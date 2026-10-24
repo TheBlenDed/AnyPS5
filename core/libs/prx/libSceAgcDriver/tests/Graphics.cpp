@@ -11270,7 +11270,37 @@ void ResourceContentKeyTests(bool benchmark) {
     using AgcDriver::Graphics::ShaderResources;
     using ShaderRecompiler::DescriptorKind;
     using ShaderRecompiler::DescriptorRole;
-    for (const auto count : {0u, 1u, 31u, 32u, 33u, 16384u}) {
+    const auto reference = [](const AgcDriver::Graphics::CompiledShader& shader, bool dataWords, bool movable) {
+        const auto& program = *shader.program;
+        std::vector<std::uint32_t> words{dataWords ? 1u : 0u, static_cast<std::uint32_t>(shader.stage), static_cast<std::uint32_t>(program.PipelineVariantId()), static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u), static_cast<std::uint32_t>(program.bindings.size())};
+        for (const auto& binding : program.bindings) {
+            for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) words.push_back(word);
+            if (movable && binding.role == DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
+                for (std::size_t i = 0; i < binding.count; ++i) {
+                    const auto* descriptor = binding.guestDescriptor.data() + 4u * i;
+                    const bool written = i >= binding.bufferWritten.size() || binding.bufferWritten[i];
+                    const bool empty = descriptor[2] == 0 || (descriptor[0] == 0 && (descriptor[1] & 0xffffu) == 0);
+                    for (unsigned j = 0; j < 4; ++j) words.push_back(written || empty ? descriptor[j] : j == 1 ? descriptor[1] & 0xffff0000u : j == 3 ? descriptor[3] : 0u);
+                }
+            } else if ((dataWords && !movable) || (binding.role != DescriptorRole::ShaderData && binding.role != DescriptorRole::FlattenedSrt)) {
+                for (const auto word : binding.guestDescriptor) words.push_back(word);
+            }
+            for (const auto* bits : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) {
+                words.push_back(static_cast<std::uint32_t>(bits->size()));
+                for (std::size_t first = 0; first < bits->size(); first += 32) {
+                    std::uint32_t word = 0;
+                    for (std::size_t bit = 0; bit < 32 && first + bit < bits->size(); ++bit) word |= static_cast<std::uint32_t>((*bits)[first + bit]) << bit;
+                    words.push_back(word);
+                }
+            }
+            words.push_back(static_cast<std::uint32_t>(binding.imageSamplers.size()));
+            for (const auto sampler : binding.imageSamplers) words.push_back(sampler);
+            words.push_back(static_cast<std::uint32_t>(binding.imageShapes.size()));
+            for (const auto shape : binding.imageShapes) words.push_back(static_cast<std::uint32_t>(shape));
+        }
+        return words;
+    };
+    for (const auto count : {0u, 1u, 31u, 32u, 33u, 128u, 1024u, 16384u}) {
         ShaderRecompiler::RecompileResult program;
         ShaderRecompiler::DescriptorBinding images{};
         images.kind = DescriptorKind::SampledImage;
@@ -11278,7 +11308,7 @@ void ResourceContentKeyTests(bool benchmark) {
         images.count = count;
         images.guestDescriptor.resize(static_cast<std::size_t>(count) * 8u);
         for (std::size_t i = 0; i < images.guestDescriptor.size(); ++i) images.guestDescriptor[i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
-        for (auto* bits : {&images.imageWritten, &images.samplerDepthCompare, &images.imageDepthCompare, &images.imageAtomic, &images.samplerUnnormalized, &images.samplerIntegerBorder, &images.imageUnnormalized, &images.imageUnnormalizedBaseLevel, &images.bufferWritten}) {
+        for (auto* bits : {&images.imageWritten, &images.samplerDepthCompare, &images.imageDepthCompare, &images.imageAtomic, &images.samplerUnnormalized, &images.samplerIntegerBorder, &images.samplerCoordinatesIgnored, &images.imageUnnormalized, &images.imageUnnormalizedBaseLevel, &images.bufferWritten}) {
             bits->resize(count);
             for (std::size_t i = 0; i < bits->size(); ++i) (*bits)[i] = i % 3u == 0;
         }
@@ -11301,6 +11331,10 @@ void ResourceContentKeyTests(bool benchmark) {
         const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         for (const bool dataWords : {false, true}) for (const bool movable : {false, true}) {
             const auto original = ShaderResources::ContentKey(shader, dataWords, movable);
+            Require(original == reference(shader, dataWords, movable), "content key differs from the word-by-word reference");
+            std::vector<std::uint32_t> appended{0xdeadbeefu, 0xabcdef01u};
+            ShaderResources::AppendContentKey(shader, dataWords, movable, appended);
+            Require(appended.size() == original.size() + 2 && appended[0] == 0xdeadbeefu && appended[1] == 0xabcdef01u && std::equal(original.begin(), original.end(), appended.begin() + 2), "appending a content key changed its prefix or words");
             program.bindings[1].guestDescriptor.back() ^= 1u;
             Require((ShaderResources::ContentKey(shader, dataWords, movable) != original) == (dataWords && !movable), "content key changed its data-word policy");
             program.bindings[1].guestDescriptor.back() ^= 1u;
@@ -11311,7 +11345,7 @@ void ResourceContentKeyTests(bool benchmark) {
             Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the written-buffer mask");
             program.bindings[2].bufferWritten[0] = false;
             if (count != 0) {
-                for (auto* bits : {&program.bindings[0].imageWritten, &program.bindings[0].samplerDepthCompare, &program.bindings[0].imageDepthCompare, &program.bindings[0].imageAtomic, &program.bindings[0].samplerUnnormalized, &program.bindings[0].samplerIntegerBorder, &program.bindings[0].imageUnnormalized, &program.bindings[0].imageUnnormalizedBaseLevel}) {
+                for (auto* bits : {&program.bindings[0].imageWritten, &program.bindings[0].samplerDepthCompare, &program.bindings[0].imageDepthCompare, &program.bindings[0].imageAtomic, &program.bindings[0].samplerUnnormalized, &program.bindings[0].samplerIntegerBorder, &program.bindings[0].samplerCoordinatesIgnored, &program.bindings[0].imageUnnormalized, &program.bindings[0].imageUnnormalizedBaseLevel}) {
                     bits->back().flip();
                     Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last packed flag");
                     bits->back().flip();

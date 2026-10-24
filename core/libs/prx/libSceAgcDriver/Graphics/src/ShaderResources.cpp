@@ -2645,8 +2645,8 @@ void ShaderResources::reportDescriptorCaches() const {
     AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
-template<typename TVisitor>
-void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
+template<typename TVisitor, typename TRangeVisitor>
+void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit, const TRangeVisitor& visitRange) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
     visit(dataWords ? 1u : 0u);
@@ -2676,7 +2676,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
                 else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
             }
         } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
-            for (const auto word : binding.guestDescriptor) visit(word);
+            visitRange(std::span<const std::uint32_t>(binding.guestDescriptor));
         }
         packBits(binding.imageWritten);
         packBits(binding.samplerDepthCompare);
@@ -2691,7 +2691,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         // must not serve a build with another (the variant implies it, this makes it explicit).
         packBits(binding.bufferWritten);
         visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
-        for (const auto sampler : binding.imageSamplers) visit(sampler);
+        visitRange(std::span<const std::uint32_t>(binding.imageSamplers));
         visit(static_cast<std::uint32_t>(binding.imageShapes.size()));
         for (const auto shape : binding.imageShapes) visit(static_cast<std::uint32_t>(shape));
     }
@@ -2718,7 +2718,9 @@ void ShaderResources::AppendContentKey(const CompiledShader& shader, bool dataWo
         for (const auto* bits : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) addWords(bits->size() / 32u + (bits->size() % 32u != 0 ? 1u : 0u));
     }
     key.reserve(words);
-    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
+    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); }, [&](std::span<const std::uint32_t> words) {
+        if (!words.empty()) key.insert(key.end(), words.begin(), words.end());
+    });
 }
 
 namespace {
@@ -2818,9 +2820,12 @@ bool ShaderResources::DiffContentKeys(std::span<const std::uint32_t> previous, s
 bool MatchesContentKey(const CompiledShader& shader, std::span<const std::uint32_t> key) {
     std::size_t cursor = 0;
     bool equal = true;
-    VisitContentKey(shader, false, true, [&](std::uint32_t word) {
+    const auto visit = [&](std::uint32_t word) {
         equal &= cursor < key.size() && key[cursor] == word;
         ++cursor;
+    };
+    VisitContentKey(shader, false, true, visit, [&](std::span<const std::uint32_t> words) {
+        for (const auto word : words) visit(word);
     });
     return equal && cursor == key.size();
 }
