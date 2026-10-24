@@ -65,8 +65,8 @@ int APS5_VABI scePthreadSemPost(PthreadSem* sem) {
         if (current->_count == sceSemValueMax)
             return SCE_KERNEL_ERROR_EOVERFLOW;
         ++current->_count;
+        current->_cv.NotifyOne();
     }
-    current->_cv.NotifyOne();
     return 0;
 }
 

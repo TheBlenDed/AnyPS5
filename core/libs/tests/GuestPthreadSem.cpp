@@ -1,11 +1,16 @@
 #include "SceTypes.hpp"
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#ifdef ANYPS5_SEM_POST_LOCK_PROBE
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include <latch>
+#endif
 
 extern "C" {
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
@@ -26,6 +31,45 @@ static constexpr int SCE_KERNEL_ERROR_EOVERFLOW = static_cast<int>(0x80020054u);
 static constexpr int SCE_KERNEL_ERROR_ETIMEDOUT = static_cast<int>(0x8002003C);
 
 static void Require(bool value) { if (!value) std::abort(); }
+
+#ifdef ANYPS5_SEM_POST_LOCK_PROBE
+static PthreadSem probedSem = nullptr;
+static std::latch notificationEntered{1};
+static std::latch mutexProbed{1};
+static bool tokenAccessible = false;
+
+void TimedWait::Condition::NotifyOne() {
+    notificationEntered.count_down();
+    mutexProbed.wait();
+}
+
+static int CheckPostNotificationOrder() {
+    Require(scePthreadSemInit(&probedSem, 0, 0, nullptr) == SCE_OK);
+    std::thread consumer([] {
+        notificationEntered.wait();
+        tokenAccessible = probedSem->_mutex.try_lock();
+        if (tokenAccessible) probedSem->_mutex.unlock();
+        mutexProbed.count_down();
+    });
+    Require(scePthreadSemPost(&probedSem) == SCE_OK);
+    consumer.join();
+    Require(scePthreadSemDestroy(&probedSem) == SCE_OK);
+    std::printf("semaphore post: token protected until notification finishes=%d\n", !tokenAccessible);
+    return tokenAccessible ? 1 : 0;
+}
+#endif
+
+static void CheckDestroyAfterLastWait() {
+    for (unsigned round = 0; round < 200; ++round) {
+        PthreadSem sem = nullptr;
+        Require(scePthreadSemInit(&sem, 0, 0, nullptr) == SCE_OK);
+        std::thread poster([&] { Require(scePthreadSemPost(&sem) == SCE_OK); });
+        Require(scePthreadSemWait(&sem) == SCE_OK);
+        Require(scePthreadSemDestroy(&sem) == SCE_OK);
+        poster.join();
+    }
+    std::puts("semaphore post/wait/destroy: 200 handoffs passed");
+}
 
 static void CheckValueLimit() {
     constexpr unsigned int maximum = 0x7fffffffu;
@@ -67,7 +111,11 @@ static void* APS5_VABI Poster(void* arg) {
 }
 
 int main() {
+#ifdef ANYPS5_SEM_POST_LOCK_PROBE
+    return CheckPostNotificationOrder();
+#endif
     CheckValueLimit();
+    CheckDestroyAfterLastWait();
 
     PthreadSem sem = nullptr;
     Require(scePthreadSemInit(&sem, 0, 2, nullptr) == SCE_OK);
