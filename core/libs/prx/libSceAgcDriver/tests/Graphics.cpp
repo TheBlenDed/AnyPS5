@@ -11786,6 +11786,15 @@ int main(int argc, char** argv) {
             descriptorCacheTests();
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--import-allocation-errors") {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.bufferDeviceAddress = true;
+            context.limits.maxStorageBufferRange = 1u << 27;
+            RunImportAllocationErrorTests(context);
+            Require(mock.live == 0, "import allocation errors leaked Vulkan objects");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unused-viewport-depth") {
             UnusedViewportDepthTests();
             DepthClipTests();
