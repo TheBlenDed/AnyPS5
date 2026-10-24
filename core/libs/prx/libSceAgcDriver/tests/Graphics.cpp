@@ -6838,6 +6838,114 @@ void ResourceCacheAccountingTests(bool benchmark) {
     Require(mock.live == 0, "resource cache accounting leaked Vulkan objects");
 }
 
+void ResourceCacheHashTests(bool benchmark) {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    ShaderRecompiler::RecompileResult program;
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    {
+        auto first = std::make_shared<ShaderResources>(context, shader, std::span<const GuestMemorySnapshot>{}, true);
+        auto second = std::make_shared<ShaderResources>(context, shader, std::span<const GuestMemorySnapshot>{}, true);
+        ResourceCache cache;
+        cache.SetBase(512, 8);
+        cache.Insert({}, first);
+        Require(cache.Find({}) == first && cache.Touch({}), "an empty resource key did not survive lookup");
+        cache.Remove({});
+        Require(cache.Find({}) == nullptr && !cache.Touch({}), "an empty resource key survived removal");
+        ResourceCache::Key mutableKey(65, 0x12345678u);
+        const auto original = mutableKey;
+        cache.Insert(mutableKey, first);
+        mutableKey.back() ^= 1u;
+        Require(cache.Find(mutableKey) == nullptr && !cache.Touch(mutableKey), "a changed caller key reused a stale hash");
+        Require(cache.Find(original) == first, "inserting a key retained the caller's mutable storage");
+        mutableKey.push_back(0);
+        cache.Insert(mutableKey, second);
+        Require(cache.Find(mutableKey) == second && cache.Find(original) == first, "different key lengths aliased");
+        constexpr std::uint64_t prime = 0x9e3779b97f4a7c15ull;
+        constexpr std::array<std::uint64_t, 4> seeds{0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
+        std::array<std::uint64_t, 4> lanes{};
+        for (std::size_t i = 0; i < lanes.size(); ++i) {
+            lanes[i] = seeds[i] * prime;
+            lanes[i] ^= lanes[i] >> 29u;
+        }
+        std::uint64_t inverse = 1;
+        for (unsigned i = 0; i < 6; ++i) inverse *= 2u - prime * inverse;
+        ResourceCache::Key collisionA(8, 0), collisionB(8, 0);
+        constexpr std::uint64_t difference = 0x123456789abcdef0ull;
+        const auto storeLane = [&](std::size_t lane, std::uint64_t target) {
+            const auto unmixed = target ^ (target >> 29u) ^ (target >> 58u);
+            const auto word = seeds[lane] ^ unmixed * inverse;
+            collisionB[2 * lane] = static_cast<std::uint32_t>(word);
+            collisionB[2 * lane + 1] = static_cast<std::uint32_t>(word >> 32u);
+        };
+        storeLane(0, lanes[0] ^ difference);
+        storeLane(1, lanes[1] ^ std::rotr(difference, 17));
+        cache.Insert(collisionA, first);
+        cache.Insert(collisionB, second);
+        Require(collisionA != collisionB && cache.Find(collisionA) == first && cache.Find(collisionB) == second, "colliding resource hashes replaced distinct keys");
+        cache.Remove(collisionA, second.get());
+        Require(cache.Find(collisionA) == first, "conditional removal ignored the resource identity");
+        cache.Remove(collisionA, first.get());
+        Require(cache.Find(collisionA) == nullptr && cache.Find(collisionB) == second && cache.Touch(collisionB), "removing a colliding key damaged its neighbour");
+        cache.Clear();
+        std::vector<ResourceCache::Key> keys(512, ResourceCache::Key(64, 0));
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            keys[i].back() = static_cast<std::uint32_t>(i);
+            cache.Insert(keys[i], i % 2 == 0 ? first : second);
+        }
+        for (std::size_t i = 0; i < keys.size(); ++i) Require(cache.Find(keys[i]) == (i % 2 == 0 ? first : second), "resource cache rehash lost a key");
+        std::atomic<bool> valid{true};
+        std::vector<std::thread> threads;
+        for (unsigned worker = 0; worker < 4; ++worker) threads.emplace_back([&, worker] {
+            for (std::size_t i = 0; i < 1024; ++i) {
+                const auto index = (i + worker * 17) % keys.size();
+                if (cache.Find(keys[index]) != (index % 2 == 0 ? first : second) || !cache.Touch(keys[index])) valid.store(false);
+            }
+        });
+        for (auto& thread : threads) thread.join();
+        Require(valid.load(), "concurrent resource lookups changed an identity");
+        cache.Clear();
+        cache.SetBase(2, 8);
+        cache.Insert(collisionA, first);
+        cache.Insert(collisionB, second);
+        Require(cache.Touch(collisionA), "touch missed a colliding key");
+        cache.Insert(original, first);
+        Require(cache.Find(collisionB) == nullptr && cache.Find(collisionA) == first, "touch changed the LRU eviction order");
+        if (benchmark) for (const std::size_t words : {8u, 64u, 4096u, 169030u}) {
+            std::vector<ResourceCache::Key> requests(12, ResourceCache::Key(words));
+            for (std::size_t k = 0; k < requests.size(); ++k) {
+                for (std::size_t i = 0; i < words; ++i) requests[k][i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
+                requests[k].back() = static_cast<std::uint32_t>(k);
+            }
+            for (const std::string_view scenario : {"base-hit", "grown-hit", "grown-touch", "miss"}) {
+                cache.Clear();
+                cache.SetBase(scenario == "base-hit" ? 32 : 8, 8);
+                cache.Clear();
+                for (unsigned pass = 0; pass < 6; ++pass) for (const auto& key : requests) {
+                    if (cache.Find(key) == nullptr) cache.Insert(key, first);
+                }
+                const auto capacity = cache.Capacity();
+                Require(cache.Size() == requests.size() && (scenario == "base-hit" || capacity > 8), "hash benchmark did not warm the intended cache");
+                if (scenario == "miss") for (auto& key : requests) key.back() += 1000;
+                for (unsigned round = 0; round < 5; ++round) {
+                    constexpr std::size_t operations = 1024;
+                    std::size_t hits = 0;
+                    const auto start = std::chrono::steady_clock::now();
+                    for (std::size_t operation = 0; operation < operations; ++operation) {
+                        const auto& key = requests[operation % requests.size()];
+                        hits += scenario == "grown-touch" ? cache.Touch(key) : cache.Find(key) == first;
+                    }
+                    const auto nanos = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+                    Require(hits == (scenario == "miss" ? 0 : operations) && cache.Size() == requests.size() && cache.Capacity() == capacity, "hash benchmark changed cache results or policy");
+                    std::printf("resource-hash words=%zu scenario=%s round=%u operations=%zu ns_per_op=%.3f hits=%zu capacity=%zu\n", words, scenario.data(), round, operations, nanos / operations, hits, capacity);
+                }
+            }
+        }
+    }
+    Require(mock.live == 0, "resource hash tests leaked Vulkan objects");
+}
+
 void tableUpdateAfterBindTests() {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     using namespace AgcDriver::Graphics;
@@ -12005,6 +12113,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--resource-cache-accounting" || std::string_view(argv[1]) == "--benchmark-resource-cache-accounting")) {
             ResourceCacheAccountingTests(std::string_view(argv[1]) == "--benchmark-resource-cache-accounting");
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--resource-cache-hash" || std::string_view(argv[1]) == "--benchmark-resource-cache-hash")) {
+            ResourceCacheHashTests(std::string_view(argv[1]) == "--benchmark-resource-cache-hash");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--alpha-to-coverage-state") {

@@ -3796,15 +3796,16 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
+    const LookupKey lookup{key, KeyHash{}(key)};
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
+    const auto found = index.find(lookup);
     if (found == index.end()) {
-        noteReturn(key);
+        noteReturn(lookup.hash);
         noteMiss(key);
         return nullptr;
     }
     entries.splice(entries.begin(), entries, found->second);
-    noteUse(key);
+    noteUse(lookup.hash);
     return found->second->second;
 }
 
@@ -3832,9 +3833,9 @@ void ResourceCache::noteEvicted(const Key& key) {
     std::fprintf(stderr, "[rescache] capacity %zu -> %zu entries: keys it evicted keep coming back\n", previous, capacity);
 }
 
-void ResourceCache::noteUse(const Key& key) {
+void ResourceCache::noteUse(std::size_t hash) {
     if (fixedCapacity || capacity <= baseEntries) return;
-    usedKeys.insert(KeyHash{}(key));
+    usedKeys.insert(hash);
     if (++usesSinceCheck < capacity * shrinkWindow) return;
     const auto used = usedKeys.size();
     const auto uses = usesSinceCheck;
@@ -3849,9 +3850,9 @@ void ResourceCache::noteUse(const Key& key) {
     std::fprintf(stderr, "[rescache] capacity %zu -> %zu entries: %zu keys served the last %zu uses\n", previous, capacity, used, uses);
 }
 
-void ResourceCache::noteReturn(const Key& key) {
+void ResourceCache::noteReturn(std::size_t hash) {
     if (fixedCapacity) return;
-    const auto found = evictedKeys.find(KeyHash{}(key));
+    const auto found = evictedKeys.find(hash);
     if (found == evictedKeys.end()) return;
     evictedOrder.erase(found->second);
     evictedKeys.erase(found);
@@ -3979,7 +3980,8 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     std::lock_guard lock(mutex);
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
-    if (const auto found = index.find(key); found != index.end()) {
+    const LookupKey lookup{key, KeyHash{}(key)};
+    if (const auto found = index.find(lookup); found != index.end()) {
         const auto elements = found->second->second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         cachedTableElements -= elements;
@@ -3995,7 +3997,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         fixedCapacity = parsed != 0;
         capacity = fixedCapacity ? static_cast<std::size_t>(parsed) : baseEntries;
     }
-    noteUse(key);
+    noteUse(lookup.hash);
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
         const auto elements = entries.back().second->TableElements();
@@ -4070,11 +4072,12 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
 
 bool ResourceCache::Touch(const Key& key) {
     resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
+    const LookupKey lookup{key, KeyHash{}(key)};
     std::lock_guard lock(mutex);
-    const auto found = index.find(key);
+    const auto found = index.find(lookup);
     if (found == index.end()) return false;
     entries.splice(entries.begin(), entries, found->second);
-    noteUse(key);
+    noteUse(lookup.hash);
     return true;
 }
 

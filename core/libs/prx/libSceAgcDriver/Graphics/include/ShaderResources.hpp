@@ -732,10 +732,16 @@ private:
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(const Key& key);
-    void noteReturn(const Key& key);
-    void noteUse(const Key& key);
+    void noteReturn(std::size_t hash);
+    void noteUse(std::size_t hash);
     void removeImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted);
+    struct LookupKey {
+        const Key& words;
+        std::size_t hash;
+    };
     struct KeyHash {
+        using is_transparent = void;
+        std::size_t operator()(const LookupKey& key) const noexcept { return key.hash; }
         std::size_t operator()(const Key& key) const noexcept {
             constexpr std::uint64_t Prime = 0x9e3779b97f4a7c15ull;
             std::uint64_t lanes[4] = {0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
@@ -759,9 +765,15 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
+    struct KeyEqual {
+        using is_transparent = void;
+        bool operator()(const Key& left, const Key& right) const noexcept { return left == right; }
+        bool operator()(const LookupKey& left, const Key& right) const noexcept { return left.words == right; }
+        bool operator()(const Key& left, const LookupKey& right) const noexcept { return left == right.words; }
+    };
     mutable AgcDriver::Mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    std::unordered_map<Key, decltype(entries)::iterator, KeyHash, KeyEqual> index;
     std::uint64_t cachedTableElements = 0;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
