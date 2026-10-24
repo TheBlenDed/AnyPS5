@@ -3086,9 +3086,18 @@ bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const
 }
 
 std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes) const {
+    return PendingWriterSerial(address, bytes, nullptr);
+}
+
+std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes, bool* written) const {
+    if (written != nullptr) *written = false;
     if (bytes == 0) return 0;
     const auto end = address + bytes;
-    const auto writes = [&](const Batch& batch) { return overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value(); };
+    const auto writes = [&](const Batch& batch) {
+        const bool wrote = overlaps(batch, address, end);
+        if (written != nullptr) *written = wrote;
+        return wrote || readOverlap(batch, address, end, ReadKind::AddressBased).has_value();
+    };
     if (open != nullptr && writes(*open)) return OpenSerial();
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
         if (writes(**it)) return (*it)->serial;
@@ -3719,17 +3728,19 @@ void Recorder::WaitSerial(std::uint64_t serial) {
 }
 
 void Recorder::FinishUpTo(std::uint64_t serial) {
-    // A drain: the wait already happened (unlocked), the fences are signaled, so the source-0 wait
-    // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows
-    // up in the site table by its own address).
-    ++syncCounts[0];
+    FinishUpTo(serial, 0);
+}
+
+void Recorder::FinishUpTo(std::uint64_t serial, int source) {
+    Require(source >= 0 && source < 5, "invalid recorder sync source");
+    ++syncCounts[source];
     announcedSource = 4;
     const void* site = std::exchange(announcedSite, nullptr);
-    const auto previousSite = inFlight.empty() || inFlight.front()->serial > serial ? activeSyncSite : BeginSyncSite(0, site != nullptr ? site : __builtin_return_address(0));
+    const auto previousSite = inFlight.empty() || inFlight.front()->serial > serial ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
     while (!inFlight.empty() && inFlight.front()->serial <= serial) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
-        finish(std::move(batch), true, 0);
+        finish(std::move(batch), true, source);
     }
     activeSyncSite = previousSite;
 }

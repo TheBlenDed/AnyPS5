@@ -182,6 +182,7 @@ public:
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes, bool* written) const;
     std::uint64_t PendingLeaseSerial(std::uint64_t address, std::size_t bytes) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
@@ -212,6 +213,7 @@ public:
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
+    void FinishUpTo(std::uint64_t serial, int source);
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();
