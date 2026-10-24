@@ -6757,6 +6757,87 @@ void hostImportBudgetTests() {
     Require(HostImportBudget(memory, 16 * GiB) == 8 * GiB, "a host heap past memoryHeapCount limits the import budget");
 }
 
+void ResourceCacheAccountingTests(bool benchmark) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.imageTableCapacity = 4;
+    context.limits.maxPerStageDescriptorSampledImages = 4;
+    context.limits.maxDescriptorSetSampledImages = 4;
+    std::vector<std::unique_ptr<ShaderRecompiler::RecompileResult>> programs;
+    const auto makeResources = [&](std::uint32_t count) {
+        programs.push_back(std::make_unique<ShaderRecompiler::RecompileResult>());
+        auto& program = *programs.back();
+        if (count != 0) {
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + count));
+            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+            map.guestDescriptor[Abi::HeaderElementCount] = count;
+            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+            program.bindings.push_back(std::move(map));
+            auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, count, std::vector<std::uint32_t>(8u * count));
+            images.kind = Kind::SampledImage;
+            images.imageShapes.resize(count);
+            images.imageDepthCompare.resize(count);
+            images.imageSamplers.resize(count);
+            program.bindings.push_back(std::move(images));
+        }
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        return std::make_shared<ShaderResources>(context, shader, std::span<const GuestMemorySnapshot>{}, true);
+    };
+    {
+        auto empty = makeResources(0);
+        auto two = makeResources(2);
+        auto four = makeResources(4);
+        Require(two->TableElements() == 2 && four->TableElements() == 4, "resource cache accounting fixture lost its table elements");
+        ResourceCache cache;
+        cache.SetBase(3, 8);
+        cache.Insert({1}, two);
+        cache.Insert({2}, four);
+        cache.Insert({3}, empty);
+        Require(cache.TableElements() == 6, "resource cache accounting lost an inserted table");
+        cache.Insert({1}, four);
+        Require(cache.TableElements() == 8, "resource cache accounting lost a replacement");
+        cache.Remove({1}, two.get());
+        Require(cache.TableElements() == 8, "resource cache accounting removed a different object");
+        cache.Remove({1}, four.get());
+        Require(cache.TableElements() == 4, "resource cache accounting lost an explicit removal");
+        cache.Insert({4}, two);
+        Require(cache.Touch({2}), "resource cache accounting lost an LRU entry");
+        std::vector<std::shared_ptr<ShaderResources>> evicted;
+        cache.Insert({5}, two, &evicted);
+        Require(cache.Find({3}) == nullptr && cache.TableElements() == 8, "resource cache accounting changed zero-table LRU eviction");
+        cache.Insert({6}, empty, &evicted);
+        Require(cache.Find({4}) == nullptr && cache.TableElements() == 6, "resource cache accounting lost a table evicted by a zero-table insertion");
+        cache.Clear();
+        Require(cache.TableElements() == 0 && cache.Size() == 0, "resource cache accounting did not clear");
+        cache.SetBase(65536, 8);
+        const auto limit = ResourceCache::TableElementBudget();
+        Require(limit >= 8 && limit <= 65536, "resource cache accounting needs a table budget from 8 to 65536");
+        for (std::uint32_t key = 0; key <= limit / 4; ++key) cache.Insert({key}, four, &evicted);
+        Require(cache.TableElements() == limit / 4 * 4 && cache.Find({0}) == nullptr, "resource cache accounting changed table-budget eviction");
+        cache.Clear();
+        if (benchmark) {
+            constexpr std::uint32_t operations = 4096;
+            for (const std::uint32_t count : {1024u, 4096u, 16384u}) {
+                Require(2ull * count <= limit, "resource cache benchmark exceeds the table budget");
+                cache.SetBase(count, 8);
+                for (std::uint32_t key = 0; key < count; ++key) cache.Insert({key}, two);
+                for (unsigned round = 0; round < 5; ++round) {
+                    const auto start = std::chrono::steady_clock::now();
+                    for (std::uint32_t key = 0; key < operations; ++key) cache.Insert({key % count}, two);
+                    const auto micros = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                    Require(cache.TableElements() == 2ull * count && cache.Size() == count, "resource cache benchmark changed retained entries");
+                    std::printf("resource-cache entries=%u round=%u operations=%u ns_per_insert=%.3f\n", count, round, operations, micros * 1000.0 / operations);
+                }
+                cache.Clear();
+            }
+        }
+    }
+    Require(mock.live == 0, "resource cache accounting leaked Vulkan objects");
+}
+
 void tableUpdateAfterBindTests() {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     using namespace AgcDriver::Graphics;
@@ -11877,6 +11958,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--resource-cache-accounting" || std::string_view(argv[1]) == "--benchmark-resource-cache-accounting")) {
+            ResourceCacheAccountingTests(std::string_view(argv[1]) == "--benchmark-resource-cache-accounting");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--alpha-to-coverage-state") {

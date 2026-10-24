@@ -2020,6 +2020,11 @@ target_link_libraries(agc_driver_graphics_tests PRIVATE
 
 if(BUILD_TESTING)
     add_test(NAME agc_command_batch_fence_failure COMMAND agc_driver_graphics_tests --command-batch-fence-failure)
+    add_test(NAME agc_driver_resource_cache_accounting COMMAND agc_driver_graphics_tests --resource-cache-accounting)
+    set_tests_properties(agc_driver_resource_cache_accounting PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_resource_cache_accounting PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_command_batch_fence_failure PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_command_batch_fence_failure PROPERTIES ENVIRONMENT_MODIFICATION

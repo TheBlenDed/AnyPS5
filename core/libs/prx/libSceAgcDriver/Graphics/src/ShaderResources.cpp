@@ -3975,12 +3975,15 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(key); found != index.end()) {
+        const auto elements = found->second->second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
+        cachedTableElements -= elements;
         entries.erase(found->second);
         index.erase(found);
     }
     entries.emplace_front(key, std::move(resources));
     index.emplace(key, entries.begin());
+    cachedTableElements += entries.front().second->TableElements();
     if (capacity == 0) {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
@@ -3990,21 +3993,21 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     noteUse(key);
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first);
+        const auto elements = entries.back().second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
+        cachedTableElements -= elements;
         index.erase(entries.back().first);
         entries.pop_back();
     }
     if (entries.front().second->TableElements() == 0) return;
-    std::uint64_t tables = 0;
-    for (const auto& entry : entries) tables += entry.second->TableElements();
-    for (auto it = std::prev(entries.end()); tables > TableElementBudget() && it != entries.begin();) {
+    for (auto it = std::prev(entries.end()); cachedTableElements > TableElementBudget() && it != entries.begin();) {
         const auto elements = it->second->TableElements();
         if (elements == 0) {
             --it;
             continue;
         }
-        tables -= elements;
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
+        cachedTableElements -= elements;
         index.erase(it->first);
         it = std::prev(entries.erase(it));
     }
@@ -4037,7 +4040,9 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        const auto elements = it->second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
+        cachedTableElements -= elements;
         index.erase(it->first);
         it = entries.erase(it);
     }
@@ -4050,7 +4055,9 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             ++it;
             continue;
         }
+        const auto elements = it->second->TableElements();
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
+        cachedTableElements -= elements;
         index.erase(it->first);
         it = entries.erase(it);
     }
@@ -4078,6 +4085,7 @@ void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
     index.clear();
     entries.clear();
+    cachedTableElements = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;
@@ -4116,14 +4124,13 @@ std::uint64_t ResourceCache::TableElementBudget() {
 
 std::uint64_t ResourceCache::TableElements() const {
     std::lock_guard lock(mutex);
-    std::uint64_t tables = 0;
-    for (const auto& entry : entries) tables += entry.second->TableElements();
-    return tables;
+    return cachedTableElements;
 }
 
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
+    cachedTableElements -= found->second->second->TableElements();
     entries.erase(found->second);
     index.erase(found);
 }
