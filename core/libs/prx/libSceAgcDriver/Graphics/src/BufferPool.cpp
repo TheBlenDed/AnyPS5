@@ -368,12 +368,12 @@ bool BufferPool::DeviceTiered(VkMemoryPropertyFlags properties) {
     return (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 && (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0 && DeviceTierEnabled();
 }
 
-std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags properties) {
+std::size_t BufferPool::Capacity(std::size_t bytes, VkMemoryPropertyFlags) {
     constexpr std::size_t smallest = 256;
     if (exactSizes()) return bytes;
     if (bytes < classLimit) return std::max(smallest, std::bit_ceil(bytes));
-    if (!DeviceTiered(properties)) return bytes;
     const auto step = std::bit_floor(bytes) >> deviceClassBits;
+    if (bytes > std::numeric_limits<std::size_t>::max() - (step - 1)) return bytes;
     return (bytes + step - 1) / step * step;
 }
 

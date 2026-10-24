@@ -8,6 +8,7 @@
 #include "../SlabReturn.hpp"
 #include <SDL_loadso.h>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +45,10 @@ PFN_vkBindBufferMemory RealBindBufferMemory = nullptr;
 VkResult BindFailure = VK_SUCCESS;
 unsigned BindAttempts = 0;
 unsigned SuccessfulBinds = 0;
+unsigned AllocationCalls = 0;
+unsigned FreeCalls = 0;
+unsigned MapCalls = 0;
+unsigned UnmapCalls = 0;
 
 struct Allocation {
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -60,6 +65,7 @@ int FailAfterMap = -1;
 VKAPI_ATTR VkResult VKAPI_CALL CountedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
     const auto result = RealAllocateMemory(device, info, allocator, memory);
     if (result == VK_SUCCESS) {
+        ++AllocationCalls;
         const auto entry = std::find_if(Allocations.begin(), Allocations.end(), [](const Allocation& allocation) { return allocation.memory == VK_NULL_HANDLE; });
         if (entry == Allocations.end()) ++AllocationErrors;
         else *entry = {*memory, info->allocationSize, false};
@@ -80,12 +86,14 @@ VKAPI_ATTR void VKAPI_CALL CountedFreeMemory(VkDevice device, VkDeviceMemory mem
     }
     LiveBytes -= entry->bytes;
     *entry = {};
+    ++FreeCalls;
     RealFreeMemory(device, memory, allocator);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL CountedMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize bytes, VkMemoryMapFlags flags, void** mapping) {
     const auto result = RealMapMemory(device, memory, offset, bytes, flags, mapping);
     if (result == VK_SUCCESS) {
+        ++MapCalls;
         const auto entry = std::find_if(Allocations.begin(), Allocations.end(), [&](const Allocation& allocation) { return allocation.memory == memory; });
         if (entry == Allocations.end()) ++AllocationErrors;
         else entry->mapped = true;
@@ -104,6 +112,7 @@ VKAPI_ATTR void VKAPI_CALL CountedUnmapMemory(VkDevice device, VkDeviceMemory me
         return;
     }
     entry->mapped = false;
+    ++UnmapCalls;
     RealUnmapMemory(device, memory);
 }
 
@@ -503,6 +512,84 @@ void ExpectCreated(std::initializer_list<VkDeviceSize> sizes, const std::string&
     CreatedSizes().clear();
 }
 
+void LargeHostClasses(const Context& context) {
+    constexpr std::size_t mib = 1u << 20u;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    const bool exact = std::getenv("APS5_NO_BUFFER_CLASSES") != nullptr;
+    auto probe = context;
+    probe.bufferPool = std::make_shared<BufferPool>(probe);
+    const auto before = AllocationCalls;
+    void* mapping = nullptr;
+    {
+        AgcDriver::Graphics::Buffer first(probe, 8 * mib + 4096, usage);
+        mapping = first.Bytes().data();
+    }
+    {
+        const auto bytes = 8 * mib + 8192;
+        AgcDriver::Graphics::Buffer source(probe, bytes, usage);
+        Require(source.Bytes().size() == bytes && CreatedSizes().back() == bytes, "large host buffer exposes its memory class instead of the requested range");
+        std::printf("host-pool exact=%d allocations_for_two_sizes=%u\n", exact, AllocationCalls - before);
+        Require(AllocationCalls == before + (exact ? 2u : 1u), "nearby large host requests did not follow the requested exact/class reuse policy");
+        Require(exact || source.Bytes().data() == mapping, "a reused large host allocation lost its mapping");
+        const std::array<std::uint32_t, 2> expected{Fresh, ~Fresh};
+        std::memcpy(source.Bytes().data(), &expected[0], sizeof(std::uint32_t));
+        std::memcpy(source.Bytes().data() + bytes - sizeof(std::uint32_t), &expected[1], sizeof(std::uint32_t));
+        AgcDriver::Graphics::Buffer destination(probe, sizeof(expected), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::Graphics::CommandBatch batch(probe);
+            const VkMemoryBarrier uploaded{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+            probe.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &uploaded, 0, nullptr, 0, nullptr);
+            const std::array<VkBufferCopy, 2> copies{{{0, 0, sizeof(std::uint32_t)}, {bytes - sizeof(std::uint32_t), sizeof(std::uint32_t), sizeof(std::uint32_t)}}};
+            probe.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(batch.Handle(), source.Handle(), destination.Handle(), copies.size(), copies.data());
+            const VkMemoryBarrier downloaded{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+            probe.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(batch.Handle(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &downloaded, 0, nullptr, 0, nullptr);
+            batch.SubmitAndWait();
+        }
+        destination.Invalidate();
+        Require(std::memcmp(destination.Bytes().data(), expected.data(), sizeof(expected)) == 0, "GPU copy lost the first or last word of a rebound large host buffer");
+    }
+    const auto beforeLarger = AllocationCalls;
+    {
+        AgcDriver::Graphics::Buffer larger(probe, 9 * mib + 4096, usage);
+        Require(AllocationCalls == beforeLarger + 1, "a larger host class reused insufficient memory");
+    }
+}
+
+void BenchmarkLargeHostClasses(const Context& context) {
+    using Clock = std::chrono::steady_clock;
+    constexpr std::size_t count = 256;
+    constexpr std::size_t mib = 1u << 20u;
+    const auto origin = Clock::now();
+    for (unsigned round = 0; round < 3; ++round) {
+        for (const std::size_t base : {8 * mib, 32 * mib}) {
+            auto probe = context;
+            probe.bufferPool = std::make_shared<BufferPool>(probe);
+            const auto oldLive = LiveBytes;
+            const auto allocated = AllocationCalls;
+            const auto mapped = MapCalls;
+            const auto freed = FreeCalls;
+            const auto unmapped = UnmapCalls;
+            const auto start = Clock::now();
+            for (std::size_t index = 0; index < count; ++index) {
+                const auto bytes = base + 4096 + index * 256;
+                AgcDriver::Graphics::Buffer buffer(probe, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                Require(buffer.Bytes().size() == bytes && CreatedSizes().back() == bytes, "host-pool benchmark changed the requested buffer range");
+                buffer.Bytes().front() = std::byte{0x42};
+                buffer.Bytes().back() = std::byte{0x24};
+            }
+            const auto end = Clock::now();
+            const auto retained = LiveBytes - oldLive;
+            Require(AllocationErrors == 0 && retained <= 512u * mib, "host-pool benchmark exceeded its memory budget or lost an allocation");
+            probe.bufferPool.reset();
+            const auto cleaned = Clock::now();
+            Require(LiveBytes == oldLive && AllocationErrors == 0, "host-pool benchmark leaked native Vulkan memory");
+            const auto us = [](auto duration) { return std::chrono::duration<double, std::micro>(duration).count(); };
+            std::printf("hostpool-bench {\"round\":%u,\"base_mib\":%zu,\"count\":%zu,\"ts_us\":%.3f,\"work_us\":%.3f,\"cleanup_us\":%.3f,\"allocations\":%u,\"maps\":%u,\"frees\":%u,\"unmaps\":%u,\"retained_bytes\":%llu}\n", round, base / mib, count, us(start - origin), us(end - start), us(cleaned - end), AllocationCalls - allocated, MapCalls - mapped, FreeCalls - freed, UnmapCalls - unmapped, static_cast<unsigned long long>(retained));
+        }
+    }
+}
+
 void ExactSizes(const Context& context) {
     constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     const auto hostClass = BufferPool::Capacity(100, HostMemory);
@@ -545,6 +632,13 @@ int main(int argc, char** argv) {
             return VulkanTestSkipped;
         }
         const auto& context = device->GetContext();
+        if (argc == 2 && (std::strcmp(argv[1], "--host-large-classes") == 0 || std::strcmp(argv[1], "--host-large-benchmark") == 0)) {
+            if (std::strcmp(argv[1], "--host-large-benchmark") == 0) BenchmarkLargeHostClasses(context);
+            else LargeHostClasses(context);
+            device.reset();
+            Require(AllocationErrors == 0 && LiveBytes == 0, "large host buffer cleanup left an invalid memory state");
+            return 0;
+        }
         const bool onlyReturns = argc == 2;
         const bool hostOnly = onlyReturns && std::strcmp(argv[1], "--slab-return-host") == 0;
         Require(!onlyReturns || hostOnly || std::strcmp(argv[1], "--slab-return-device") == 0, "unknown slab return test mode");
