@@ -1649,9 +1649,11 @@ if(BUILD_TESTING)
         target_compile_definitions(guest_memory_tests PRIVATE GUEST_MEMORY_ELF0_MODULE="$<TARGET_FILE:guest_memory_elf0_module>")
     endif()
     add_test(NAME guest_memory COMMAND guest_memory_tests)
+    add_test(NAME guest_arena_first_fit COMMAND guest_memory_tests arena-first-fit)
+    set_tests_properties(guest_arena_first_fit PROPERTIES TIMEOUT 30)
     add_test(NAME guest_mmap_fixed_anonymous COMMAND guest_memory_tests fixed-anonymous)
     if(WIN32)
-        set_tests_properties(guest_memory guest_mmap_fixed_anonymous PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_memory guest_arena_first_fit guest_mmap_fixed_anonymous PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     if(NOT ANYPS5_ENABLE_ASAN AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
