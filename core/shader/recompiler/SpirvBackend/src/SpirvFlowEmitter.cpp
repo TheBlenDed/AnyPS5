@@ -1,3 +1,4 @@
+#include "SpirvBackend/SpirvImageEmitter.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
@@ -90,6 +91,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
             RecordBdaFaultWords(state, ConstantU32(state, static_cast<std::uint32_t>(hash)), ConstantU32(state, static_cast<std::uint32_t>(hash >> 32u)), ConstantU32(state, state.loopGuardLimit), EmitBinaryU32(state, spv::OpISub, pc, ConstantU32(state, 1u)), BdaAbi::FaultReason::LoopLimit);
         });
     }
+    EmitBlendedTargets(state);
     FlushColorTargetMerge(state);
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
@@ -188,8 +190,19 @@ std::uint32_t EmitBranchCondition(SpirvValueEmitContext& ctx, const BlockInfo& i
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1u);
     const auto kind = info.terminator.condition;
     const bool zero = kind == BranchCondition::ExecZero || kind == BranchCondition::VccZero || kind == BranchCondition::SccZero;
+    // A zero condition must hold on both lanes of every invocation still running, so the halves' AND is
+    // compared with a ballot of those invocations, not with all 32 bits: an invocation that left early
+    // (StopBdaInvocationIf after a recorded fault) drops out of every later ballot, and a loop leaving on
+    // execz, vccz or scc0 then never left (a GPU hang instead of the fault report).
+    std::uint32_t expected = ConstantU32(state, 0u);
+    if (zero) {
+        const auto active = state.module.AllocateId();
+        EmitSubgroupBallot(state, active, ConstantBool(state, true));
+        expected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), expected, active, 0u);
+    }
     const auto combined = EmitBinaryU32(state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, ConstantU32(state, zero ? ~0u : 0u));
+    state.module.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), result, combined, expected);
     return result;
 }
 
@@ -740,6 +753,7 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
 void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
     auto& state = ctx.state;
     state.currentBlock = block;
+    state.runtimeBufferValues.clear();
     EmitLabel(state, ctx.Label(block));
     bool emittedNonPhi = false;
     // Wave LDS ordering (see WaveLdsScope): a barrier separates an LDS write from the next LDS access
@@ -786,11 +800,14 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
+                state.runtimeBufferLabel = state.currentLabel;
                 EmitStructuredInstruction(lane, functionState, *inst);
+                state.runtimeBufferLabel = 0;
             }
         }
         state.laneHalf = 0;
     }
+    EmitBindlessEntryProbes(ctx);
 }
 
 void PatchStructuredPhis(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState) {
@@ -900,7 +917,9 @@ void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
     }
     const bool tessellation = state.program.Resources().stage == IrShaderStage::TessellationControl;
     const auto memoryScope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-    const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state);
+    // A single-workgroup dispatch's barrier also orders buffer memory: its glc reads go through the
+    // L1-cached binding (ShaderComputeStageInfo::singleWorkgroup) and must see the group's stores.
+    const std::uint32_t semantics = tessellation ? static_cast<std::uint32_t>(spv::MemorySemanticsMaskNone) : spv::MemorySemanticsAcquireReleaseMask | LdsMemorySemantics(state) | (state.singleWorkgroup ? spv::MemorySemanticsUniformMemoryMask : 0u);
     state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, memoryScope), ConstantU32(state, semantics));
 }
 

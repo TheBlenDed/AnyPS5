@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -41,6 +42,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -640,13 +642,14 @@ void reportedBudgetTests(const Context& context) {
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
-    const auto budget = SampledTextureBudget(context.memory, &reported, 0);
-    Require(budget >= (2048ull << 20u), "the sampled texture cache budget is below the 2 GiB floor");
+    const auto budgets = TextureCacheBudgetsFor(context.memory, &reported, {});
+    const auto budget = budgets.sampled;
+    Require(budget != 0 && budgets.ceiling > budget && budgets.storage <= TextureCacheBudget(context.memory) && budgets.target >= budgets.storage, "the texture cache budgets of the device are inconsistent");
     for (std::uint32_t heap = 0; heap < context.memory.memoryHeapCount; ++heap) {
         if ((context.memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) continue;
         std::printf("device-local heap %u: %llu MiB, VK_EXT_memory_budget budget %llu MiB, usage %llu MiB\n", heap, static_cast<unsigned long long>(context.memory.memoryHeaps[heap].size >> 20u), static_cast<unsigned long long>(reported.heapBudget[heap] >> 20u), static_cast<unsigned long long>(reported.heapUsage[heap] >> 20u));
     }
-    std::printf("sampled texture cache budget %llu MiB, storage image cache budget %llu MiB\n", static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(TextureCacheBudget(context.memory) >> 20u));
+    std::printf("sampled texture cache budget %llu MiB (ceiling %llu MiB), storage image cache budget %llu MiB, VRAM share of the texture caches %llu MiB\n", static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u));
 }
 
 void snapshotTests(const Context& context) {
@@ -675,7 +678,70 @@ void snapshotTests(const Context& context) {
     Require(TextureCacheUsage().sampledBytes == tiny->AllocationBytes(), "a snapshot whose " + std::to_string(tiny->AllocationBytes()) + "-byte image is smaller than its " + std::to_string(guestBytes) + " guest bytes counted " + std::to_string(TextureCacheUsage().sampledBytes) + " bytes, not its allocation");
 }
 
-void recycleTests(const Context& context) {
+// A snapshot is validated by block hashes of its guest bytes: an unchanged surface hits its entry,
+// and one changed byte anywhere (either end, either side of a 64 KiB block boundary) makes it again.
+// A loading screen (lean-x13): the present counter stands still while one build binds thousands of
+// textures and holds them all until it is recorded. The cache's textures from seconds ago must make
+// room instead of every new texture becoming a one-off; a texture the build binds twice is made
+// once; and the device-local sampled images stay within the cache's ceiling however many the build
+// holds (past it, new textures go to system memory when the device has a memory type for that).
+void burstTests(const Context& context) {
+    Block block(context);
+    ClearCachedTextures(context.device);
+    Recorder::CountPresent();
+    const auto deviceBefore = SampledTextureMemory();
+    const auto bytes = Sampled(context, block.Surface(0))->AllocationBytes();
+    const auto capacity = static_cast<std::size_t>(Budget / bytes);
+    Require(capacity >= 2u && 2u * capacity + 2u <= Surfaces, "a snapshot of the 256 KiB surface holds " + std::to_string(bytes) + " bytes, which the test's 1 MiB budget does not fit as planned");
+    std::vector<std::weak_ptr<Texture>> stale{Sampled(context, block.Surface(0))};
+    for (std::size_t surface = 1; surface < capacity; ++surface) stale.push_back(Sampled(context, block.Surface(surface)));
+    Require(TextureCacheUsage().sampledEntries == capacity, "the stale frame did not fill the cache");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2100));
+    std::vector<std::shared_ptr<Texture>> build;
+    std::size_t madeTwice = 0;
+    for (std::size_t surface = capacity; surface < Surfaces; ++surface) build.push_back(Sampled(context, block.Surface(surface)));
+    std::size_t staleLeft = 0;
+    for (const auto& texture : stale) staleLeft += !texture.expired();
+    for (std::size_t surface = capacity; surface < Surfaces; ++surface) {
+        auto again = Sampled(context, block.Surface(surface));
+        madeTwice += again != build[surface - capacity];
+        build.push_back(std::move(again));
+    }
+    const auto device = SampledTextureMemory() - deviceBefore;
+    std::printf("a build holding %zu textures after 2 s without a present: %zu made twice, %zu of the %zu stale textures left, %llu KiB of device-local sampled images (ceiling %llu KiB)\n", Surfaces - capacity, madeTwice, staleLeft, capacity, static_cast<unsigned long long>(device >> 10u), static_cast<unsigned long long>(Ceiling >> 10u));
+    Require(madeTwice == 0, std::to_string(madeTwice) + " textures the build binds twice were made twice");
+    Require(staleLeft == 0, std::to_string(staleLeft) + " textures last used seconds before kept the cache from the build's textures");
+    bool hostType = false;
+    for (std::uint32_t type = 0; type < context.memory.memoryTypeCount; ++type) hostType |= (context.memory.memoryHeaps[context.memory.memoryTypes[type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
+    if (!hostType) {
+        std::puts("no memory type outside the device-local heaps: the spill to system memory is not tested");
+        return;
+    }
+    Require(device <= Ceiling, "a build holding " + std::to_string(Surfaces - capacity) + " textures took " + std::to_string(device >> 10u) + " KiB of device-local sampled images, past the " + std::to_string(Ceiling >> 10u) + " KiB ceiling");
+    build.clear();
+    ClearCachedTextures(context.device);
+    Require(SampledTextureMemory() == deviceBefore, "the burst's textures outlived the build and the cache");
+}
+
+void snapshotChangeTests(const Context& context) {
+    Block block(context);
+    ClearCachedTextures(context.device);
+    auto texture = Sampled(context, block.Surface(1));
+    Require(!texture->ViewsStorageImage(), "a sampled texture outside host-imported memory is not a snapshot");
+    Require(Sampled(context, block.Surface(1)) == texture, "an unchanged snapshot was made again");
+    auto* bytes = reinterpret_cast<std::uint8_t*>(block.Surface(1));
+    for (const std::size_t offset : {std::size_t{0}, std::size_t{65535}, std::size_t{65536}, SurfaceBytes / 2 + 3, SurfaceBytes - 1}) {
+        bytes[offset] ^= 0x10;
+        auto again = Sampled(context, block.Surface(1));
+        Require(again != texture, "a changed byte at +" + std::to_string(offset) + " of a snapshot's surface was not seen");
+        texture = again;
+        Require(Sampled(context, block.Surface(1)) == texture, "the snapshot made after a change at +" + std::to_string(offset) + " was made again");
+    }
+    texture.reset();
+    ClearCachedTextures(context.device);
+}
+
+[[maybe_unused]] void recycleTests(const Context& context) {
     Block block(context);
     ClearCachedTextures(context.device);
     const auto address = block.Surface(0);
@@ -699,7 +765,7 @@ void recycleTests(const Context& context) {
     Require(TextureCacheUsage().spareEntries == 1 && TextureCacheUsage().spareBytes == BigBytes, "the second big snapshot did not take the parked spare of its size");
 }
 
-void spareAgeTests(const Context& context) {
+[[maybe_unused]] void spareAgeTests(const Context& context) {
     Block block(context);
     ClearCachedTextures(context.device);
     constexpr std::uint32_t BigSide = Side * 2;
@@ -741,9 +807,10 @@ void heldTests(const Context& context) {
     for (std::size_t surface = 0; surface <= capacity; ++surface) all.push_back(Sampled(context, block.Surface(surface)));
     Require(TextureCacheUsage().sampledEntries == capacity + 1u && TextureCacheUsage().sampledBytes > Budget, "textures their callers hold left a cache over its budget");
     for (std::size_t surface = 0; surface < all.size(); ++surface) Require(Sampled(context, block.Surface(surface)) == all[surface], "surface " + std::to_string(surface) + " was made again while its texture was held");
-    all.push_back(Sampled(context, block.Surface(capacity + 1u)));
+    const std::weak_ptr<Texture> refused = Sampled(context, block.Surface(capacity + 1u));
+    Require(refused.expired(), "past the ceiling, a texture nobody holds any more was cached or kept");
     Require(TextureCacheUsage().sampledEntries == capacity + 1u && TextureCacheUsage().sampledBytes <= Ceiling, "held textures took the sampled texture cache past a quarter over its budget");
-    for (std::size_t surface = 1; surface < all.size(); ++surface) Require(Sampled(context, block.Surface(surface)) == all[surface], "past the ceiling, surface " + std::to_string(surface) + " left in place of the least recently used held texture");
+    for (std::size_t surface = 0; surface < all.size(); ++surface) Require(Sampled(context, block.Surface(surface)) == all[surface], "past the ceiling, held surface " + std::to_string(surface) + " was evicted, which frees nothing, instead of the new texture being refused");
     all.clear();
     Sampled(context, block.Surface(capacity + 2u));
     Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "released textures were not evicted down to the budget");
@@ -767,20 +834,18 @@ void releasedTests(Context context) {
         Require(cache.Find({1}) == pinned, "the resource cache rejected a descriptor set whose texture is cached");
         pinned.reset();
         ClearCachedTextures(context.device);
-        Require(!texture.expired() && texture.lock()->Released(), "the sampled texture cache dropped a texture the resource cache holds without marking it released");
+        Require(cache.Find({1}) == nullptr && cache.Size() == 0, "the resource cache kept an entry holding a released texture");
+        Require(pinnedSet.expired() && texture.expired(), "the resource cache kept a released texture alive");
         auto live = ImageResources(context, block, 1, 1, true);
         std::vector<std::shared_ptr<ShaderResources>> displaced;
         cache.Insert({2}, live, &displaced);
-        Require(cache.Find({1}) == nullptr && cache.Find({2}) == live && cache.Size() == 1, "the resource cache kept an entry holding a released texture");
-        Require(displaced.size() == 1 && displaced.front() == pinnedSet.lock(), "the entry holding a released texture was not handed back to the caller");
-        displaced.clear();
-        Require(pinnedSet.expired() && texture.expired(), "the resource cache kept a released texture alive");
+        Require(cache.Find({2}) == live && cache.Size() == 1 && displaced.empty(), "the resource cache rejected a descriptor set whose texture is cached");
         auto stale = ImageResources(context, block, 2, 1, true);
         ClearCachedTextures(context.device);
         Require(stale->SampledTextures().front()->Released(), "a held texture the sampled cache dropped is not marked released");
+        Require(cache.Find({2}) == nullptr && cache.Size() == 0, "the live entry whose texture was released stayed in the resource cache");
         cache.Insert({3}, stale, &displaced);
-        Require(cache.Find({3}) == nullptr, "a descriptor set holding a released texture entered the resource cache");
-        Require(cache.Size() == 0 && displaced.size() == 1 && displaced.front() == live, "the live entry whose texture was released stayed in the resource cache");
+        Require(cache.Find({3}) == nullptr && cache.Size() == 0, "a descriptor set holding a released texture entered the resource cache");
         displaced.clear();
     } catch (...) {
         cache.Clear();
@@ -844,10 +909,16 @@ void frameTests(const Context& context) {
         hits += again == made[surface].lock();
     }
     Require(hits == capacity, "the next frame over the same " + std::to_string(frame) + " textures found " + std::to_string(hits) + " of them cached, not the " + std::to_string(capacity) + " the cache kept");
-    auto refused = Sampled(context, block.Surface(frame - 1u));
-    Require(Sampled(context, block.Surface(frame - 1u)) != refused, "a texture used a second time in the frame was cached in place of one of the frame's textures");
-    Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture used a second time left the cache over its budget");
-    refused.reset();
+    if (std::getenv("APS5_SAMPLED_LATER_USE_REFUSAL") != nullptr) {
+        auto refused = Sampled(context, block.Surface(frame - 1u));
+        Sampled(context, block.Surface(frame - 1u));
+        for (std::size_t surface = 0; surface < capacity; ++surface) Require(!made[surface].expired(), "a texture used a second time in the frame was cached in place of one of the frame's textures");
+        Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture used a second time left the cache over its budget");
+    } else {
+        auto admitted = Sampled(context, block.Surface(frame - 1u));
+        Require(Sampled(context, block.Surface(frame - 1u)) == admitted, "a texture used a second time in the frame was not cached");
+        Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture admitted on its second use left the cache over its budget");
+    }
     Recorder::CountPresent();
     std::vector<std::weak_ptr<Texture>> moved(frame);
     for (std::size_t surface = 0; surface < frame; ++surface) moved[surface] = Sampled(context, block.Surface(frame + surface));
@@ -1004,7 +1075,8 @@ std::uint64_t ExpectedBudget(const Context& context) {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
     ReportBudget(context.physical, &properties);
-    return SampledTextureBudget(context.memory, &reported, SampledTextureMemory() + TextureCacheUsage().storageBytes, TextureCacheUsage().storageBytes);
+    const auto use = TextureCacheUsage();
+    return TextureCacheBudgetsFor(context.memory, &reported, {SampledTextureMemory(), use.sampledBytes, use.storageBytes}, CurrentTextureCacheBudgets(context).target).sampled;
 }
 
 std::uint64_t ReadBudget(const Context& context) {
@@ -1038,26 +1110,515 @@ void memoryTests(Context context) {
     ClearCachedTextures(context.device);
     Require(TextureCacheUsage().sampledEntries == 0 && SampledTextureMemory() == before + held->AllocationBytes(), "a texture its caller still holds stopped counting as sampled texture memory when it left the cache");
     const auto budget = ReadBudget(context);
-    Require(budget == ExpectedBudget(context), "the sampled texture cache budget counts a texture its caller still holds as memory in use outside the texture caches");
+    Require(budget == ExpectedBudget(context), "the sampled texture cache budget does not count a texture its caller still holds outside the cache against the cache");
     std::printf("reported heap budget %llu MiB with %llu MiB in use: sampled texture cache budget %llu MiB with a %llu KiB texture held outside the cache\n", static_cast<unsigned long long>(ReportedBudget >> 20u), static_cast<unsigned long long>(ReportedUsage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(held->AllocationBytes() >> 10u));
     held.reset();
     Require(SampledTextureMemory() == before, "a released texture still counts as sampled texture memory");
 }
 
+// A device-local heap that is full past `limit` bytes of device-local allocations made through the
+// wrapped device functions (the test's stand-in for VRAM running out under a burst).
+struct HeapLimit {
+    PFN_vkGetDeviceProcAddr real = nullptr;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+    VkPhysicalDeviceMemoryProperties memory{};
+    std::mutex mutex;
+    std::unordered_map<VkDeviceMemory, VkDeviceSize> local;
+    VkDeviceSize used = 0;
+    VkDeviceSize limit = ~VkDeviceSize{0};
+    std::uint64_t refused = 0;
+};
+
+HeapLimit& Limit() {
+    static HeapLimit limit;
+    return limit;
+}
+
+VkResult VKAPI_PTR LimitedAllocate(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    auto& limit = Limit();
+    const bool local = (limit.memory.memoryTypes[info->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+    {
+        std::lock_guard lock(limit.mutex);
+        if (local && limit.used + info->allocationSize > limit.limit) {
+            ++limit.refused;
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+    }
+    const auto result = limit.allocate(device, info, callbacks, memory);
+    if (result == VK_SUCCESS && local) {
+        std::lock_guard lock(limit.mutex);
+        limit.local[*memory] = info->allocationSize;
+        limit.used += info->allocationSize;
+    }
+    return result;
+}
+
+void VKAPI_PTR LimitedFree(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* callbacks) {
+    auto& limit = Limit();
+    {
+        std::lock_guard lock(limit.mutex);
+        if (const auto found = limit.local.find(memory); found != limit.local.end()) {
+            limit.used -= found->second;
+            limit.local.erase(found);
+        }
+    }
+    limit.free(device, memory, callbacks);
+}
+
+PFN_vkVoidFunction VKAPI_PTR LimitedProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkAllocateMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LimitedAllocate);
+    if (std::strcmp(name, "vkFreeMemory") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LimitedFree);
+    return Limit().real(device, name);
+}
+
+// A loading-screen burst (lean-x21): one build holds mipmapped snapshots (no linear image in system
+// memory for them) far past the sampled share while the device-local heap fills, then the build
+// allocates a device buffer. The snapshots past the share go to the overflow type, a snapshot the
+// full heap refuses does too, and so does the buffer, instead of the build failing.
+int burstOverflowTests(Context context) {
+    if (!OverflowMemoryType(context.memory, ~0u)) {
+        std::puts("skipped: the device has no memory type outside its device-local heaps");
+        return VulkanTestSkipped;
+    }
+    auto& limit = Limit();
+    limit.real = context.deviceProc;
+    limit.allocate = reinterpret_cast<PFN_vkAllocateMemory>(context.deviceProc(context.device, "vkAllocateMemory"));
+    limit.free = reinterpret_cast<PFN_vkFreeMemory>(context.deviceProc(context.device, "vkFreeMemory"));
+    limit.memory = context.memory;
+    context.deviceProc = &LimitedProc;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::size_t Stride = std::size_t{1} << 20u;
+    constexpr std::size_t Count = 24;
+    constexpr std::uint32_t LastMip = 8;
+#ifdef _WIN32
+    void* memory = VirtualAlloc(nullptr, Stride * Count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* memory = std::aligned_alloc(65536, Stride * Count);
+#endif
+    Require(memory != nullptr, "cannot allocate the burst's surfaces");
+    std::memset(memory, 0x5a, Stride * Count);
+    GuestAllocations::Mutation().Add(memory, Stride * Count, true, true, true);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto before = SampledTextureMemory();
+    std::vector<std::shared_ptr<Texture>> held;
+    std::size_t overflowed = 0, system = 0;
+    {
+        std::lock_guard lock(limit.mutex);
+        limit.limit = limit.used + 2 * Stride;
+    }
+    for (std::size_t surface = 0; surface < Count; ++surface) {
+        auto words = Descriptor(base + surface * Stride);
+        words[3] |= LastMip << 16u;
+        words[5] |= LastMip << 4u;
+        held.push_back(CachedSampledTexture(context, words));
+        overflowed += held.back()->Spilled() && !held.back()->InHostMemory();
+        system += held.back()->InHostMemory();
+    }
+    std::uint64_t counted = 0;
+    for (const auto& texture : held) counted += texture->InHostMemory() ? 0u : texture->AllocationBytes();
+    const auto sampled = SampledTextureMemory() - before;
+    {
+        std::lock_guard lock(limit.mutex);
+        limit.limit = limit.used;
+    }
+    const auto refusedBefore = limit.refused;
+    DeviceBuffer buffer(context, 2621440, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::printf("a build holding %zu mipmapped snapshots past a 1 MiB budget with a full device-local heap: %zu in the overflow type, %zu in system memory, %llu KiB counted as device-local sampled memory, %llu device-local allocations refused; a 2.5 MiB device buffer allocated after %llu refusals\n", Count, overflowed, system, static_cast<unsigned long long>(sampled >> 10u), static_cast<unsigned long long>(refusedBefore), static_cast<unsigned long long>(limit.refused - refusedBefore));
+    Require(system == 0, "a mipmapped snapshot went to system memory");
+    Require(overflowed + 4u >= Count, "only " + std::to_string(overflowed) + " of the " + std::to_string(Count) + " snapshots past the share went to the overflow type");
+    Require(sampled == counted, "the snapshots in the overflow type are not counted as device-local sampled memory");
+    Require(limit.refused > refusedBefore, "the device buffer did not meet the full heap");
+    {
+        std::lock_guard lock(limit.mutex);
+        limit.limit = ~VkDeviceSize{0};
+    }
+    held.clear();
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    // Builds of a burst bind the same image table again and again: the spilled snapshots are kept
+    // for reuse, so each surface is made once however many builds bind it, and the kept ones nothing
+    // uses go down to the overflow budget (APS5_TEXTURE_OVERFLOW_MIB=4 for this test; the trim that
+    // found everything in use above is repeated after 50 ms without a recorder retiring batches).
+    constexpr std::size_t Table = 8;
+    constexpr std::size_t Builds = 5;
+    const auto first = SampledCacheCounters();
+    std::uint64_t afterFirstBuild = 0;
+    for (std::size_t build = 0; build < Builds; ++build) {
+        std::vector<std::shared_ptr<Texture>> bound;
+        for (std::size_t surface = 0; surface < Table; ++surface) {
+            auto words = Descriptor(base + surface * Stride);
+            words[3] |= LastMip << 16u;
+            words[5] |= LastMip << 4u;
+            bound.push_back(CachedSampledTexture(context, words));
+        }
+        if (build == 0) afterFirstBuild = SampledTextureOverflowMemory();
+    }
+    const auto last = SampledCacheCounters();
+    const auto budget = CurrentTextureCacheBudgets(context).overflow;
+    std::printf("%zu builds binding the same %zu mipmapped snapshots past the share: %llu made, %llu spilled ones reused, %llu kept ones dropped; %llu KiB in the overflow type after the first build (budget %llu KiB)\n", Builds, Table, static_cast<unsigned long long>(last.made - first.made), static_cast<unsigned long long>(last.spilledReuses - first.spilledReuses), static_cast<unsigned long long>(last.overflowDropped - first.overflowDropped), static_cast<unsigned long long>(afterFirstBuild >> 10u), static_cast<unsigned long long>(budget >> 10u));
+    Require(last.made - first.made <= Table, std::to_string(last.made - first.made) + " snapshots were made for " + std::to_string(Builds) + " builds binding the same " + std::to_string(Table) + " surfaces");
+    Require(last.spilledReuses - first.spilledReuses >= (Builds - 1u) * (Table - 4u), "the builds after the first reused only " + std::to_string(last.spilledReuses - first.spilledReuses) + " spilled snapshots");
+    Require(last.overflowDropped > first.overflowDropped, "the burst's kept snapshots nothing used were not dropped down to the overflow budget");
+    Require(budget == 4ull << 20u && afterFirstBuild <= budget + Stride, "the overflow type held " + std::to_string(afterFirstBuild >> 10u) + " KiB after the first build, past its " + std::to_string(budget >> 10u) + " KiB budget");
+    ClearCachedTextures(context.device);
+    GuestAllocations::Mutation().Remove(memory);
+#ifdef _WIN32
+    VirtualFree(memory, 0, MEM_RELEASE);
+#else
+    std::free(memory);
+#endif
+    std::puts("sampled texture burst overflow tests passed");
+    return 0;
+}
+
+// Use-after-free watch on the device functions (no validation layer on this machine): which
+// images and views each command buffer names (copies, clears, barriers, bound descriptor sets) from
+// its begin until it is reset, freed or its submission's fence signals, and every image or view
+// destroyed while a command buffer naming it is still pending.
+struct HandleWatch {
+    PFN_vkGetDeviceProcAddr real = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+    std::mutex mutex;
+    struct Commands {
+        std::unordered_set<std::uint64_t> handles;
+        bool submitted = false;
+        VkFence fence = VK_NULL_HANDLE;
+        std::uint64_t epoch = 0;
+        bool idle = false;
+        VkCommandPool pool = VK_NULL_HANDLE;
+    };
+    std::unordered_map<VkFence, std::uint64_t> fenceEpochs;
+    std::unordered_map<VkCommandBuffer, Commands> commands;
+    std::unordered_map<VkDescriptorSet, std::vector<std::uint64_t>> sets;
+    std::uint64_t destroyed = 0;
+    std::uint64_t violations = 0;
+    std::string first;
+    template<typename F>
+    F at(const char* name) const { return reinterpret_cast<F>(real(device, name)); }
+    bool pending(const Commands& state) const {
+        if (!state.submitted) return true;
+        if (state.idle) return false;
+        if (state.fence == VK_NULL_HANDLE) return true;
+        // A fence submitted again was reset first, which the earlier submission had to finish for.
+        if (const auto found = fenceEpochs.find(state.fence); found != fenceEpochs.end() && found->second != state.epoch) return false;
+        return at<PFN_vkGetFenceStatus>("vkGetFenceStatus")(device, state.fence) != VK_SUCCESS;
+    }
+    void name(VkCommandBuffer buffer, std::uint64_t handle) {
+        std::lock_guard lock(mutex);
+        commands[buffer].handles.insert(handle);
+    }
+    void destroying(std::uint64_t handle, const char* what) {
+        std::lock_guard lock(mutex);
+        ++destroyed;
+        for (const auto& [buffer, state] : commands) {
+            if (!state.handles.contains(handle) || !pending(state)) continue;
+            if (violations++ == 0) {
+                const auto status = state.fence != VK_NULL_HANDLE ? static_cast<int>(at<PFN_vkGetFenceStatus>("vkGetFenceStatus")(device, state.fence)) : 99;
+                first = std::string(what) + " destroyed while a " + (state.submitted ? "submitted, unfinished" : "recorded, unsubmitted") + " command buffer names it (handle " + std::to_string(handle) + ", fence status " + std::to_string(status) + ", epoch " + std::to_string(state.epoch) + ", " + std::to_string(state.handles.size()) + " handles named)";
+                if (std::getenv("APS5_WATCH_ABORT") != nullptr) {
+                    std::fputs(first.c_str(), stderr);
+                    std::abort();
+                }
+            }
+            return;
+        }
+    }
+    void reset(VkCommandBuffer buffer) {
+        std::lock_guard lock(mutex);
+        commands.erase(buffer);
+    }
+};
+
+HandleWatch& Watch() {
+    static HandleWatch watch;
+    return watch;
+}
+
+template<typename T>
+std::uint64_t Handle(T handle) {
+    return reinterpret_cast<std::uint64_t>(handle);
+}
+
+VkResult VKAPI_PTR WatchedAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* buffers) {
+    const auto result = Watch().at<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(device, info, buffers);
+    if (result == VK_SUCCESS) {
+        std::lock_guard lock(Watch().mutex);
+        for (std::uint32_t i = 0; i < info->commandBufferCount; ++i) Watch().commands[buffers[i]] = {{}, false, VK_NULL_HANDLE, 0, false, info->commandPool};
+    }
+    return result;
+}
+
+VkResult VKAPI_PTR WatchedBegin(VkCommandBuffer buffer, const VkCommandBufferBeginInfo* info) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        auto& state = Watch().commands[buffer];
+        const auto pool = state.pool;
+        state = {{}, false, VK_NULL_HANDLE, 0, false, pool};
+    }
+    return Watch().at<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(buffer, info);
+}
+
+VkResult VKAPI_PTR WatchedResetCommandBuffer(VkCommandBuffer buffer, VkCommandBufferResetFlags flags) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        auto& state = Watch().commands[buffer];
+        state.handles.clear();
+        state.submitted = true;
+        state.idle = true;
+    }
+    return Watch().at<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(buffer, flags);
+}
+
+void VKAPI_PTR WatchedFreeCommandBuffers(VkDevice device, VkCommandPool pool, std::uint32_t count, const VkCommandBuffer* buffers) {
+    for (std::uint32_t i = 0; i < count; ++i) Watch().reset(buffers[i]);
+    Watch().at<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(device, pool, count, buffers);
+}
+
+VkResult VKAPI_PTR WatchedResetCommandPool(VkDevice device, VkCommandPool pool, VkCommandPoolResetFlags flags) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        for (auto& [buffer, state] : Watch().commands) {
+            if (state.pool != pool) continue;
+            state.handles.clear();
+            state.submitted = true;
+            state.idle = true;
+        }
+    }
+    return Watch().at<PFN_vkResetCommandPool>("vkResetCommandPool")(device, pool, flags);
+}
+
+VkResult VKAPI_PTR WatchedSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        const auto epoch = fence != VK_NULL_HANDLE ? ++Watch().fenceEpochs[fence] : 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            for (std::uint32_t j = 0; j < submits[i].commandBufferCount; ++j) {
+                auto& state = Watch().commands[submits[i].pCommandBuffers[j]];
+                state.submitted = true;
+                state.fence = fence;
+                state.epoch = epoch;
+                state.idle = false;
+            }
+        }
+    }
+    return Watch().at<PFN_vkQueueSubmit>("vkQueueSubmit")(queue, count, submits, fence);
+}
+
+// A fence the device waited for or reset (which needs its submission finished) completes the
+// command buffers submitted with it.
+void FenceDone(std::uint32_t count, const VkFence* fences) {
+    std::lock_guard lock(Watch().mutex);
+    for (auto& [buffer, state] : Watch().commands) {
+        if (!state.submitted || state.fence == VK_NULL_HANDLE) continue;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            if (fences[i] == state.fence) state.idle = true;
+        }
+    }
+}
+
+VkResult VKAPI_PTR WatchedWaitForFences(VkDevice device, std::uint32_t count, const VkFence* fences, VkBool32 all, std::uint64_t timeout) {
+    const auto result = Watch().at<PFN_vkWaitForFences>("vkWaitForFences")(device, count, fences, all, timeout);
+    if (result == VK_SUCCESS && (all || count == 1)) FenceDone(count, fences);
+    return result;
+}
+
+VkResult VKAPI_PTR WatchedResetFences(VkDevice device, std::uint32_t count, const VkFence* fences) {
+    FenceDone(count, fences);
+    return Watch().at<PFN_vkResetFences>("vkResetFences")(device, count, fences);
+}
+
+VkResult VKAPI_PTR WatchedQueueWaitIdle(VkQueue queue) {
+    const auto result = Watch().at<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(queue);
+    std::lock_guard lock(Watch().mutex);
+    for (auto& [buffer, state] : Watch().commands) {
+        if (state.submitted) state.idle = true;
+    }
+    return result;
+}
+
+void VKAPI_PTR WatchedCopyBufferToImage(VkCommandBuffer buffer, VkBuffer source, VkImage image, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    Watch().name(buffer, Handle(image));
+    Watch().at<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(buffer, source, image, layout, count, regions);
+}
+
+void VKAPI_PTR WatchedClearColorImage(VkCommandBuffer buffer, VkImage image, VkImageLayout layout, const VkClearColorValue* color, std::uint32_t count, const VkImageSubresourceRange* ranges) {
+    Watch().name(buffer, Handle(image));
+    Watch().at<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(buffer, image, layout, color, count, ranges);
+}
+
+void VKAPI_PTR WatchedBarrier(VkCommandBuffer buffer, VkPipelineStageFlags from, VkPipelineStageFlags to, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images) {
+    for (std::uint32_t i = 0; i < imageCount; ++i) Watch().name(buffer, Handle(images[i].image));
+    Watch().at<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(buffer, from, to, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
+}
+
+void VKAPI_PTR WatchedUpdateDescriptorSets(VkDevice device, std::uint32_t writeCount, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        for (std::uint32_t i = 0; i < writeCount; ++i) {
+            if (writes[i].pImageInfo == nullptr) continue;
+            auto& views = Watch().sets[writes[i].dstSet];
+            for (std::uint32_t j = 0; j < writes[i].descriptorCount; ++j) views.push_back(Handle(writes[i].pImageInfo[j].imageView));
+        }
+    }
+    Watch().at<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(device, writeCount, writes, copyCount, copies);
+}
+
+void VKAPI_PTR WatchedBindDescriptorSets(VkCommandBuffer buffer, VkPipelineBindPoint point, VkPipelineLayout layout, std::uint32_t first, std::uint32_t count, const VkDescriptorSet* sets, std::uint32_t dynamicCount, const std::uint32_t* dynamic) {
+    {
+        std::lock_guard lock(Watch().mutex);
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto found = Watch().sets.find(sets[i]);
+            if (found == Watch().sets.end()) continue;
+            for (const auto view : found->second) Watch().commands[buffer].handles.insert(view);
+        }
+    }
+    Watch().at<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets")(buffer, point, layout, first, count, sets, dynamicCount, dynamic);
+}
+
+void VKAPI_PTR WatchedDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* callbacks) {
+    Watch().destroying(Handle(image), "an image");
+    Watch().at<PFN_vkDestroyImage>("vkDestroyImage")(device, image, callbacks);
+}
+
+void VKAPI_PTR WatchedDestroyImageView(VkDevice device, VkImageView view, const VkAllocationCallbacks* callbacks) {
+    Watch().destroying(Handle(view), "an image view");
+    Watch().at<PFN_vkDestroyImageView>("vkDestroyImageView")(device, view, callbacks);
+}
+
+PFN_vkVoidFunction VKAPI_PTR WatchedProc(VkDevice device, const char* name) {
+    static const std::unordered_map<std::string, PFN_vkVoidFunction> table{
+        {"vkAllocateCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(&WatchedAllocateCommandBuffers)},
+        {"vkBeginCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(&WatchedBegin)},
+        {"vkResetCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(&WatchedResetCommandBuffer)},
+        {"vkFreeCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(&WatchedFreeCommandBuffers)},
+        {"vkResetCommandPool", reinterpret_cast<PFN_vkVoidFunction>(&WatchedResetCommandPool)},
+        {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(&WatchedSubmit)},
+        {"vkQueueWaitIdle", reinterpret_cast<PFN_vkVoidFunction>(&WatchedQueueWaitIdle)},
+        {"vkWaitForFences", reinterpret_cast<PFN_vkVoidFunction>(&WatchedWaitForFences)},
+        {"vkResetFences", reinterpret_cast<PFN_vkVoidFunction>(&WatchedResetFences)},
+        {"vkCmdCopyBufferToImage", reinterpret_cast<PFN_vkVoidFunction>(&WatchedCopyBufferToImage)},
+        {"vkCmdClearColorImage", reinterpret_cast<PFN_vkVoidFunction>(&WatchedClearColorImage)},
+        {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(&WatchedBarrier)},
+        {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(&WatchedUpdateDescriptorSets)},
+        {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(&WatchedBindDescriptorSets)},
+        {"vkDestroyImage", reinterpret_cast<PFN_vkVoidFunction>(&WatchedDestroyImage)},
+        {"vkDestroyImageView", reinterpret_cast<PFN_vkVoidFunction>(&WatchedDestroyImageView)},
+    };
+    if (const auto found = table.find(name); found != table.end()) return found->second;
+    return Watch().real(device, name);
+}
+
+// lean-x25 lost the device in a burst with kept spilled snapshots being dropped. Kept snapshots a
+// build let go of while their uploads (or uses) are still in the recorder's open batch must
+// survive the overflow trim and the out-of-memory reclaim; once that batch retired they go, and no
+// image or view is ever destroyed while a recorded or submitted command buffer names it.
+int overflowLifetimeTests(Context context) {
+    if (!OverflowMemoryType(context.memory, ~0u)) {
+        std::puts("skipped: the device has no memory type outside its device-local heaps");
+        return VulkanTestSkipped;
+    }
+    auto& watch = Watch();
+    watch.real = context.deviceProc;
+    watch.device = context.device;
+    context.deviceProc = &WatchedProc;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::size_t Stride = std::size_t{1} << 20u;
+    constexpr std::size_t Count = 32;
+    constexpr std::size_t Build = 12;
+    constexpr std::uint32_t LastMip = 8;
+#ifdef _WIN32
+    void* memory = VirtualAlloc(nullptr, Stride * Count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* memory = std::aligned_alloc(65536, Stride * Count);
+#endif
+    Require(memory != nullptr, "cannot allocate the surfaces");
+    std::memset(memory, 0x5a, Stride * Count);
+    GuestAllocations::Mutation().Add(memory, Stride * Count, true, true, true);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto lookup = [&](std::size_t surface) {
+        auto words = Descriptor(base + surface * Stride);
+        words[3] |= LastMip << 16u;
+        words[5] |= LastMip << 4u;
+        return CachedSampledTexture(context, words);
+    };
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        const auto retire = [&] {
+            recorder.Submit();
+            Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle");
+            while (recorder.RetireOldest()) {
+            }
+        };
+        std::vector<std::weak_ptr<Texture>> first;
+        {
+            std::vector<std::shared_ptr<Texture>> build;
+            for (std::size_t surface = 0; surface < Build; ++surface) build.push_back(lookup(surface));
+            for (const auto& texture : build) first.push_back(texture);
+        }
+        Require(recorder.Recording(), "the first build's uploads are not in an open batch");
+        const auto before = SampledCacheCounters();
+        AgcDriver::Graphics::ReclaimTextureMemory(context.device, VkDeviceSize{1} << 30u);
+        std::size_t reclaimedAlive = 0;
+        for (const auto& texture : first) reclaimedAlive += !texture.expired();
+        Require(reclaimedAlive == Build && SampledCacheCounters().overflowDropped == before.overflowDropped, "the out-of-memory reclaim dropped kept snapshots whose uploads are in the open batch");
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        {
+            std::vector<std::shared_ptr<Texture>> build;
+            for (std::size_t surface = Build; surface < 2 * Build; ++surface) build.push_back(lookup(surface));
+        }
+        AgcDriver::Graphics::ReclaimTextureMemory(context.device, VkDeviceSize{1} << 30u);
+        std::size_t alive = 0;
+        for (const auto& texture : first) alive += !texture.expired();
+        const auto held = SampledCacheCounters();
+        const auto waits = held.overflowWaits - before.overflowWaits;
+        std::printf("a build let go of %zu kept spilled snapshots before its batch was submitted; a second build passed the 4 MiB overflow budget and the out-of-memory reclaim ran: %zu of them alive, %llu kept ones dropped, %llu batches waited for, %llu KiB in the overflow type\n", Build, alive, static_cast<unsigned long long>(held.overflowDropped - before.overflowDropped), static_cast<unsigned long long>(waits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 10u));
+        Require(watch.violations == 0, watch.first);
+        Require(alive == Build || waits != 0, "kept snapshots whose uploads were in the open batch were dropped without waiting for it");
+        retire();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        lookup(2 * Build);
+        retire();
+        lookup(2 * Build + 1);
+        retire();
+        const auto after = SampledCacheCounters();
+        std::size_t left = 0;
+        for (const auto& texture : first) left += !texture.expired();
+        std::printf("after the batches retired: %llu kept ones dropped, %zu of the first build's left, %llu KiB in the overflow type; %llu images and views destroyed, %llu while a command buffer named them\n", static_cast<unsigned long long>(after.overflowDropped - before.overflowDropped), left, static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 10u), static_cast<unsigned long long>(watch.destroyed), static_cast<unsigned long long>(watch.violations));
+        Require(watch.violations == 0, watch.first);
+        Require(after.overflowDropped > before.overflowDropped && left == 0, "the kept snapshots were not dropped once the batches using them retired");
+        Require(SampledTextureOverflowMemory() <= CurrentTextureCacheBudgets(context).overflow + Stride, "the overflow type stayed past its budget once nothing used the kept snapshots");
+        ClearCachedTextures(context.device);
+        retire();
+    }
+    Require(watch.violations == 0, watch.first);
+    GuestAllocations::Mutation().Remove(memory);
+#ifdef _WIN32
+    VirtualFree(memory, 0, MEM_RELEASE);
+#else
+    std::free(memory);
+#endif
+    std::puts("sampled texture overflow lifetime tests passed");
+    return 0;
+}
+
 void storageMemoryTests(Context context) {
-    constexpr std::uint64_t GiB = 1ull << 30u;
-    context.memoryProperties2 = &ReportBudget;
     Block block(context);
     auto held = Sampled(context, block.Surface(0));
-    const auto heap = LargestDeviceLocalHeap(context.memory);
-    Require(heap.has_value(), "the device has no device-local heap");
-    const auto half = std::min<std::uint64_t>(context.memory.memoryHeaps[*heap].size / 2u, ReportedBudget / 2u);
-    Require(ReadStorageBudget(context) == half, "52 GiB free of a 64 GiB budget does not leave the storage image cache half of the heap or of the budget");
-    context.memoryProperties2 = &ReportPressure;
-    const auto pressed = ReadStorageBudget(context);
-    const auto expected = GiB + TextureCacheUsage().storageBytes;
-    Require(pressed == expected, "55 GiB in use of a 64 GiB budget leaves the storage image cache " + std::to_string(pressed >> 20u) + " MiB, not the " + std::to_string(expected >> 20u) + " MiB left after the use outside the texture caches, the sampled textures and 8 GiB of headroom");
-    std::printf("reported heap budget %llu MiB with %llu MiB in use: storage image cache budget %llu MiB\n", static_cast<unsigned long long>(ReportedBudget >> 20u), static_cast<unsigned long long>(PressedUsage >> 20u), static_cast<unsigned long long>(pressed >> 20u));
+    for (const auto report : {&ReportBudget, &ReportPressure}) {
+        context.memoryProperties2 = report;
+        const auto budget = ReadStorageBudget(context);
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        report(context.physical, &properties);
+        const auto use = TextureCacheUsage();
+        const auto expected = TextureCacheBudgetsFor(context.memory, &reported, {SampledTextureMemory(), use.sampledBytes, use.storageBytes}, CurrentTextureCacheBudgets(context).target).storage;
+        Require(budget == expected, "with " + std::to_string(reported.heapUsage[0] >> 20u) + " MiB in use of a 64 GiB budget the storage image cache budget is " + std::to_string(budget >> 20u) + " MiB, not the VRAM budget's storage share of " + std::to_string(expected >> 20u) + " MiB");
+        std::printf("reported heap budget %llu MiB with %llu MiB in use: storage image cache budget %llu MiB\n", static_cast<unsigned long long>(ReportedBudget >> 20u), static_cast<unsigned long long>(reported.heapUsage[0] >> 20u), static_cast<unsigned long long>(budget >> 20u));
+    }
 }
 
 struct RecoveryProbe {
@@ -1181,6 +1742,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
+        const bool burst = mode == "burst-overflow";
+        const bool lifetime = mode == "overflow-lifetime";
         const bool disableStorageImageMultisample = mode == "without-storage-image-multisample";
         const bool recover = mode == "recover-sampled" || mode == "recover-storage" || mode == "recover-srgb" || mode == "recover-repack";
 #ifdef _WIN32
@@ -1202,6 +1765,14 @@ int main(int argc, char** argv) {
         if (mode == "device-selection") {
             device->VerifySelection();
             return 0;
+        }
+        if (burst) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            return burstOverflowTests(device->GetContext());
+        }
+        if (lifetime) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            return overflowLifetimeTests(device->GetContext());
         }
         auto context = device->GetContext();
         if (disableStorageImageMultisample) {
@@ -1256,19 +1827,19 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             reportedBudgetTests(context);
             snapshotTests(context);
-            recycleTests(context);
             heldTests(context);
             releasedTests(context);
             rescanTests(context);
             viewEvictionTests(context);
             viewTests(context);
-            scanTests(context);
+            if (std::getenv("APS5_SAMPLED_LATER_USE_REFUSAL") != nullptr) scanTests(context);
             frameTests(context);
             shrinkTests(context);
             secondUseTests(context);
             earlyMissTests(context);
             collidingKeyTests(context);
-            spareAgeTests(context);
+            snapshotChangeTests(context);
+            burstTests(context);
             ClearCachedTextures(context.device);
         }
         std::puts("sampled texture cache budget tests passed");

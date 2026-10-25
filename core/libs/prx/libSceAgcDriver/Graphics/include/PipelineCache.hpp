@@ -25,6 +25,7 @@ public:
     PipelineCache& operator=(const PipelineCache&) = delete;
     VkPipelineCache Handle() const { return cache; }
     PipelineCacheSynchronization& Synchronization() { return synchronization; }
+    bool SaveUnlessCreating() { return save(false, false); }
     void SaveNow();
     void SaveUnlessBusy();
 
@@ -48,7 +49,7 @@ private:
     File readFile() const;
     std::optional<FileHeader> readHeader() const;
     void load(std::vector<std::byte>& initialData);
-    void save(bool final, bool waitForPipelines);
+    bool save(bool final, bool waitForPipelines);
     void run();
 
     Context context;

@@ -1,3 +1,6 @@
+#include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStatsDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -21,6 +24,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DrawInputsInPlace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupBarrier.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubgroupClock.hpp"
+#include "prx/libSceAgcDriver/Graphics/shaders/FmaProbe_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PresentMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
@@ -31,6 +35,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessResolvers.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
@@ -44,6 +52,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreationGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -53,6 +62,8 @@
 #include <windows.h>
 #endif
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <chrono>
 #include <charconv>
 #include <condition_variable>
@@ -67,9 +78,11 @@
 #include <spirv/unified1/spirv.hpp>
 #include <array>
 #include <optional>
+#include <set>
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <map>
 #include <deque>
 #include <limits>
 #include <list>
@@ -151,7 +164,7 @@ bool CoreVulkanCapability(std::uint32_t capability) {
     }
 }
 
-void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
+void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, std::size_t words, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
     info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -164,6 +177,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
+    const auto admitted = Graphics::PipelineCreationGate::Shared().Admit(words, !GuestMemory::GpuMutex().HeldByThisThread());
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
     PerformanceCounters::CountPipeline();
@@ -301,7 +315,34 @@ struct ComputePipelineKey {
     ShaderRecompiler::PipelineIdentity identity;
     bool pushConstants = false;
     auto operator<=>(const ComputePipelineKey&) const = default;
-    static ComputePipelineKey Of(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) { return {shader.Identity(), pushConstants}; }
+    static ComputePipelineKey Of(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) {
+        using Role = ShaderRecompiler::DescriptorRole;
+        using Kind = ShaderRecompiler::DescriptorKind;
+        auto identity = shader.Identity();
+        static const bool exactCounts = std::getenv("APS5_TABLE_COUNT_NEUTRAL_PIPELINES") == nullptr;
+        if (identity.Empty() || exactCounts) return {identity, pushConstants};
+        const bool storageTable = std::any_of(shader.bindings.begin(), shader.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == Role::ImageTable && binding.kind == Kind::StorageImage; });
+        if (storageTable) return {identity, pushConstants};
+        const auto hash = shader.spirv.ContentHash();
+        identity = {hash.low, hash.high};
+        const auto mix = [&](std::uint64_t value) {
+            identity.low = (identity.low ^ value) * 0x9e3779b97f4a7c15ull;
+            identity.low ^= identity.low >> 29u;
+            identity.high = (identity.high ^ (value + 0x7f4a7c159e3779b9ull)) * 0xc2b2ae3d27d4eb4full;
+            identity.high ^= identity.high >> 31u;
+        };
+        mix(shader.specialization.size());
+        for (const auto& constant : shader.specialization) mix(constant.id | (static_cast<std::uint64_t>(constant.value) << 32u));
+        mix(shader.hostSubgroupSize | (shader.fullSubgroups ? 0x10000u : 0u) | (static_cast<std::uint64_t>(shader.workgroupMemoryDwords) << 32u));
+        mix(shader.bindings.size());
+        for (const auto& binding : shader.bindings) {
+            const bool variable = binding.role == Role::SamplerTable || (binding.role == Role::ImageTable && binding.kind == Kind::SampledImage);
+            mix(binding.descriptorSet | (static_cast<std::uint64_t>(binding.binding) << 16u) | (static_cast<std::uint64_t>(binding.kind) << 40u) | (variable ? 0u : static_cast<std::uint64_t>(binding.count) << 48u));
+        }
+        mix(0x7461626c65ull);
+        if (identity.Empty()) identity.low = 1;
+        return {identity, pushConstants};
+    }
 };
 
 constexpr std::uint64_t WorkgroupMemoryGranule = 1u << 20u;
@@ -379,6 +420,8 @@ struct VulkanDevice::State {
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    // Startup probe (fusedFmaProbe): GLSL.std.450 Fma is fused on this device (SpirvTarget::fusedFma).
+    bool fusedFma = false;
     bool float16DenormPreserve = false;
     bool float32FlushToZeroCandidate = false;
     bool float32FlushToZero = false;
@@ -397,6 +440,11 @@ struct VulkanDevice::State {
     bool descriptorBindingPartiallyBound = false;
     bool descriptorBindingVariableDescriptorCount = false;
     bool runtimeDescriptorArray = false;
+    bool storageImageUpdateAfterBind = false;
+    bool updateUnusedWhilePending = false;
+    bool bindlessImages = false;
+    std::unique_ptr<Graphics::BindlessTable> bindlessTable;
+    std::unique_ptr<Graphics::TextureService> textureService;
     VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptorIndexingProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT};
     bool imageInt64Atomics = false;
     bool bufferInt64Atomics = false;
@@ -435,6 +483,12 @@ struct VulkanDevice::State {
     VkQueue sparseQueue = VK_NULL_HANDLE;
     std::mutex sparseQueueMutex;
     VkQueue settleQueue = VK_NULL_HANDLE;
+    // Graphics family queue index 2 for the async compute lane (Recorder lanes, APS5_ASYNC_LANE).
+    VkQueue asyncQueue = VK_NULL_HANDLE;
+    bool asyncQueueWanted = false;
+    std::uint32_t asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+    std::uint32_t asyncIndex = 0;
+    VkCommandPool asyncPool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::mutex settleQueueMutex;
@@ -479,6 +533,7 @@ struct VulkanDevice::State {
     // Compute pipeline objects by variant (and push-constant use), under their own mutex: the
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
+    std::atomic<bool> verifyComputeLayouts{false};
     AgcDriver::Mutex computePipelinesMutex;
     std::map<ComputePipelineKey, std::shared_ptr<ComputePipelineObjects>> computePipelines;
     std::map<ComputePipelineKey, std::shared_future<std::shared_ptr<ComputePipelineObjects>>> computePipelinesBuilding;
@@ -611,6 +666,7 @@ struct VulkanDevice::State {
         auto memory = std::make_shared<WorkgroupMemory>();
         memory->device = device;
         memory->destroyPool = DeviceFunction<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool");
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::WorkgroupMemory);
         memory->buffer = std::make_unique<Graphics::DeviceBuffer>(context, static_cast<std::size_t>(size), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -675,6 +731,7 @@ struct VulkanDevice::State {
             buffer.size = pixels.size();
             buffer.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
             buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Present);
             check(DeviceFunction<PFN_vkCreateBuffer>("vkCreateBuffer")(device, &buffer, nullptr, &uploadBuffer), "vkCreateBuffer display upload");
             VkMemoryRequirements requirements{};
             DeviceFunction<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(device, uploadBuffer, &requirements);
@@ -760,12 +817,13 @@ struct VulkanDevice::State {
             const auto batches = recorder->CompletedBatches(range.afterSerial, range.throughSerial, missing);
             if (missing != 0 && !force && newest < range.afterSerial + Graphics::Recorder::CompletedRingSize / 2) break;
             retiredRanges.pop_front();
-            double busyMs = 0, firstNs = 0, lastNs = 0;
+            double busyMs = 0, asyncBusyMs = 0, firstNs = 0, lastNs = 0;
             bool stamped = false;
             std::uint64_t checked = 0, overwritten = 0;
             for (const auto& batch : batches) {
                 if (batch.gpuEndNs > batch.gpuStartNs) {
                     busyMs += (batch.gpuEndNs - batch.gpuStartNs) / 1e6;
+                    if (batch.lane == 1) asyncBusyMs += (batch.gpuEndNs - batch.gpuStartNs) / 1e6;
                     firstNs = stamped ? std::min(firstNs, batch.gpuStartNs) : batch.gpuStartNs;
                     lastNs = stamped ? std::max(lastNs, batch.gpuEndNs) : batch.gpuEndNs;
                     stamped = true;
@@ -780,6 +838,7 @@ struct VulkanDevice::State {
             const double gapMs = stamped ? (lastNs - firstNs) / 1e6 - busyMs : 0;
             if (auto* frame = PerformanceContext::Current()) frame->NoteRetired(0, busyMs, gapMs);
             presentCounters.gpuBusyMs += busyMs;
+            presentCounters.asyncBusyMs += asyncBusyMs;
             presentCounters.gpuGapMs += gapMs;
             presentCounters.gpuUnread += missing;
             presentCounters.readsChecked += checked;
@@ -869,7 +928,9 @@ struct VulkanDevice::State {
                 }
             }
             Graphics::DestroyShadows(device);
+            textureService.reset();
             recorder.reset();
+            bindlessTable.reset();
             // Cached graphics pipelines (with their framebuffers, modules, render passes and layouts)
             // belong to this device and must be destroyed while it lives.
             Graphics::ClearCachedPipelines(device);
@@ -932,6 +993,7 @@ struct VulkanDevice::State {
                 destroyPool(device, pool, nullptr);
             }
             if (settlePool != VK_NULL_HANDLE) destroyPool(device, settlePool, nullptr);
+            if (asyncPool != VK_NULL_HANDLE) destroyPool(device, asyncPool, nullptr);
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
@@ -1081,7 +1143,7 @@ ComputePipelineReplayResult VulkanDevice::ReplayComputePipeline(const ComputePip
     check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects.layout), "vkCreatePipelineLayout replay");
     result.layoutMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
-    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline);
+    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), replay.cache, objects.module, objects.layout, capture.flags, capture.stageFlags, specialization.Info(), capture.requiredSubgroupSize, &objects.pipeline, capture.spirv.size());
     result.pipelineMilliseconds = elapsed(phase);
     phase = std::chrono::steady_clock::now();
     const auto getCache = state->DeviceFunction<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
@@ -1681,7 +1743,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     queueInfo.queueFamilyIndex = family;
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &priority;
-    const float priorities[2]{1.0f, 1.0f};
+    const float priorities[3]{1.0f, 1.0f, 1.0f};
 #ifdef _WIN32
     const bool settles = true;
 #else
@@ -1694,6 +1756,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         getFamilies(selected, &families, nullptr);
         queues.resize(families);
         getFamilies(selected, &families, queues.data());
+        // The async lane's compute-only family, whether or not the graphics family has a queue for the
+        // settles: RADV's graphics family has one queue, and its settle queue then takes the compute family.
+        const char* graphicsFamily = std::getenv("APS5_LANE_GRAPHICS_FAMILY");
+        if (Graphics::Recorder::AsyncLaneRing() != 0 && !compileOnly && (graphicsFamily == nullptr || std::string_view(graphicsFamily) != "1")) {
+            for (std::uint32_t i = 0; i < families && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED; ++i) {
+                if (i != family && queues[i].queueCount != 0 && (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0 && (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) == 0) state->asyncFamily = i;
+            }
+        }
     }
     VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     deviceInfo.queueCreateInfoCount = 1;
@@ -1732,22 +1802,26 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     const bool settleQueue = plan.settle;
     const auto settleFamily = plan.settleFamily;
     const auto settleIndex = plan.settleIndex;
-    VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+    VkDeviceQueueCreateInfo queueInfos[4]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
     queueInfos[0].queueCount = plan.mainCount;
-    queueInfos[0].pQueuePriorities = plan.mainCount == 2 ? priorities : &priority;
+    if (Graphics::Recorder::AsyncLaneRing() != 0 && state->asyncFamily == VK_QUEUE_FAMILY_IGNORED && plan.mainCount == 2 && queues[family].queueCount >= 3 && !compileOnly) {
+        queueInfos[0].queueCount = 3;
+        state->asyncQueueWanted = true;
+    }
+    queueInfos[0].pQueuePriorities = queueInfos[0].queueCount >= 2 ? priorities : &priority;
     deviceInfo.queueCreateInfoCount = 1;
     const auto addQueue = [&](std::uint32_t queueFamily, std::uint32_t index) {
         for (std::uint32_t info = 1; info < deviceInfo.queueCreateInfoCount; ++info) {
             if (queueInfos[info].queueFamilyIndex != queueFamily) continue;
             queueInfos[info].queueCount = std::max(queueInfos[info].queueCount, index + 1);
-            queueInfos[info].pQueuePriorities = queueInfos[info].queueCount == 2 ? priorities : &priority;
+            queueInfos[info].pQueuePriorities = queueInfos[info].queueCount >= 2 ? priorities : &priority;
             return;
         }
         auto& added = queueInfos[deviceInfo.queueCreateInfoCount++];
         added = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
         added.queueFamilyIndex = queueFamily;
         added.queueCount = index + 1;
-        added.pQueuePriorities = added.queueCount == 2 ? priorities : &priority;
+        added.pQueuePriorities = added.queueCount >= 2 ? priorities : &priority;
     };
     if (plan.settle && plan.settleFamily != family) addQueue(plan.settleFamily, plan.settleIndex);
     if (plan.sparseFamily != VK_QUEUE_FAMILY_IGNORED) addQueue(plan.sparseFamily, plan.sparseIndex);
@@ -1760,6 +1834,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     enabled.sparseResidencyAliased = state->sparseBinding ? available.sparseResidencyAliased : VK_FALSE;
     state->sparseResidencyBuffer = enabled.sparseResidencyBuffer == VK_TRUE;
     state->sparseResidencyAliased = enabled.sparseResidencyAliased == VK_TRUE;
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        VkDeviceQueueCreateInfo* shared = nullptr;
+        for (std::uint32_t i = 0; i < deviceInfo.queueCreateInfoCount; ++i) {
+            if (queueInfos[i].queueFamilyIndex == state->asyncFamily) shared = &queueInfos[i];
+        }
+        if (shared != nullptr) {
+            // The family already has a queue (the settle or sparse one): the lane takes one more of it
+            // when the family has one, never the same VkQueue.
+            if (shared->queueCount < queues[state->asyncFamily].queueCount && shared->queueCount < 3) {
+                state->asyncIndex = shared->queueCount++;
+                shared->pQueuePriorities = priorities;
+            } else {
+                state->asyncFamily = VK_QUEUE_FAMILY_IGNORED;
+            }
+        } else {
+            auto& asyncInfo = queueInfos[deviceInfo.queueCreateInfoCount++];
+            asyncInfo = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            asyncInfo.queueFamilyIndex = state->asyncFamily;
+            asyncInfo.queueCount = 1;
+            asyncInfo.pQueuePriorities = &priority;
+        }
+    }
     // Indirect draw records with a non-zero first instance, and several records per call.
     enabled.drawIndirectFirstInstance = available.drawIndirectFirstInstance;
     enabled.multiDrawIndirect = available.multiDrawIndirect;
@@ -1823,7 +1919,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->descriptorBindingPartiallyBound = descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
         state->descriptorBindingVariableDescriptorCount = descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
         state->runtimeDescriptorArray = descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
-        if (state->storageBufferUpdateAfterBind || state->sampledImageUpdateAfterBind) {
+        state->storageImageUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE;
+        state->updateUnusedWhilePending = descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending == VK_TRUE;
+        if (state->storageBufferUpdateAfterBind || state->sampledImageUpdateAfterBind || Graphics::BindlessImagesRequested()) {
             VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &state->descriptorIndexingProperties};
             state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
         }
@@ -2074,10 +2172,25 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
+    if (Graphics::BindlessImagesRequested()) {
+        const Graphics::BindlessFeatureSupport support{true, robustness2.nullDescriptor == VK_TRUE, state->runtimeDescriptorArray, state->descriptorBindingPartiallyBound, state->descriptorIndexing, state->descriptorIndexing, state->sampledImageUpdateAfterBind, state->storageImageUpdateAfterBind, state->updateUnusedWhilePending};
+        if (const auto missing = Graphics::BindlessUnsupported(support)) {
+            std::fprintf(stderr, "[bindless] APS5_BINDLESS_IMAGES=1 is ignored: the device lacks %s\n", missing->c_str());
+        } else {
+            descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+            descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
+            descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+            state->bindlessImages = true;
+            if ((state->subgroup.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) != 0 && (state->subgroup.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0) state->capabilities.push_back(spv::CapabilityGroupNonUniformQuad);
+        }
+    }
     deviceInfo.pNext = &bdaFeatures;
-    auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
-    state->shaderProfile = std::move(shaderProfile);
+    state->deviceProc = MemoryStats::TrackDevice(state->device, selected, state->memoryProperties, state->deviceProc,
+        state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr);
+    // Before the profile (its target carries the result into every recompile and cache key).
+    state->fusedFma = fusedFmaProbe(*state, family);
+    state->shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     if (compileOnly) return;
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
@@ -2100,23 +2213,36 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     state->queueFamily = family;
+    if (state->asyncQueueWanted) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 2, &state->asyncQueue);
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->asyncFamily, state->asyncIndex, &state->asyncQueue);
+        state->deviceProc = MemoryStats::ShareBuffersProc(state->device, state->deviceProc, family, state->asyncFamily);
+        std::fprintf(stderr, "[gpu] async compute lane: queue family %u index %u (compute only; APS5_LANE_GRAPHICS_FAMILY=1 uses a third graphics-family queue); buffers are created CONCURRENT across families %u and %u\n", state->asyncFamily, state->asyncIndex, family, state->asyncFamily);
+    }
     if (settleQueue) {
         state->settleFamily = settleFamily;
         state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, settleFamily, settleIndex, &state->settleQueue);
     }
     if (state->sparseFamily != VK_QUEUE_FAMILY_IGNORED) state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, state->sparseFamily, state->sparseIndex, &state->sparseQueue);
-    if (checkpoints) state->checkpointMarker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+    if (checkpoints) {
+        const auto marker = state->DeviceFunction<PFN_vkCmdSetCheckpointNV>("vkCmdSetCheckpointNV");
+        if (const std::string_view mode = std::getenv("APS5_GPU_CHECKPOINTS"); mode != "batch" && mode != "batch+async") state->checkpointMarker = marker;
+        Graphics::Recorder::SetCheckpointFunction(marker);
+    }
     if (bufferMarkers) state->CreateMarkerBuffer();
     if (deviceFault || checkpoints || bufferMarkers) {
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
         const auto checkpointData = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
-        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData, owner = state.get()] {
+        Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, asyncQueue = state->asyncQueue, faultInfo, checkpointData, owner = state.get()] {
             if (owner->markerMapping != nullptr) {
                 std::uint32_t words[2];
                 std::memcpy(words, owner->markerMapping, sizeof(words));
                 for (const auto& line : owner->markerLog.Report(words[0], words[1])) std::fprintf(stderr, "%s\n", line.c_str());
             }
-            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
+            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData, &MemoryStats::DescribeDeviceAddress)) std::fprintf(stderr, "%s\n", line.c_str());
+            if (asyncQueue == VK_NULL_HANDLE || checkpointData == nullptr) return;
+            std::fprintf(stderr, "[device-fault] async lane queue:\n");
+            for (const auto& line : DeviceFaultReport(device, nullptr, asyncQueue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
         };
         Graphics::DeviceLostOwner() = state.get();
         state->deviceLostHook = true;
@@ -2131,6 +2257,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         settlePoolInfo.queueFamilyIndex = state->settleFamily;
         check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &settlePoolInfo, nullptr, &state->settlePool), "vkCreateCommandPool settle");
     }
+    if (state->asyncFamily != VK_QUEUE_FAMILY_IGNORED) {
+        VkCommandPoolCreateInfo asyncPoolInfo = poolInfo;
+        asyncPoolInfo.queueFamilyIndex = state->asyncFamily;
+        check(state->DeviceFunction<PFN_vkCreateCommandPool>("vkCreateCommandPool")(state->device, &asyncPoolInfo, nullptr, &state->asyncPool), "vkCreateCommandPool async lane");
+    }
     static const bool procTable = std::getenv("APS5_NO_PROC_TABLE") == nullptr;
     if (procTable) {
         Graphics::FillDeviceFunctions(graphicsContext(), state->deviceFunctions);
@@ -2139,7 +2270,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     Graphics::PrepareImportWatch(graphicsContext());
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, window != nullptr || compileOnly);
+    // A headless device starts with an empty cache (d65cc07a1), except for agc_shader_replay --pipeline-only, which
+    // precompiles against the game's file and must see its entries (APS5_PIPELINE_CACHE_LOAD=1, set by the tool).
+    const char* loadCache = std::getenv("APS5_PIPELINE_CACHE_LOAD");
+    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, window != nullptr || compileOnly || (loadCache != nullptr && std::string_view(loadCache) == "1"));
     state->detiler = std::make_unique<Graphics::TextureDetiler>(graphicsContext());
     state->textureCache = std::make_unique<Graphics::TextureCache>(graphicsContext());
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());
@@ -2154,8 +2288,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
+    Graphics::SetHtileFillOnGpu(state->recorder.get(), [this](std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+        const std::array<std::uint32_t, 4> pattern{word, word, word, word};
+        return FillBuffer(address, bytes, pattern, false);
+    });
+    if (state->bindlessImages) {
+        const auto context = graphicsContext();
+        const auto capacities = Graphics::DescriptorHeap::DeviceCapacities(context);
+        const auto& limits = state->descriptorIndexingProperties;
+        std::fprintf(stderr, "[bindless] heap: %u sampled images, %u storage images, %u samplers (update-after-bind limits per stage: %u sampled, %u storage, %u samplers, %u resources; per set: %u sampled, %u storage, %u samplers; maxSamplerAllocationCount %u)\n", capacities.sampledImages, capacities.storageImages, capacities.samplers, limits.maxPerStageDescriptorUpdateAfterBindSampledImages, limits.maxPerStageDescriptorUpdateAfterBindStorageImages, limits.maxPerStageDescriptorUpdateAfterBindSamplers, limits.maxPerStageUpdateAfterBindResources, limits.maxDescriptorSetUpdateAfterBindSampledImages, limits.maxDescriptorSetUpdateAfterBindStorageImages, limits.maxDescriptorSetUpdateAfterBindSamplers, state->properties.limits.maxSamplerAllocationCount);
+        state->bindlessTable = std::make_unique<Graphics::BindlessTable>(context, capacities, Graphics::DeviceImageKeys::InitialBuckets, Graphics::DeviceImageKeys::MaxBuckets, Graphics::BindlessRingRecords());
+        std::fprintf(stderr, "[bindless] miss ring: %u records per batch, reported-miss set %u slots (each missing key reported once per clear)\n", state->bindlessTable->RingCapacity(), state->bindlessTable->SeenSlots());
+    }
     state->context = buildContext();
     state->contextReady = true;
+    if (state->bindlessTable) {
+        auto options = Graphics::TextureService::OptionsFromEnvironment(Graphics::SampledTextureCacheBudget(state->context) / 2u);
+        const bool liveBudget = std::getenv("APS5_BINDLESS_BUDGET_MIB") == nullptr;
+        if (liveBudget) options.budgetSource = [context = &state->context] { return Graphics::CurrentTextureCacheBudgets(*context).share; };
+        state->textureService = std::make_unique<Graphics::TextureService>(*state->bindlessTable, std::make_shared<Graphics::DriverBindlessResolver>(state->context), std::make_shared<Graphics::GuestBindlessMemory>(), options);
+        state->context.textureService = state->textureService.get();
+        std::fprintf(stderr, "[bindless] texture service: %s, budget %llu MiB%s, idle after %llu submits, commit chunk %u\n", options.lazy ? "lazy (misses only, measurement mode)" : "exact (tables primed before use)", static_cast<unsigned long long>((liveBudget ? Graphics::CurrentTextureCacheBudgets(state->context).share : options.budgetBytes) >> 20u), liveBudget ? " (the sampled textures' share of the VRAM, read at each present)" : " (APS5_BINDLESS_BUDGET_MIB)", static_cast<unsigned long long>(options.idleSubmits), options.commitChunk);
+    }
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
         std::uint32_t drawableWidth = 0;
@@ -2245,7 +2399,9 @@ void VulkanDevice::startJournalReplay() {
     state->journalReplay = Graphics::StartPipelineJournalReplay(graphicsContext(), Graphics::PipelineJournalDeviceFingerprint(state->properties), {[this](const ShaderRecompiler::RecompileResult& shader, bool pushConstants) { return ReplayComputePipeline(shader, pushConstants); }});
 }
 
-VulkanDevice::~VulkanDevice() = default;
+VulkanDevice::~VulkanDevice() {
+    if (state != nullptr && state->recorder != nullptr) Graphics::SetHtileFillOnGpu(state->recorder.get(), nullptr);
+}
 
 VkPipelineCreateFlags VulkanDevice::computePipelineFlags() const {
     return (graphicsContext().pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
@@ -2377,6 +2533,14 @@ void VulkanDevice::WaitRecorded(std::uint64_t serial) {
     if (state->recorder) state->recorder->WaitSerial(serial);
 }
 
+std::uint64_t VulkanDevice::SubmittedEpoch() const {
+    return state->recorder ? state->recorder->NewestSubmitted() : 0;
+}
+
+bool VulkanDevice::WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
+    return state->recorder && state->recorder->WaitSerialFor(serial, timeoutNanos);
+}
+
 void VulkanDevice::ReapRecorded(std::uint64_t serial) {
     if (!state->recorder) return;
     // The drain's site in the [recorder] table is this call's caller (Driver::execute's drain,
@@ -2416,6 +2580,8 @@ bool VulkanDevice::StoresPendingOver(std::uint64_t address, std::size_t bytes) c
 }
 
 int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool reapFirst) {
+    // A label lands after its own queue's recorded work: into that queue's lane, whichever thread records it.
+    const Graphics::Recorder::LaneScope laneScope(Graphics::Recorder::LaneOfQueue(queue));
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
@@ -2534,14 +2700,18 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     return true;
 }
 
-bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
+void VulkanDevice::NoteHtileMask(std::uint64_t address, std::size_t bytes, std::uint32_t mask, std::uint32_t value) const {
+    Graphics::NoteHtileMaskOnGpu(graphicsContext(), address, bytes, mask, value);
+}
+
+bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, bool reap) {
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
     // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
     // finished does not force a wait below. Before the import lookup: a completion may refresh the
     // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
-    if (OpportunisticReap()) recorder.Reap();
+    if (reap && OpportunisticReap()) recorder.Reap();
     const auto context = graphicsContext();
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr) return false;
@@ -2711,6 +2881,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     phase(recordMs);
     if (uniform) recorder.NotePendingWordFill(address, bytes, pattern[0]);
     else recorder.NotePendingWrite(address, bytes);
+    if (uniform) Graphics::NoteHtileMaskOnGpu(context, address, bytes, 0u, pattern[0]);
     GuestMemory::MarkWritten(address, bytes);
     phase(notesMs);
     return true;
@@ -2969,6 +3140,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     }
     const auto gpuTiming = recorder.BeginGpuTiming(programAddress);
     const VkBufferCopy region{Graphics::HostImportOffset(*sourceImport, source), Graphics::HostImportOffset(*destinationImport, destination), bytes};
+    Graphics::Recorder::Checkpoint(commands, Graphics::Recorder::CheckpointKind::DmaCopy, destination);
     context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, sourceImport->buffer, destinationImport->buffer, 1, &region);
     recorder.EndGpuTiming(gpuTiming, bytes);
     // The copied bytes are visible to everything recorded after and to the host, as after a fill.
@@ -3364,8 +3536,8 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
             // image first, as a sampled texture of the image would (see cachedTexture). The uncached
             // walk: the collect memo is per worker packet, so on this thread a memoized answer could
             // miss a CPU write that landed after a worker's walk of the same range.
-            static const bool noAdopt = std::getenv("APS5_NO_PRESENT_EPOCH") != nullptr;
-            if (!noAdopt) GuestMemory::AdoptLatestCollectEpoch();
+            static const bool adopt = std::getenv("APS5_PRESENT_EPOCH") != nullptr && std::getenv("APS5_NO_PRESENT_EPOCH") == nullptr;
+            if (adopt) GuestMemory::AdoptLatestCollectEpoch();
             GuestMemory::CollectWritesUncached(buffer.address, bytes);
             if (!GuestMemory::UnchangedSince(buffer.address, bytes, resident->GenerationFor(buffer.address, bytes)) || (buffer.dccAddress != 0 && ResidentKeysMoved(*resident))) {
                 if (resident->ImageLayers() > 1) resident->RefreshLayers(layer, 1);
@@ -3757,8 +3929,40 @@ double VulkanDevice::FinishPresent() {
     return RetirePresents(0);
 }
 
+namespace {
+
+void TriggerRenderDocCaptureAtPresent() {
+#ifdef _WIN32
+    static const long long wanted = [] {
+        const char* value = std::getenv("APS5_RENDERDOC_CAPTURE_PRESENT");
+        return value != nullptr ? std::atoll(value) : -1ll;
+    }();
+    if (wanted < 0) return;
+    static std::atomic<long long> presents{0};
+    if (presents.fetch_add(1, std::memory_order_relaxed) + 1 != wanted) return;
+    const auto module = GetModuleHandleA("renderdoc.dll");
+    if (module == nullptr) {
+        std::fprintf(stderr, "[renderdoc] capture at present %lld requested, but renderdoc.dll is not loaded\n", wanted);
+        return;
+    }
+    using GetApi = int (*)(int, void**);
+    const auto getApi = reinterpret_cast<GetApi>(reinterpret_cast<void*>(GetProcAddress(module, "RENDERDOC_GetAPI")));
+    void** api = nullptr;
+    if (getApi == nullptr || getApi(10102, reinterpret_cast<void**>(&api)) != 1 || api == nullptr) {
+        std::fprintf(stderr, "[renderdoc] RENDERDOC_GetAPI 1.1.2 failed\n");
+        return;
+    }
+    if (const char* path = std::getenv("APS5_RENDERDOC_CAPTURE_PATH"); path != nullptr) reinterpret_cast<void (*)(const char*)>(api[11])(path);
+    reinterpret_cast<void (*)()>(api[15])();
+    std::fprintf(stderr, "[renderdoc] capture triggered at present %lld\n", wanted);
+#endif
+}
+
+}
+
 void VulkanDevice::QueuePresent() {
     if (!state->queuePending) return;
+    TriggerRenderDocCaptureAtPresent();
     PerformanceTimer timing("Vulkan.QueuePresent");
     state->queuePending = false;
     const auto index = state->queueIndex;
@@ -3837,6 +4041,184 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     return target;
 }
 
+// Whether GLSL.std.450 Fma is a fused multiply-add here (one rounding), which the recompiler's exact f32
+// path for v_fma_mix* needs (SpirvTarget::fusedFma; Vulkan does not promise it). One dispatch of
+// FmaProbe.comp over 4,096 triples whose fused and unfused results differ (c = -round(a * b), so a
+// fused fma returns the product's rounding error and an unfused one 0) plus random ones, compared
+// bit for bit with std::fma. Any Vulkan failure or mismatch answers false (the f64 helper as
+// before); APS5_NO_MIX_F32=1 skips the f32 path in the recompiler whatever the probe found.
+bool VulkanDevice::fusedFmaProbe(const State& device, std::uint32_t family) {
+    constexpr std::uint32_t Count = 4096;
+    std::vector<float> triples(Count * 4u);
+    std::uint64_t seed = 0x9e3779b97f4a7c15ull;
+    const auto next = [&] {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return seed;
+    };
+    const auto unit = [&](int exponent) {
+        // A float in [2^exponent, 2^(exponent + 1)) with a random 23-bit mantissa and sign.
+        const auto word = (static_cast<std::uint32_t>(exponent + 127) << 23u) | static_cast<std::uint32_t>(next() & 0x7fffffu) | (next() & 1u ? 0x80000000u : 0u);
+        return std::bit_cast<float>(word);
+    };
+    std::vector<std::uint32_t> expected(Count);
+    for (std::uint32_t index = 0; index < Count; ++index) {
+        const float a = unit(static_cast<int>(next() % 40u) - 20);
+        const float b = unit(static_cast<int>(next() % 40u) - 20);
+        const float c = index % 2u == 0 ? -(a * b) : unit(static_cast<int>(next() % 40u) - 20);
+        triples[index * 4u + 0] = a;
+        triples[index * 4u + 1] = b;
+        triples[index * 4u + 2] = c;
+        triples[index * 4u + 3] = 0.0f;
+        expected[index] = std::bit_cast<std::uint32_t>(std::fma(a, b, c));
+    }
+    const auto fn = [&](const char* name) { return device.deviceProc(device.device, name); };
+    const auto vk = [&](const char* name) {
+        auto function = fn(name);
+        if (function == nullptr) throw std::runtime_error(std::string("FMA probe: missing ") + name);
+        return function;
+    };
+    VkDevice handle = device.device;
+    VkBuffer buffers[2]{};
+    VkDeviceMemory memories[2]{};
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    bool fused = false;
+    const char* failure = nullptr;
+    try {
+        const VkDeviceSize sizes[2]{triples.size() * sizeof(float), Count * sizeof(std::uint32_t)};
+        void* mapped[2]{};
+        for (int index = 0; index < 2; ++index) {
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            info.size = sizes[index];
+            info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (reinterpret_cast<PFN_vkCreateBuffer>(vk("vkCreateBuffer"))(handle, &info, nullptr, &buffers[index]) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateBuffer");
+            VkMemoryRequirements requirements{};
+            reinterpret_cast<PFN_vkGetBufferMemoryRequirements>(vk("vkGetBufferMemoryRequirements"))(handle, buffers[index], &requirements);
+            constexpr VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            std::uint32_t type = device.memoryProperties.memoryTypeCount;
+            for (std::uint32_t candidate = 0; candidate < device.memoryProperties.memoryTypeCount; ++candidate) {
+                if ((requirements.memoryTypeBits & (1u << candidate)) != 0 && (device.memoryProperties.memoryTypes[candidate].propertyFlags & flags) == flags) {
+                    type = candidate;
+                    break;
+                }
+            }
+            if (type == device.memoryProperties.memoryTypeCount) throw std::runtime_error("FMA probe: no host-coherent memory");
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = type;
+            if (reinterpret_cast<PFN_vkAllocateMemory>(vk("vkAllocateMemory"))(handle, &allocation, nullptr, &memories[index]) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkAllocateMemory");
+            if (reinterpret_cast<PFN_vkBindBufferMemory>(vk("vkBindBufferMemory"))(handle, buffers[index], memories[index], 0) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkBindBufferMemory");
+            if (reinterpret_cast<PFN_vkMapMemory>(vk("vkMapMemory"))(handle, memories[index], 0, VK_WHOLE_SIZE, 0, &mapped[index]) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkMapMemory");
+        }
+        std::memcpy(mapped[0], triples.data(), sizes[0]);
+        std::memset(mapped[1], 0, sizes[1]);
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = sizeof(FMA_PROBE_SPV);
+        moduleInfo.pCode = FMA_PROBE_SPV;
+        if (reinterpret_cast<PFN_vkCreateShaderModule>(vk("vkCreateShaderModule"))(handle, &moduleInfo, nullptr, &module) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateShaderModule");
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        for (std::uint32_t index = 0; index < 2; ++index) bindings[index] = {index, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        setInfo.bindingCount = 2;
+        setInfo.pBindings = bindings;
+        if (reinterpret_cast<PFN_vkCreateDescriptorSetLayout>(vk("vkCreateDescriptorSetLayout"))(handle, &setInfo, nullptr, &setLayout) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateDescriptorSetLayout");
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &setLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        if (reinterpret_cast<PFN_vkCreatePipelineLayout>(vk("vkCreatePipelineLayout"))(handle, &layoutInfo, nullptr, &layout) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreatePipelineLayout");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+        pipelineInfo.layout = layout;
+        if (reinterpret_cast<PFN_vkCreateComputePipelines>(vk("vkCreateComputePipelines"))(handle, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateComputePipelines");
+        const VkDescriptorPoolSize poolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+        VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        if (reinterpret_cast<PFN_vkCreateDescriptorPool>(vk("vkCreateDescriptorPool"))(handle, &poolInfo, nullptr, &pool) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateDescriptorPool");
+        VkDescriptorSetAllocateInfo setAllocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        setAllocation.descriptorPool = pool;
+        setAllocation.descriptorSetCount = 1;
+        setAllocation.pSetLayouts = &setLayout;
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        if (reinterpret_cast<PFN_vkAllocateDescriptorSets>(vk("vkAllocateDescriptorSets"))(handle, &setAllocation, &set) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkAllocateDescriptorSets");
+        VkDescriptorBufferInfo bufferInfos[2]{{buffers[0], 0, VK_WHOLE_SIZE}, {buffers[1], 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[2]{};
+        for (std::uint32_t index = 0; index < 2; ++index) {
+            writes[index] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[index].dstSet = set;
+            writes[index].dstBinding = index;
+            writes[index].descriptorCount = 1;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[index].pBufferInfo = &bufferInfos[index];
+        }
+        reinterpret_cast<PFN_vkUpdateDescriptorSets>(vk("vkUpdateDescriptorSets"))(handle, 2, writes, 0, nullptr);
+        VkCommandPoolCreateInfo commandPoolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        commandPoolInfo.queueFamilyIndex = family;
+        if (reinterpret_cast<PFN_vkCreateCommandPool>(vk("vkCreateCommandPool"))(handle, &commandPoolInfo, nullptr, &commandPool) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateCommandPool");
+        VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        commandAllocation.commandPool = commandPool;
+        commandAllocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        commandAllocation.commandBufferCount = 1;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        if (reinterpret_cast<PFN_vkAllocateCommandBuffers>(vk("vkAllocateCommandBuffers"))(handle, &commandAllocation, &commands) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkAllocateCommandBuffers");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        reinterpret_cast<PFN_vkBeginCommandBuffer>(vk("vkBeginCommandBuffer"))(commands, &begin);
+        reinterpret_cast<PFN_vkCmdBindPipeline>(vk("vkCmdBindPipeline"))(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        reinterpret_cast<PFN_vkCmdBindDescriptorSets>(vk("vkCmdBindDescriptorSets"))(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+        const std::uint32_t count = Count;
+        reinterpret_cast<PFN_vkCmdPushConstants>(vk("vkCmdPushConstants"))(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &count);
+        reinterpret_cast<PFN_vkCmdDispatch>(vk("vkCmdDispatch"))(commands, Count / 64u, 1, 1);
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+        reinterpret_cast<PFN_vkCmdPipelineBarrier>(vk("vkCmdPipelineBarrier"))(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        if (reinterpret_cast<PFN_vkEndCommandBuffer>(vk("vkEndCommandBuffer"))(commands) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkEndCommandBuffer");
+        VkQueue queue = VK_NULL_HANDLE;
+        reinterpret_cast<PFN_vkGetDeviceQueue>(vk("vkGetDeviceQueue"))(handle, family, 0, &queue);
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (reinterpret_cast<PFN_vkCreateFence>(vk("vkCreateFence"))(handle, &fenceInfo, nullptr, &fence) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkCreateFence");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        if (reinterpret_cast<PFN_vkQueueSubmit>(vk("vkQueueSubmit"))(queue, 1, &submit, fence) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkQueueSubmit");
+        if (reinterpret_cast<PFN_vkWaitForFences>(vk("vkWaitForFences"))(handle, 1, &fence, VK_TRUE, 10'000'000'000ull) != VK_SUCCESS) throw std::runtime_error("FMA probe: vkWaitForFences");
+        const auto* results = static_cast<const std::uint32_t*>(mapped[1]);
+        std::uint32_t mismatches = 0;
+        for (std::uint32_t index = 0; index < Count; ++index) mismatches += results[index] != expected[index] ? 1u : 0u;
+        fused = mismatches == 0;
+        std::fprintf(stderr, "[fma-probe] GLSL.std.450 Fma %s on this device (%u of %u results differ from std::fma)\n", fused ? "is fused: v_fma_mix takes the exact f32 path" : "is not fused: v_fma_mix keeps the f64 helper", mismatches, Count);
+    } catch (const std::exception& error) {
+        failure = error.what();
+    }
+    if (failure != nullptr) std::fprintf(stderr, "[fma-probe] %s: v_fma_mix keeps the f64 helper\n", failure);
+    const auto destroy = [&](const char* name, auto object, auto type) {
+        if (object == VK_NULL_HANDLE) return;
+        if (auto function = reinterpret_cast<decltype(type)>(fn(name)); function != nullptr) function(handle, object, nullptr);
+    };
+    destroy("vkDestroyFence", fence, PFN_vkDestroyFence{});
+    destroy("vkDestroyCommandPool", commandPool, PFN_vkDestroyCommandPool{});
+    destroy("vkDestroyDescriptorPool", pool, PFN_vkDestroyDescriptorPool{});
+    destroy("vkDestroyPipeline", pipeline, PFN_vkDestroyPipeline{});
+    destroy("vkDestroyPipelineLayout", layout, PFN_vkDestroyPipelineLayout{});
+    destroy("vkDestroyDescriptorSetLayout", setLayout, PFN_vkDestroyDescriptorSetLayout{});
+    destroy("vkDestroyShaderModule", module, PFN_vkDestroyShaderModule{});
+    for (int index = 0; index < 2; ++index) {
+        destroy("vkDestroyBuffer", buffers[index], PFN_vkDestroyBuffer{});
+        destroy("vkFreeMemory", memories[index], PFN_vkFreeMemory{});
+    }
+    return fused;
+}
+
 Graphics::SampleOrder VulkanDevice::HostSampleOrder(const Graphics::State& graphics) const {
     if (!graphics.sampleLocationGrid) return {};
     return Graphics::HostSampleLocationsFor(graphicsContext(), graphics).order;
@@ -3849,7 +4231,9 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.fusedFma = state->fusedFma;
     target.float16DenormPreserve = state->float16DenormPreserve;
+    target.bindlessImages = state->bindlessImages;
     target.spannedWaves = state->spannedWaves;
     target.depthRangeRemap = !state->depthRangeUnrestricted;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
@@ -3907,10 +4291,68 @@ bool VulkanDevice::GraphicsPipelineLibraries() const {
     return state->graphicsPipelineLibrary;
 }
 
+bool VulkanDevice::BindlessImagesEnabled() const {
+    return state->bindlessTable != nullptr;
+}
+
+bool VulkanDevice::TextureServiceRunning() const {
+    return state->textureService != nullptr;
+}
+
+const Graphics::TextureService* VulkanDevice::BindlessService() const {
+    return state->textureService.get();
+}
+
+void VulkanDevice::BindlessPresentWait() {
+    if (!state->textureService || !state->recorder) return;
+    PerformanceTimer timing("Vulkan.BindlessPresentWait");
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t serial = 0;
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        serial = state->textureService->PresentSerial(*state->recorder);
+        if (serial != 0 && !state->recorder->HasTimeline()) state->recorder->Sync();
+    }
+    timing.Mark("present_serial");
+    if (serial != 0 && state->recorder->HasTimeline()) state->recorder->WaitSerial(serial);
+    timing.Mark("wait_serial");
+    const auto waited = serial != 0 ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u;
+    // Without the GPU lock: prepare the entries the revalidation will most likely find stale (see
+    // TextureService::PrepareRevalidation; APS5_NO_EARLY_REVALIDATE=1 off).
+    state->textureService->PrepareRevalidation();
+    timing.Mark("early_prepare");
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    timing.Mark("gpu_mutex_wait");
+    if (serial != 0 && state->recorder->HasTimeline()) {
+        Graphics::Recorder::AnnounceSyncSite(__builtin_return_address(0));
+        state->recorder->FinishUpTo(serial);
+    }
+    timing.Mark("finish_up_to");
+    // The revalidation is one collect epoch (GuestMemory::EndCollectEpoch; APS5_NO_PRESENT_COLLECT_EPOCH=1:
+    // a fresh epoch for every collect as before).
+    static const bool presentEpoch = std::getenv("APS5_NO_PRESENT_COLLECT_EPOCH") == nullptr;
+    if (presentEpoch) GuestMemory::BumpCollectEpoch();
+    try {
+        state->textureService->AfterPresentWait(*state->recorder, waited);
+    } catch (...) {
+        if (presentEpoch) GuestMemory::EndCollectEpoch();
+        throw;
+    }
+    if (presentEpoch) GuestMemory::EndCollectEpoch();
+    timing.Mark("after_present_wait");
+    if (Graphics::BindlessStatsRequested()) std::fprintf(stderr, "%s\n", state->textureService->TakeFrameLine(Graphics::BindlessOldPathNanoseconds()).c_str());
+    timing.Mark("frame_line");
+}
+
 Graphics::Context VulkanDevice::graphicsContext() const {
+    std::optional<Graphics::Context> built;
+    return graphicsContext(built);
+}
+
+const Graphics::Context& VulkanDevice::graphicsContext(std::optional<Graphics::Context>& built) const {
     static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
     if (state->contextReady && !noCache) return state->context;
-    return buildContext();
+    return built.emplace(buildContext());
 }
 
 Graphics::Context VulkanDevice::buildContext() const {
@@ -3953,6 +4395,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sparseQueue = state->sparseQueue;
     context.sparseQueueMutex = &state->sparseQueueMutex;
     context.settleQueue = state->settlePool != VK_NULL_HANDLE ? state->settleQueue : VK_NULL_HANDLE;
+    context.asyncQueue = state->asyncQueue;
+    context.asyncPool = state->asyncPool;
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;
     context.settleQueueMutex = &state->settleQueueMutex;
@@ -4007,6 +4451,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.nullDescriptors = state->shaderProfile != nullptr && state->shaderProfile->NullDescriptors();
     context.bufferInt64Atomics = state->bufferInt64Atomics;
     context.placeholderImages = state->placeholderImages.get();
+    context.bindlessTable = state->bindlessTable.get();
+    context.textureService = state->textureService.get();
     context.viewportIndexLayer = state->viewportIndexLayer;
     context.imageFormatList = state->imageFormatList;
     context.demoteToHelperInvocation = state->demoteToHelperInvocation;
@@ -4020,7 +4466,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sampleLocationGridSampleCounts = state->sampleLocationGridSampleCounts;
     context.sampleLocationGridSizes = state->sampleLocationGridSizes;
     context.shaderStencilExport = state->shaderStencilExport;
-    context.memoryProperties2 =state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
+    context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
+    context.integratedGpu = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     context.singlePassStorage = state->storageImageWithoutFormat;
     context.cacheReclaim = Graphics::ReleaseTextureCaches;
     return context;
@@ -4031,7 +4478,8 @@ VulkanDevice::IndirectDrawSupport VulkanDevice::DrawIndirectSupport() const {
 }
 
 std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
-    return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
+    std::optional<Graphics::Context> built;
+    return Graphics::KnownValidationFailure(graphicsContext(built), shaders, graphics);
 }
 
 void VulkanDevice::DepthCopyPass(const Graphics::DepthCopyPass& pass) {
@@ -4080,7 +4528,12 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
     return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
 }
 
-void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
+std::shared_ptr<const Graphics::AheadDraw> VulkanDevice::PrepareAheadDraw(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
+    std::optional<Graphics::Context> built;
+    return Graphics::PrepareAheadDraw(graphicsContext(built), graphics, shaders);
+}
+
+void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe, Graphics::PreparedDraw* prepared, const Graphics::AheadDraw* ahead) {
     startJournalReplay();
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
@@ -4090,9 +4543,104 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     // GPU mutex); APS5_TRACE_DRAWS=1 restores them.
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
-    const auto context = graphicsContext();
-    Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
+    std::optional<Graphics::Context> built;
+    Graphics::Draw(graphicsContext(built), graphics, draw, shaders, snapshots, recipe, prepared, ahead);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+}
+
+std::shared_ptr<Graphics::PreparedDraw> VulkanDevice::PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return nullptr;
+        ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
+    }
+    return Graphics::PrepareDraw(graphicsContext(), graphics, draw, shaders);
+}
+
+namespace {
+
+struct DepthPresyncCounters {
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> pending{0};
+    std::atomic<std::uint64_t> waited{0};
+    std::atomic<std::uint64_t> waitedUs{0};
+    std::atomic<std::uint64_t> submitted{0};
+    std::atomic<std::int64_t> lastReport{0};
+    // The newest pending writer of the HTILE range at each pre-sync (Recorder::OriginOfNote).
+    std::mutex writersMutex;
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writers;
+};
+
+DepthPresyncCounters& DepthPresyncs() {
+    static auto* counters = new DepthPresyncCounters();
+    return *counters;
+}
+
+}
+
+std::uint64_t VulkanDevice::PresyncDrawDepth(const Graphics::State& graphics) {
+    static const bool disabled = std::getenv("APS5_NO_HTILE_PRESYNC") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (disabled || !graphics.depth || graphics.depth->htileAddress == 0 || !CanWaitUnlocked()) return 0;
+    auto& counters = DepthPresyncs();
+    counters.checked.fetch_add(1, std::memory_order_relaxed);
+    const auto& depth = *graphics.depth;
+    // Lock-free first: no recorded batch writes anything near the HTILE range.
+    if (!Graphics::Recorder::SnapshotWriteOverlaps(depth.htileAddress, static_cast<std::size_t>(Graphics::HtileMetadataBytes(depth.extent)))) return 0;
+    std::uint64_t serial = 0;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        if (!state->recorder) return 0;
+        const auto context = graphicsContext();
+        const auto bytes = Graphics::HtileStoreBackWaits(context, depth);
+        if (bytes == 0) return 0;
+        counters.pending.fetch_add(1, std::memory_order_relaxed);
+        const auto info = state->recorder->DescribePendingWrite(depth.htileAddress, bytes);
+        if (!info.has_value()) return 0;
+        if (profile) {
+            const auto origin = Graphics::Recorder::OriginOfNote(state->recorder->NewestWriteNote(depth.htileAddress, bytes));
+            Graphics::NoteHtileWriter(origin.has_value() ? origin->program : 0, depth.htileAddress);
+            char key[224];
+            if (origin.has_value()) {
+                const bool exact = origin->begin == depth.htileAddress && origin->end == depth.htileAddress + bytes;
+                std::snprintf(key, sizeof(key), "q0x%x op 0x%02x prog 0x%llx %s 0x%llx+0x%llx%s", origin->queue, origin->opcode & 0xffffu, static_cast<unsigned long long>(origin->program), exact ? "exact" : "other", static_cast<unsigned long long>(origin->begin), static_cast<unsigned long long>(origin->end - origin->begin), info->open ? " open" : "");
+                if (origin->kernel) {
+                    const auto length = std::strlen(key);
+                    std::snprintf(key + length, sizeof(key) - length, " mask-kernel m 0x%x v 0x%x", origin->mask, origin->value);
+                }
+            } else {
+                std::snprintf(key, sizeof(key), "unattributed%s", info->open ? " open" : "");
+            }
+            std::lock_guard writersLock(counters.writersMutex);
+            ++counters.writers[key].first;
+        }
+        serial = info->serial;
+        if (info->open) {
+            serial = state->recorder->SubmitAndEpoch();
+            counters.submitted.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (serial == 0) return 0;
+    const auto start = std::chrono::steady_clock::now();
+    WaitRecorded(serial);
+    counters.waited.fetch_add(1, std::memory_order_relaxed);
+    counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    if (profile) {
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = counters.lastReport.load();
+        if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
+            std::string writerText;
+            {
+                std::lock_guard writersLock(counters.writersMutex);
+                std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> sorted(counters.writers.begin(), counters.writers.end());
+                counters.writers.clear();
+                std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+                for (std::size_t i = 0; i < sorted.size() && i < 8; ++i) writerText += " [" + sorted[i].first + ": " + std::to_string(sorted[i].second.first) + "]";
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[htile-presync] (cumulative) %llu depth draws checked, %llu would wait in the store-back, %llu pre-synced (%llu submitted the open batch) waiting %.0f ms without the GPU mutex; newest writers (10 s):%s\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.pending.load()), static_cast<unsigned long long>(counters.waited.load()), static_cast<unsigned long long>(counters.submitted.load()), counters.waitedUs.load() / 1000.0, writerText.c_str());
+        }
+    }
+    return serial;
 }
 
 bool VulkanDevice::DrawInputsInPlace() const {
@@ -4139,6 +4687,7 @@ ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, Vk
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
+    if (const auto salt = Graphics::RuntimeSwitches::KeySalt(); salt != 0) key.push_back(salt);
     return key;
 }
 
@@ -4329,6 +4878,14 @@ struct DispatchCounters {
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
     double templateRevalidateMs = 0;
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
+    // Dispatch overlap (Recorder::DeferDispatchBarrier): trailing barriers deferred, and dispatches
+    // recorded without a leading barrier after an unordered one of their queue.
+    std::uint64_t trailingDeferred = 0, overlapped = 0;
+    // Why a dispatch of a compute ring did not defer (indirect, template data refresh, LDS in device
+    // memory, split grid or checkpoints) or, unordered, did not overlap (no deferred barrier of its
+    // ring was still open: something else was recorded in between).
+    std::uint64_t notIndirect = 0, notRefresh = 0, notLds = 0, notOther = 0, unorderedLost = 0, unorderedSeen = 0, orderedSeen = 0;
+    std::chrono::steady_clock::time_point overlapReport = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point cacheReport = std::chrono::steady_clock::now();
 };
 
@@ -4576,9 +5133,9 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
-    std::shared_ptr<Graphics::ShaderResources::DrawBindings> bindings{};
     std::uint64_t cpuArguments = 0;
     int cpuReason = 0;
+    std::shared_ptr<Graphics::ShaderResources::DrawBindings> bindings{};
     std::array<std::uint32_t, 3> threadGroup{};
     std::array<std::uint32_t, 3> threadLimit{};
 };
@@ -4653,8 +5210,8 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
-    const auto context = graphicsContext();
-    const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe);
+    std::optional<Graphics::Context> built;
+    const auto outcome = Graphics::DrawWithRecipe(graphicsContext(built), graphics, draw, shaders, snapshots, *recipe);
     if (!outcome.recorded) {
         switch (outcome.miss) {
             case Graphics::DrawRecipeMiss::NotRecordable: counters.precheckMisses[MissNotRecordable].fetch_add(1, std::memory_order_relaxed); break;
@@ -4738,6 +5295,14 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
     return serial;
 }
 
+void VulkanDevice::PrimeBindlessDraw(std::span<const Graphics::CompiledShader> shaders) const {
+    if (Graphics::BindlessHeapStages(shaders) == 0u) return;
+    const auto context = graphicsContext();
+    for (const auto& shader : shaders) {
+        if (shader.program->bindlessHeap) Graphics::PrimeBindlessTables(context, shader.program->bindlessTables);
+    }
+}
+
 VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
     const auto& counters = Presyncs();
     return {counters.checked.load(std::memory_order_relaxed), counters.presyncs.load(std::memory_order_relaxed), counters.keyChecks.load(std::memory_order_relaxed), counters.keyWaits.load(std::memory_order_relaxed), counters.writerChecks.load(std::memory_order_relaxed), counters.writerWaits.load(std::memory_order_relaxed)};
@@ -4752,6 +5317,7 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     const auto start = std::chrono::steady_clock::now();
     const Graphics::CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
     const auto context = graphicsContext();
+    if (shader.bindlessHeap) Graphics::PrimeBindlessTables(context, shader.bindlessTables);
     auto prepared = std::make_shared<PreparedDispatch>();
     prepared->dispatchThreads = dispatchThreads;
     // A cached build (the map locks itself) is revalidated under the mutex by the dispatch, which
@@ -4836,6 +5402,7 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
     };
     if (!DispatchRecipes() || recipe == nullptr) return miss(MissNoRecipe);
     if (recipe->device != state->device) return miss(MissDevice);
+    if (const auto salt = Graphics::RuntimeSwitches::KeySalt(); salt != 0 && (recipe->key.empty() || recipe->key.back() != salt)) return miss(MissNoRecipe);
     auto hit = std::make_shared<RecipeHit>();
     hit->recipe = recipe;
     hit->indirect = indirect;
@@ -4942,6 +5509,15 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
     std::snprintf(groupsText, 40, "%ux%ux%u", record.x, record.y, record.z);
 }
 
+namespace {
+
+bool CheckpointsInRuns() {
+    static const bool allowed = std::getenv("APS5_CHECKPOINTS_IN_RUNS") != nullptr;
+    return allowed;
+}
+
+}
+
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
@@ -4957,6 +5533,42 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         char text[384];
         std::snprintf(text, sizeof(text), "Vulkan dispatch: workgroup count %ux%ux%u%s exceeds device limits %ux%ux%u and a split aliases the device-memory LDS slots, whose base is computed from gl_NumWorkGroups of a single chunk", record.x, record.y, record.z, counted, limit[0], limit[1], limit[2]);
         throw std::runtime_error(text);
+    }
+    // Dispatch overlap (see Recorder::DeferDispatchBarrier): a direct dispatch of a guest compute
+    // ring that records nothing of its own around it (no indirect arguments, template data
+    // refresh, bindless heap service, device-memory LDS, split grid or checkpoint) may leave its
+    // trailing barrier deferred, and one the title left unordered after the previous such dispatch
+    // of its ring records without a leading barrier.
+    bool unordered = false;
+    const auto overlapQueue = Graphics::Recorder::TakeDispatchOrder(unordered);
+    const auto* groupLimit = state->properties.limits.maxComputeWorkGroupCount;
+    // APS5_NO_LANE_OVERLAP=1 (diagnostic, an APS5_AB switch): no dispatch of the async lane (lane 1) overlaps.
+    if (Graphics::Recorder::LaneOwnFamily() && Graphics::Recorder::ThreadLane() == 1) require(!record.shader->program->bindlessHeap && resources.SampledTextures().empty() && resources.StorageImages().empty(), "a dispatch that binds images was recorded into the async lane, whose compute-family queue does not own the images");
+    const bool laneOverlap = !recorder.AsyncLaneActive() || Graphics::Recorder::ThreadLane() == 0 || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneOverlap);
+    const bool overlapCapable = laneOverlap && overlapQueue != 0 && Graphics::Recorder::DispatchOverlapEnabled() && arguments == 0 && argumentImport == nullptr && !record.htileClear.has_value() && record.shader->program->workgroupMemoryDwords == 0 && (state->checkpointMarker == nullptr || CheckpointsInRuns()) && record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2] && (Graphics::Recorder::StagedOverlapEnabled() || !resources.HasGpuCopies());
+    if (timer.profile && overlapQueue != 0) {
+        if (!overlapCapable) {
+            if (arguments != 0 || argumentImport != nullptr) ++d.notIndirect;
+            else if (record.shader->program->workgroupMemoryDwords != 0) ++d.notLds;
+            else ++d.notOther;
+        }
+        ++(unordered ? d.unorderedSeen : d.orderedSeen);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - d.overlapReport >= std::chrono::seconds(10)) {
+            d.overlapReport = now;
+            const auto flushes = Graphics::Recorder::DeferredFlushCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[overlap] compute-ring dispatches (cumulative): %llu after an ordering packet, %llu unordered (%llu overlapped, %llu found no open deferred barrier); not deferring: indirect %llu, (overlapped with a data refresh %llu), device LDS %llu, other %llu; %llu trailing barriers deferred, recorded by: commands %llu, draw pass %llu, key stores %llu, label store %llu, store run %llu, samples %llu, submit %llu\n", static_cast<unsigned long long>(d.orderedSeen), static_cast<unsigned long long>(d.unorderedSeen), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(d.unorderedLost), static_cast<unsigned long long>(d.notIndirect), static_cast<unsigned long long>(d.notRefresh), static_cast<unsigned long long>(d.notLds), static_cast<unsigned long long>(d.notOther), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(flushes[0]), static_cast<unsigned long long>(flushes[1]), static_cast<unsigned long long>(flushes[2]), static_cast<unsigned long long>(flushes[3]), static_cast<unsigned long long>(flushes[4]), static_cast<unsigned long long>(flushes[5]), static_cast<unsigned long long>(flushes[6]));
+            const auto range = Graphics::Recorder::RangeCheckCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[overlap-range] (cumulative) joins refused by the access-range check %llu; range conflicts joined while APS5_NO_OVERLAP_RANGE_CHECK was set %llu (now %s)\n", static_cast<unsigned long long>(range[0]), static_cast<unsigned long long>(range[1]), Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoOverlapRangeCheck) ? "set" : "unset");
+            const auto batched = Graphics::Recorder::BatchedStagingCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[batched-staging] (APS5_NO_BATCHED_STAGING %s, cumulative) %llu run splits, %llu preludes with %llu copy-in builds and %llu pristine copies; %llu copy-backs after a run sharing its barrier (%llu after an overlapping one); unordered dispatches not overlapped: no open run %llu, other ring's run %llu, render pass %llu, store run %llu, resources already in the run %llu\n", Graphics::Recorder::BatchedStagingEnabled() ? "unset" : "set", static_cast<unsigned long long>(batched.splits), static_cast<unsigned long long>(batched.preludes), static_cast<unsigned long long>(batched.preludeCopies), static_cast<unsigned long long>(batched.pristineCopies), static_cast<unsigned long long>(batched.mergedCopyBacks), static_cast<unsigned long long>(batched.copyBackConflicts), static_cast<unsigned long long>(batched.lostNoRun), static_cast<unsigned long long>(batched.lostOtherQueue), static_cast<unsigned long long>(batched.lostRenderPass), static_cast<unsigned long long>(batched.lostStoreRun), static_cast<unsigned long long>(batched.lostOwner));
+            std::string sites;
+            for (const auto& [site, count] : Graphics::Recorder::RunCloseSites(24)) sites += (sites.empty() ? "" : "; ") + site + " " + std::to_string(count);
+            std::string async;
+            for (const auto& [site, count] : Graphics::Recorder::RunCloseSites(24, 0x51)) async += (async.empty() ? "" : "; ") + site + " " + std::to_string(count);
+            AgcDriver::ProfilePrint_nid_no_patch("[run-close] runs closed by call site (cumulative, ring keys as guest queues): %s\n[run-close] of ring 0x51: %s\n[run-close] unordered dispatches by ring: %s\n", sites.c_str(), async.c_str(), Graphics::Recorder::OverlapByRing().c_str());
+            AgcDriver::ProfilePrint_nid_no_patch("%s (APS5_NO_STAGED_OVERLAP %s)\n%s\n%s\n", Graphics::Recorder::RunConflictReport().c_str(), Graphics::Recorder::StagedOverlapEnabled() ? "unset" : "set", Graphics::Recorder::OwedCopyBackReport().c_str(), Graphics::Recorder::LaneOrderReport().c_str());
+        }
     }
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
     // opening the batch, the keeps, the data refresh, the barriers with the bind and the dispatch
@@ -4984,8 +5596,31 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    if (record.shader->program->bindlessHeap) {
+        require(context.bindlessTable != nullptr && context.textureService != nullptr, "a bindless image dispatch needs the device's descriptor heap and texture service");
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!GuestMemory::GpuMutex().HeldByThisThread()) gpuLock.lock();
+        Graphics::ServeBindlessTables(context, recorder, record.shader->program->bindlessTables);
+    }
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    bool overlapped = false;
+    const std::array<const void*, 2> runOwners{record.resources.get(), record.resources != nullptr ? record.resources->MemoryOwner() : nullptr};
+    thread_local std::vector<std::array<std::uint64_t, 3>>* runAccessesSlot = nullptr;
+    auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
+    runAccesses.clear();
+    if (overlapCapable) resources.RunAccesses(runAccesses);
+    if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
+    auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
+    if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
+    if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
+    // Batched staging (Recorder::SplitForRun): a run's first dispatch that copies buffers itself
+    // (so its ring's next dispatches likely do too) records into a new command buffer, so that the
+    // copy-ins of the dispatches joining the run can go to a prelude submitted ahead of this one.
+    if (overlapCapable && !overlapped && resources.HasGpuCopies() && Graphics::Recorder::BatchedStagingEnabled()) commands = recorder.SplitForRun();
+    // The first dispatch of a run that may overlap records its leading barrier in full (bindless
+    // heap writes included), whatever the previous command covered: it orders everything before the
+    // run for every dispatch of it, bindless or not.
+    if (record.shader->program->bindlessHeap || (overlapCapable && !overlapped)) covered = 0;
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
@@ -5002,14 +5637,38 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // after an earlier dispatch's reads of the buffers by that dispatch's trailing barrier. A
         // recipe compares the two 64-bit hashes first: equal hashes mean the buffers hold the words.
         const bool differs = record.dataRefresh == RecordedDispatch::DataRefresh::Words || resources.DataWordsHash() != record.dataWordsHash;
+        // With the async lane a cached template can be used by both lanes, which the GPU runs
+        // unordered: a refresh must wait for the other lane's dispatches still reading the old
+        // words, and a dispatch reading (or refreshing over) words the other lane refreshed must
+        // wait for that refresh. The edge submits the other lane's open batch and makes this
+        // lane's batch wait for it. APS5_NO_LANE_TEMPLATE_EDGE=1 (an APS5_AB switch) records
+        // without the edge as before.
+        const bool laneEdges = recorder.AsyncLaneActive() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLaneTemplateEdge);
+        const int lane = laneEdges ? Graphics::Recorder::ThreadLane() : 0;
+        if (laneEdges) {
+            const int other = 1 - lane;
+            const bool afterRefresh = resources.dataWriterLane == other;
+            const bool beforeRefresh = !afterRefresh && (resources.dataReaderLanes & (1u << other)) != 0 && differs && resources.DataWordsDiffer(*record.shader);
+            if (afterRefresh || beforeRefresh) {
+                recorder.OrderAfterLane(other);
+                Graphics::Recorder::CountTemplateEdge(beforeRefresh);
+                resources.dataWriterLane = -1;
+                resources.dataReaderLanes = 0;
+            }
+        }
         if (differs && (record.resourceKeyMatched ? resources.refreshData(commands, *record.shader, &recorder) : resources.RefreshData(commands, *record.shader, &recorder))) {
             covered = 0;
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
             record.refreshed = true;
+            if (laneEdges) {
+                resources.dataWriterLane = lane;
+                resources.dataReaderLanes = 0;
+            }
         } else {
             ++d.templateSameWords;
         }
+        if (laneEdges) resources.dataReaderLanes = static_cast<std::uint8_t>(resources.dataReaderLanes | (1u << lane));
         recordStep(PhaseRecordDataRefresh);
     }
     std::shared_ptr<Graphics::Buffer> threadArguments;
@@ -5051,12 +5710,28 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     // Results of earlier recorded work are visible to this dispatch, its own to everything after.
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    if (overlapped) {
+        // The previous dispatch of this ring (unordered against this one by the title) is still
+        // owed its trailing barrier; this one runs beside it, ordered after everything earlier by
+        // the leading barrier of the run's first dispatch. Its template data refresh (other buffers
+        // than any dispatch of the run reads: OverlapCommands) needs only the transfer's own barrier.
+        if (record.refreshed) {
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT);
+            Graphics::Recorder::CountBarriers(CommandClass::TemplateDataRefresh);
+            ++d.notRefresh;
+        }
+        ++d.overlapped;
+    } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
         const auto timing = recorder.BeginGpuTiming(CommandClass::DispatchLeading);
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        const VkAccessFlags heapWrites = record.shader->program->bindlessHeap || overlapCapable ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0u;
+        // A run's first dispatch also orders the transfers recorded later in the run (the template
+        // data refreshes of its other dispatches) after everything before it.
+        const VkPipelineStageFlags leadingStages = overlapCapable ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        const VkAccessFlags leadingAccess = overlapCapable ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, leadingStages, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | heapWrites, leadingAccess);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchLeading);
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
@@ -5079,6 +5754,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
     if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
     else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    if (record.shader->program->bindlessHeap) context.bindlessTable->Heap().Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
@@ -5089,6 +5765,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
+    else if (Graphics::Recorder::ThreadLane() == 1) Graphics::Recorder::Checkpoint(commands, Graphics::Recorder::CheckpointKind::AsyncDispatch, record.programAddress);
     const auto marker = state->bufferMarker != nullptr ? state->markerLog.Next(record.programAddress) : 0u;
     if (marker != 0) state->bufferMarker(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, state->markerBuffer, 0, marker);
     if (argumentImport != nullptr) {
@@ -5124,15 +5801,23 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recorder.EndGpuTiming(gpuTiming);
     if (marker != 0) state->bufferMarker(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state->markerBuffer, sizeof(std::uint32_t), marker);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
-    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (overlapCapable) {
+        // Recorded by the next command that is not an unordered dispatch of this ring.
+        recorder.DeferDispatchBarrier(overlapQueue, runOwners);
+        recorder.NoteRunAccess(record.programAddress, runAccesses);
+        ++d.trailingDeferred;
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
-    resources.MarkGpuWrites(recorder);
+    if (overlapCapable) resources.MarkGpuWritesInRun(recorder, record.resources);
+    else resources.MarkGpuWrites(recorder);
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
         recorder.NotePendingWrite(record.htileClear->first, record.htileClear->second);
@@ -5143,24 +5828,142 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const bool completionNeeded = resources.NeedsCompletion() || record.htileClear.has_value();
     if (completionNeeded && resources.Reusable()) {
         auto kept = record.resources;
-        recorder.OnComplete([kept, htileClear = record.htileClear] {
-            kept->CheckFaults();
+        recorder.OnComplete([kept, shaderAddress = record.programAddress, htileClear = record.htileClear] {
+            kept->CheckFaults(shaderAddress);
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
         });
     } else if (completionNeeded) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
         auto writers = state->copiedWriters;
         auto kept = record.resources;
-        recorder.OnComplete([kept, writers, htileClear = record.htileClear] {
+        recorder.OnComplete([kept, writers, shaderAddress = record.programAddress, htileClear = record.htileClear] {
             // Delisted before the write-back: one that fails must not keep indirect dispatches on the CPU.
             writers->erase(std::remove(writers->begin(), writers->end(), kept), writers->end());
-            kept->WriteBackBuffers();
+            kept->WriteBackBuffers(shaderAddress);
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
         });
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
         if (resources.HasCopiedWrites()) writers->push_back(kept);
     }
     recordStep(PhaseRecordCompletion);
+}
+
+namespace {
+
+struct PlannedComputeLayout {
+    std::vector<std::uint32_t> key;
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    std::vector<VkDescriptorBindingFlags> flags;
+};
+
+PlannedComputeLayout planComputeLayout(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader) {
+    using Role = ShaderRecompiler::DescriptorRole;
+    using Kind = ShaderRecompiler::DescriptorKind;
+    PlannedComputeLayout plan;
+    std::set<std::uint32_t> occupied;
+    const ShaderRecompiler::DescriptorBinding* sampledTable = nullptr;
+    const ShaderRecompiler::DescriptorBinding* storageTable = nullptr;
+    bool flagged = false;
+    std::uint64_t storageBuffers = 0;
+    std::uint64_t resources = 0;
+    const auto append = [&](std::uint32_t binding, VkDescriptorType type, std::uint32_t count, VkDescriptorBindingFlags flags = 0) {
+        plan.bindings.push_back({binding, type, count, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+        plan.flags.push_back(flags);
+        plan.key.insert(plan.key.end(), {binding, static_cast<std::uint32_t>(type), count, VK_SHADER_STAGE_COMPUTE_BIT});
+        flagged = flagged || flags != 0;
+        if (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) storageBuffers += count;
+        if (type != VK_DESCRIPTOR_TYPE_SAMPLER) resources += count;
+    };
+    for (const auto& binding : shader.bindings) {
+        Graphics::Require(binding.descriptorSet == 0 && occupied.insert(binding.binding).second, "pipeline-only: unsupported descriptor layout");
+        switch (binding.role) {
+            case Role::ImageTable: {
+                const bool storage = binding.kind == Kind::StorageImage;
+                Graphics::Require((storage || binding.kind == Kind::SampledImage) && binding.binding == (storage ? ShaderRecompiler::RuntimeAbi::StorageImageTableBinding : ShaderRecompiler::RuntimeAbi::ImageTableBinding), "pipeline-only: unsupported descriptor layout");
+                (storage ? storageTable : sampledTable) = &binding;
+                break;
+            }
+            case Role::SamplerTable:
+                Graphics::Require(binding.kind == Kind::Sampler && context.samplerTableCapacity != 0, "pipeline-only: unsupported descriptor layout");
+                append(binding.binding, VK_DESCRIPTOR_TYPE_SAMPLER, context.samplerTableCapacity, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+                break;
+            case Role::GuestImages:
+            case Role::GuestSamplers: {
+                Graphics::Require((binding.role == Role::GuestImages && (binding.kind == Kind::SampledImage || binding.kind == Kind::StorageImage)) || (binding.role == Role::GuestSamplers && binding.kind == Kind::Sampler), "pipeline-only: unsupported descriptor layout");
+                const auto heap = static_cast<ShaderRecompiler::RuntimeAbi::Binding>(binding.binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count));
+                const auto localBinding = static_cast<std::uint32_t>(heap);
+                const bool sampled = localBinding >= ShaderRecompiler::RuntimeAbi::FirstImageBinding && localBinding < ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding;
+                const bool storage = localBinding >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding && localBinding < static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
+                Graphics::Require((binding.kind == Kind::SampledImage && sampled) || (binding.kind == Kind::StorageImage && storage) || (binding.kind == Kind::Sampler && heap == ShaderRecompiler::RuntimeAbi::Binding::Samplers), "pipeline-only: unsupported descriptor layout");
+                Graphics::Require(binding.count != 0 && binding.count <= ShaderRecompiler::RuntimeAbi::HeapCapacity(heap) && (binding.kind == Kind::Sampler || context.nullDescriptors || context.placeholderImages != nullptr), "pipeline-only: unsupported descriptor layout");
+                append(binding.binding, binding.kind == Kind::SampledImage ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : binding.kind == Kind::StorageImage ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER, binding.count);
+                break;
+            }
+            case Role::GuestBuffers:
+            case Role::ShaderData:
+            case Role::FlattenedSrt:
+            case Role::Gds:
+            case Role::BdaPagetable:
+            case Role::FaultBuffer:
+            case Role::ImageTableMap:
+                Graphics::Require(binding.count != 0 && binding.kind == Kind::StorageBuffer && !binding.readOnly, "pipeline-only: unsupported descriptor layout");
+                append(binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, binding.count);
+                break;
+            default:
+                throw std::runtime_error("AGC graphics: pipeline-only: unsupported descriptor layout");
+        }
+    }
+    Graphics::Require(storageBuffers <= context.limits.maxPerStageDescriptorStorageBuffers && storageBuffers <= context.limits.maxDescriptorSetStorageBuffers && resources <= context.limits.maxPerStageResources, "pipeline-only: update-after-bind layout is unsupported");
+    const auto elements = sampledTable != nullptr ? sampledTable->count : storageTable != nullptr ? storageTable->count : 0u;
+    Graphics::Require(storageTable == nullptr || storageTable->count == elements, "pipeline-only: sampled and storage image tables disagree on their element domain");
+    std::uint32_t storageTableDescriptors = 0;
+    if (storageTable != nullptr) {
+        storageTableDescriptors = Graphics::StorageImageTableDescriptorCount(context, elements, sampledTable != nullptr);
+        Graphics::Require(storageTableDescriptors != 0, "pipeline-only: storage image tables exceed device descriptor limits");
+        append(ShaderRecompiler::RuntimeAbi::StorageImageTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageTableDescriptors, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+    }
+    if (sampledTable != nullptr) {
+        const auto capacity = storageTableDescriptors == 0 ? context.imageTableCapacity : std::min(context.imageTableCapacity, Graphics::ImageTableCapacity(context, storageTableDescriptors));
+        Graphics::Require(capacity != 0, "pipeline-only: sampled image tables exceed device descriptor limits");
+        append(ShaderRecompiler::RuntimeAbi::ImageTableBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacity, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT);
+    }
+    if (!flagged) plan.flags.clear();
+    return plan;
+}
+
+}
+
+std::vector<std::uint32_t> VulkanDevice::PlannedComputeLayoutKey(const ShaderRecompiler::RecompileResult& shader) {
+    return planComputeLayout(graphicsContext(), shader).key;
+}
+
+double VulkanDevice::WarmComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress, bool verifyDispatchLayout) {
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
+    Graphics::Require(shader.spirv.size() >= 5u && shader.spirv[0] == 0x07230203u, "pipeline-only: invalid SPIR-V");
+    const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0}}};
+    const auto pushes = Graphics::PushConstantStages(shaders) != 0;
+    Graphics::Require(!pushes || state->properties.limits.maxPushConstantsSize >= Graphics::ComputePushConstantBytes, "pipeline-only: compute push constant range exceeds device limit");
+    static_cast<void>(Graphics::AssemblePushConstants(shaders));
+    const auto context = graphicsContext();
+    const auto plan = planComputeLayout(context, shader);
+    Graphics::Require(context.descriptorCache != nullptr, "pipeline-only: descriptor cache is unavailable");
+    const auto layout = context.descriptorCache->Layout(plan.key, plan.bindings, false, plan.flags);
+    const auto started = std::chrono::steady_clock::now();
+    const auto objects = createComputePipeline(context, shader, layout, plan.key, pushes ? VK_SHADER_STAGE_COMPUTE_BIT : 0u, programAddress);
+    const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (verifyDispatchLayout) state->verifyComputeLayouts.store(true, std::memory_order_relaxed);
+    return elapsed;
+}
+
+std::vector<VkDescriptorSetLayout> VulkanDevice::computeSetLayouts(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout) const {
+    std::vector<VkDescriptorSetLayout> layouts{setLayout};
+    if (shader.workgroupMemoryDwords != 0) layouts.push_back(state->workgroupMemoryLayout);
+    if (!shader.bindlessHeap) return layouts;
+    require(context.bindlessTable != nullptr, "a bindless image program needs the device's descriptor heap (APS5_BINDLESS_IMAGES=1 on a device that supports it)");
+    auto& heap = context.bindlessTable->Heap();
+    while (layouts.size() < ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet) layouts.push_back(heap.EmptyLayout());
+    layouts.push_back(heap.Layout(VK_SHADER_STAGE_COMPUTE_BIT));
+    return layouts;
 }
 
 // The module, pipeline layout and pipeline of a compute result over `setLayout` (the set layout
@@ -5177,10 +5980,10 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
     objects->module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     objects->resourcesLayout = setLayout;
-    const std::array<VkDescriptorSetLayout, 2> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
+    const auto setLayouts = computeSetLayouts(context, shader, setLayout);
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    layoutInfo.setLayoutCount = shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
+    layoutInfo.setLayoutCount = static_cast<std::uint32_t>(setLayouts.size());
     layoutInfo.pSetLayouts = setLayouts.data();
     layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
     layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
@@ -5216,7 +6019,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
         if (!path.empty()) std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
     }
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
-    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, context.pipelineCacheSynchronization);
+    CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, stageFlags, specialization.Info(), subgroupSize, &objects->pipeline, shader.spirv.size(), context.pipelineCacheSynchronization);
     objects->destroyModule(objects->device, objects->module, nullptr);
     objects->module = VK_NULL_HANDLE;
     if (!state->probingFloatControls) {
@@ -5238,7 +6041,7 @@ VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, 
     VkShaderModule module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     VkPipeline pipeline = VK_NULL_HANDLE;
     try {
-        CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, module, objects.layout, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, context.pipelineCacheSynchronization);
+        CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, module, objects.layout, computePipelineFlags(), computeStageFlags(shader), specialization.Info(), computeSubgroupSize(shader), &pipeline, shader.spirv.size(), context.pipelineCacheSynchronization);
     } catch (...) {
         objects.destroyModule(objects.device, module, nullptr);
         throw;
@@ -5516,12 +6319,16 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (profile && std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
         d.cacheReport = std::chrono::steady_clock::now();
         AgcDriver::ProfilePrint_nid_no_patch("[rescache] (cumulative): %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
-        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call (cumulative): %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; compute pipelines created %llu (%llu under the GPU mutex)\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)));
+        const auto gate = Graphics::PipelineCreationGate::Shared().Totals();
+        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call (cumulative): %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu; overlap: %llu trailing barriers deferred, %llu dispatches overlapped; compute pipelines created %llu (%llu under the GPU mutex); creation gate: %llu waited %.1f s, %llu past the budget without waiting, peak %llu at once / %llu MiB estimated of a %llu MiB budget\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped), static_cast<unsigned long long>(d.trailingDeferred), static_cast<unsigned long long>(d.overlapped), static_cast<unsigned long long>(computePipelinesCreated.load(std::memory_order_relaxed)), static_cast<unsigned long long>(computePipelinesCreatedLocked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(gate.waited), static_cast<double>(gate.waitNanoseconds) / 1e9, static_cast<unsigned long long>(gate.unwaited), static_cast<unsigned long long>(gate.peakInFlight), static_cast<unsigned long long>(gate.peakBytes >> 20u), static_cast<unsigned long long>(gate.budgetBytes >> 20u));
         reportRecipes();
         reportDispatchMove();
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
+    if (state->verifyComputeLayouts.load(std::memory_order_relaxed)) {
+        Graphics::Require(planComputeLayout(context, shader).key == resources->LayoutKey(), "pipeline-only: planned descriptor layout differs from dispatch");
+    }
     static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
     if (verifySetLayouts && objects != nullptr) require(objects->resourcesLayout == resources->Layout(), "the resident compute pipeline's set layout differs from the dispatch's");
     if (objects == nullptr) {

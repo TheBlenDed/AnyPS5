@@ -20,6 +20,11 @@ inline constexpr std::uint32_t BufferBase = 0u;
 inline constexpr std::uint32_t BufferWords = 4u;
 inline constexpr std::uint32_t ImageBase = 1024u;
 inline constexpr std::uint32_t ImageWords = 5u;
+inline constexpr std::uint32_t DeferredDirectImageMode = 0xfffffff0u;
+
+inline constexpr bool IsDeferredDirectImageMode(std::uint32_t value) {
+    return value == DeferredDirectImageMode;
+}
 inline constexpr std::uint32_t VertexBase = 4096u;
 inline constexpr std::uint32_t VertexWords = 6u;
 inline constexpr std::uint32_t PushDataOffset = 8188u;
@@ -34,8 +39,10 @@ inline constexpr std::uint32_t DepthRemapBase = 8240u;
 inline constexpr std::uint32_t DepthRemapWords = 1u;
 inline constexpr std::uint32_t WorkgroupOffsetBase = 8241u;
 inline constexpr std::uint32_t WorkgroupOffsetWords = 3u;
+inline constexpr std::uint32_t ExportBlendBase = 8244u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
+inline constexpr std::uint32_t LevelsPastViewBase = 8384u;
 inline constexpr std::uint32_t StoreQuantizeBase = 12288u;
 inline constexpr std::uint32_t StoreQuantizeWords = 4u;
 inline constexpr std::uint32_t DescriptorIndexBase = 16384u;
@@ -43,6 +50,7 @@ inline constexpr std::uint32_t DescriptorIndexStride = 128u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;
 inline constexpr std::uint32_t UnnormalizedBaseLevelBase = 57408u;
 inline constexpr std::uint32_t FmaskFormatBase = 57472u;
+inline constexpr std::uint32_t UnnormalizedWrapBase = 57536u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;

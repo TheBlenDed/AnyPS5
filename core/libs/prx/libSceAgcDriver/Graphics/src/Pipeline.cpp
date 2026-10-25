@@ -2,13 +2,16 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "BindlessImageAbi.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
@@ -18,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <string_view>
@@ -220,7 +224,7 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
 }
 
 bool ShadersWriteMemory(std::span<const CompiledShader> shaders) {
-    const auto any = [](const std::vector<bool>& written, std::uint32_t count) { return written.size() < count || std::ranges::any_of(written, [](bool element) { return element; }); };
+    const auto any = [](const ShaderRecompiler::ElementFlags& written, std::uint32_t count) { return written.size() < count || std::ranges::any_of(written, [](bool element) { return element; }); };
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) continue;
         for (const auto& binding : shader.program->bindings) {
@@ -280,7 +284,7 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) return false;
+    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || !state.blendedColors.empty() || BindlessHeapStages(shaders) != 0u || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -470,12 +474,35 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         // layout, so later draws bind their own ShaderResources' set under it.
         const bool pixelLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
         const auto pixelLdsLayouts = pixelLds ? PixelFunctionLdsSetLayouts(context) : PixelFunctionLdsLayouts{};
-        const std::array<VkDescriptorSetLayout, 3> setLayouts{resources.main, pixelLds && !resources.split ? pixelLdsLayouts.empty : resources.fragment, pixelLdsLayouts.buffer};
+        std::array<VkDescriptorSetLayout, 4> setLayouts{resources.main, pixelLds && !resources.split ? pixelLdsLayouts.empty : resources.fragment, pixelLdsLayouts.buffer, VK_NULL_HANDLE};
+        if (!state.blendedColors.empty()) {
+            Require(!pixelLds, "blended color targets beside a pixel LDS buffer (both in descriptor set 2) are unsupported");
+            Require(state.blendedColors.size() <= context.limits.maxPerStageDescriptorStorageImages, "blended color targets exceed per-stage storage image limits");
+            Require(context.descriptorCache != nullptr, "blended color targets need the descriptor cache");
+            std::vector<VkDescriptorSetLayoutBinding> blended;
+            for (const auto& color : state.blendedColors) blended.push_back({color.exportIndex, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr});
+            VkDescriptorSetLayoutCreateInfo blendedInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            blendedInfo.bindingCount = static_cast<std::uint32_t>(blended.size());
+            blendedInfo.pBindings = blended.data();
+            Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &blendedInfo, nullptr, &blendedLayout), "vkCreateDescriptorSetLayout blended targets");
+            if (setLayouts[ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet] == VK_NULL_HANDLE) setLayouts[ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet] = context.descriptorCache->Layout({}, {});
+            setLayouts[ShaderRecompiler::RuntimeAbi::BlendedTargetDescriptorSet] = blendedLayout;
+        }
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.flags = pixelLds || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
-        layoutInfo.setLayoutCount = pixelLds ? 3u : resources.split ? 2u : 1u;
+        layoutInfo.setLayoutCount = blendedLayout != VK_NULL_HANDLE ? ShaderRecompiler::RuntimeAbi::BlendedTargetDescriptorSet + 1u : pixelLds ? 3u : resources.split ? 2u : 1u;
+        heapStages = BindlessHeapStages(shaders);
+        if (heapStages != 0u) {
+            Require(context.bindlessTable != nullptr, "a bindless image draw needs the device's descriptor heap (APS5_BINDLESS_IMAGES=1 on a device that supports it)");
+            auto& heap = context.bindlessTable->Heap();
+            for (std::uint32_t set = 0; set < ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet; ++set) {
+                if (setLayouts[set] == VK_NULL_HANDLE) setLayouts[set] = heap.EmptyLayout();
+            }
+            setLayouts[ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet] = heap.Layout(heapStages);
+            layoutInfo.setLayoutCount = ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet + 1u;
+        }
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
@@ -703,6 +730,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 
 bool Pipeline::Prebuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return !shader.program->stencilReferences.empty(); })) return false;
+    if (BindlessHeapStages(shaders) != 0u) return false;
     struct Scope {
         Scope() { prebuilding = true; prebuilt = false; }
         ~Scope() { prebuilding = false; }
@@ -724,6 +752,7 @@ void Pipeline::release() noexcept {
     if (secondChannel) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, secondChannel, nullptr);
     if (renderPass) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, renderPass, nullptr);
     if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+    if (blendedLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, blendedLayout, nullptr);
     for (auto module : _modules) {
         if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
     }
@@ -732,6 +761,7 @@ void Pipeline::release() noexcept {
     secondChannel = VK_NULL_HANDLE;
     renderPass = VK_NULL_HANDLE;
     layout = VK_NULL_HANDLE;
+    blendedLayout = VK_NULL_HANDLE;
     _modules.clear();
 }
 
@@ -745,6 +775,7 @@ void Pipeline::Abandon() noexcept {
     secondChannel = VK_NULL_HANDLE;
     renderPass = VK_NULL_HANDLE;
     layout = VK_NULL_HANDLE;
+    blendedLayout = VK_NULL_HANDLE;
     _modules.clear();
 }
 
@@ -754,6 +785,10 @@ void Framebuffer::Abandon() noexcept {
 
 VkPipelineLayout Pipeline::Layout() const {
     return layout;
+}
+
+VkDescriptorSetLayout Pipeline::BlendedTargetLayout() const {
+    return blendedLayout;
 }
 
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers) {
@@ -808,7 +843,7 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
-void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, PassBinding* bound) const {
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -835,7 +870,8 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
         if (depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
         if (depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
         context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
-        Continue(commands, state);
+        if (bound != nullptr) *bound = {};
+        Continue(commands, state, bound);
         return;
     }
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -854,44 +890,70 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     sampleLocations.pPostSubpassSampleLocations = &post;
     if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    Continue(commands, state);
+    if (bound != nullptr) *bound = {};
+    Continue(commands, state, bound);
 }
 
-void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
+void Pipeline::Continue(VkCommandBuffer commands, const State& state, PassBinding* bound) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
-    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    const auto handle = best != VK_NULL_HANDLE ? best : pipeline;
+    const bool same = bound != nullptr && bound->pipeline == handle;
+    const std::array<float, 3> bias{state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope};
+    const std::array<float, 2> bounds{state.minDepthBounds, state.maxDepthBounds};
+    if (!same) context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
+    if (!same || std::memcmp(&bound->viewport, &state.viewport, sizeof(VkViewport)) != 0) context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
+    if (!same || std::memcmp(&bound->scissor, &state.scissor, sizeof(VkRect2D)) != 0) context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     if (state.stencilReplayReference) context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
-        setLibraryState(commands, state);
+        const auto values = libraryState(state);
+        if (!same || !bound->hasLibrary || state.stencilReplayReference || std::memcmp(&bound->library, &values, sizeof(values)) != 0) setLibraryState(commands, values);
+        if (bound != nullptr) *bound = {handle, state.viewport, state.scissor, bias, bounds, true, values};
         return;
     }
-    if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
-    if (!depthBounds) return;
-    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
+    if (depthBias && (!same || bound->depthBias != bias)) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
+    if (depthBounds && (!same || bound->depthBounds != bounds)) context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
+    if (bound != nullptr) *bound = {handle, state.viewport, state.scissor, bias, bounds};
 }
 
-void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state) const {
+PassLibraryState Pipeline::libraryState(const State& state) const {
+    PassLibraryState values;
+    std::memset(&values, 0, sizeof(values));
     const bool depth = state.depth.has_value();
-    context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, state.cullMode);
-    context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, state.frontFace);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
-    context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, depth && state.depthTest);
-    context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, depth && state.depthWrite);
-    context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS);
-    context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, depthBounds);
-    context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, depth && state.stencilTest);
+    values.cullMode = state.cullMode;
+    values.frontFace = state.frontFace;
+    if (depthBias) values.depthBias = {HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope};
+    values.depthBounds = depthBounds ? std::array<float, 2>{state.minDepthBounds, state.maxDepthBounds} : std::array<float, 2>{0.0f, 1.0f};
+    values.depthTest = depth && state.depthTest;
+    values.depthWrite = depth && state.depthWrite;
+    values.depthCompare = depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS;
+    values.boundsTest = depthBounds;
+    values.stencilTest = depth && state.stencilTest;
+    if (depth) {
+        values.stencilFront = state.stencilFront;
+        values.stencilBack = state.stencilBack;
+    }
+    return values;
+}
+
+void Pipeline::setLibraryState(VkCommandBuffer commands, const PassLibraryState& values) const {
+    context.Resolved(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, values.cullMode);
+    context.Resolved(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, values.frontFace);
+    context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, values.depthBias[0], values.depthBias[1], values.depthBias[2]);
+    context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, values.depthBounds[0], values.depthBounds[1]);
+    context.Resolved(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, values.depthTest);
+    context.Resolved(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, values.depthWrite);
+    context.Resolved(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, values.depthCompare);
+    context.Resolved(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, values.boundsTest);
+    context.Resolved(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, values.stencilTest);
     const auto stencil = [&](VkStencilFaceFlags face, const VkStencilOpState& op) {
         context.Resolved(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
         context.Resolved(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, face, op.compareMask);
         context.Resolved(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, face, op.writeMask);
         context.Resolved(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, face, op.reference);
     };
-    stencil(VK_STENCIL_FACE_FRONT_BIT, depth ? state.stencilFront : VkStencilOpState{});
-    stencil(VK_STENCIL_FACE_BACK_BIT, depth ? state.stencilBack : VkStencilOpState{});
+    stencil(VK_STENCIL_FACE_FRONT_BIT, values.stencilFront);
+    stencil(VK_STENCIL_FACE_BACK_BIT, values.stencilBack);
 }
 
 void Pipeline::ContinueSecondChannel(VkCommandBuffer commands) const {
@@ -952,6 +1014,7 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(key, shader.pushConstantOffset);
     }
     append(key, PushConstantStages(shaders));
+    append(key, BindlessHeapStages(shaders));
     append(key, input.bindings.size());
     for (const auto& binding : input.bindings) {
         append(key, binding.binding);
@@ -1001,6 +1064,8 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     if (state.blends.size() != state.colors.size()) {
         for (const auto& color : state.colors) append(key, color.exportIndex);
     }
+    append(key, state.blendedColors.size());
+    for (const auto& color : state.blendedColors) append(key, color.exportIndex);
     append(key, state.depth.has_value());
     if (state.depth) {
         append(key, state.depth->format);

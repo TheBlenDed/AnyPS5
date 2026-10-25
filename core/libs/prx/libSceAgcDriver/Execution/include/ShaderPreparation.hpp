@@ -19,6 +19,9 @@ public:
     bool Tracks(const ShaderSnapshot& snapshot) const;
     void Hold();
     void Commit();
+    // A refused preparation was skipped (APS5_SKIP_REFUSED_SHADERS): the transactions it unwound do not
+    // abort the one still open on this thread, which keeps and commits the work done before it.
+    static void ContinueAfterRefusal();
 
 private:
     struct State;

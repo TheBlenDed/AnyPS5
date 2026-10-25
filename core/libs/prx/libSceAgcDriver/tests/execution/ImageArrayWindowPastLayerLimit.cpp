@@ -5,6 +5,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <new>
 #include <bit>
 #include <cmath>
 #include <cstdint>

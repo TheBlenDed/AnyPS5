@@ -52,6 +52,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 mix(vertex.fetchBufferReg);
                 mix(vertex.fetchEmbedded);
                 mix(vertex.paClVsOutCntl);
+                mix(static_cast<std::uint32_t>(vertex.drawBaseVertexSgpr));
+                mix(static_cast<std::uint32_t>(vertex.drawStartInstanceSgpr));
                 mix(vertex.pointList);
                 mix(std::bit_cast<std::uint32_t>(vertex.pointSize));
                 mix(std::bit_cast<std::uint32_t>(vertex.pointSizeMin));
@@ -86,6 +88,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(pixel.targetMerge.depthStencilWrites);
             mix(pixel.targetMerge.depthStencilTests);
             mix(pixel.alphaToCoverage);
+            for (const auto& blend : pixel.targetBlend) mix(static_cast<std::uint64_t>(blend.enable) | (static_cast<std::uint64_t>(blend.sourceFactor) << 8u) | (static_cast<std::uint64_t>(blend.destinationFactor) << 16u) | (static_cast<std::uint64_t>(blend.function) << 24u) | (static_cast<std::uint64_t>(blend.writeMask) << 32u));
             mix(static_cast<std::uint64_t>(pixel.rasterPrimitive));
             mix(pixel.ditheredAlphaToCoverage);
             mix(pixel.quadPixelMask);
@@ -185,6 +188,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (rotate) {
                         auto rotated = std::make_shared<DrawEntry>();
                         rotated->decode = entry->decode;
+                        rotated->prepared = entry->prepared;
                         rotated->stages = entry->stages;
                         rotated->shape = entry->shape;
                         rotated->recipes.store(entry->recipes.load());

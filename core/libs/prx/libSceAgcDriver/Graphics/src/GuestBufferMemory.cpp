@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -159,6 +161,35 @@ AddressSpaceCache& Spaces() {
     return cache;
 }
 
+struct AddressReuseCounts {
+    std::atomic<std::uint64_t> proofs{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AddressReuse::Count)> outcomes{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SpaceResumeMiss::Count)> resumeMisses{};
+    std::atomic<std::uint64_t> refusedProofNs{0};
+    std::atomic<std::uint64_t> reusedHolds{0};
+    std::atomic<std::uint64_t> budgetRefusals{0};
+    std::atomic<std::uint64_t> budgetRefusalsHeld{0};
+    std::atomic<std::uint64_t> heldImportRefusals{0};
+    std::atomic<std::uint64_t> heldImportRefusalsHeld{0};
+    std::atomic<std::uint64_t> sharedUses{0};
+    std::atomic<std::uint64_t> perUseSets{0};
+};
+
+AddressReuseCounts& ReuseCounts() {
+    static AddressReuseCounts counts;
+    return counts;
+}
+
+void countResumeMiss(SpaceResumeMiss miss) {
+    ReuseCounts().resumeMisses[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countImportRefusal(std::atomic<std::uint64_t> AddressReuseCounts::*all, std::atomic<std::uint64_t> AddressReuseCounts::*held) {
+    auto& counts = ReuseCounts();
+    (counts.*all).fetch_add(1, std::memory_order_relaxed);
+    if (counts.reusedHolds.load(std::memory_order_relaxed) != 0) (counts.*held).fetch_add(1, std::memory_order_relaxed);
+}
+
 bool addressSpaceCacheEnabled() {
     static const bool disabled = std::getenv("APS5_NO_ADDRESS_SPACE_CACHE") != nullptr;
     return !disabled;
@@ -231,10 +262,36 @@ struct ImportSettle {
 #endif
 };
 
+class HostImportMutex {
+public:
+    void lock() {
+        mutex.lock();
+        owner.store(token(), std::memory_order_relaxed);
+    }
+
+    void unlock() {
+        owner.store(nullptr, std::memory_order_relaxed);
+        mutex.unlock();
+    }
+
+    bool HeldByThisThread() const {
+        return owner.load(std::memory_order_relaxed) == token();
+    }
+
+private:
+    static const void* token() {
+        thread_local char identity;
+        return &identity;
+    }
+
+    std::mutex mutex;
+    std::atomic<const void*> owner{nullptr};
+};
+
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
 // the registered set; a dropped import is destroyed once the recorded work that may read it completed.
 struct HostImports {
-    AgcDriver::Mutex mutex;
+    HostImportMutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyBuffer destroyBuffer = nullptr;
     PFN_vkFreeMemory freeMemory = nullptr;
@@ -254,6 +311,7 @@ struct HostImports {
     // Bumped whenever an import is dropped, so HostImport pointers taken under the lock earlier can be
     // reused while it is unchanged.
     std::uint64_t epoch = 1;
+    std::uint64_t inserts = 0;
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
@@ -477,6 +535,7 @@ VkResult createImportBuffer(const Context& context, VkExternalMemoryHandleTypeFl
 }
 
 const char* bindImport(const Context& context, HostImport& entry, VkExternalMemoryHandleTypeFlagBits handleType, const void* import, std::uint32_t importTypes, bool& allocated, VkResult& failure) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::HostImport);
     const auto failed = [&](const char* step, VkResult result) -> const char* {
         if (entry.buffer) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
         if (allocated && entry.memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
@@ -601,6 +660,7 @@ ImportChunks& Chunks() {
 }
 
 std::shared_ptr<ImportChunk> importChunk(const Context& context, int file, std::uint64_t index, std::uint32_t bufferTypes, const char*& step, VkResult& failure) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::HostImport);
     struct stat info {};
     if (fstat(file, &info) != 0) {
         failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
@@ -869,7 +929,7 @@ constexpr std::uint64_t settleFloorBytes = 0x100000;
 #ifdef _WIN32
 constexpr std::uint64_t settleBlockBytes = 0x10000;
 constexpr auto settlePollPeriod = std::chrono::microseconds(100);
-std::atomic<bool> deferredSettles{std::getenv("APS5_NO_DEFERRED_SETTLES") == nullptr};
+std::atomic<bool> deferredSettles{std::getenv("APS5_DEFERRED_SETTLES") != nullptr};
 #endif
 
 ImportSettle& settleFor(const Context& context, HostImports& state) {
@@ -1472,7 +1532,8 @@ std::uint64_t configuredBudget() {
 
 std::uint64_t importBudget(const Context& context) {
     if (const auto configured = configuredBudget(); configured != 0) return configured;
-    return HostImportBudget(context.memory, physicalMemoryBytes());
+    static const bool halfHeapReserve = std::getenv("APS5_HOST_IMPORT_HALF_HEAP_RESERVE") != nullptr;
+    return HostImportBudget(context.memory, physicalMemoryBytes(), halfHeapReserve);
 }
 
 std::optional<std::uint32_t> hostHeapIndex(const VkPhysicalDeviceMemoryProperties& memory) {
@@ -1719,7 +1780,11 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return !expandedWindow || Recorder::Active() == nullptr;
     };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
-        if (held(it->second)) return stepDown ? importAllocation(context, state, address, lease, requester, end, evict, bytes / 2) : nullptr;
+        if (held(it->second)) {
+            if (stepDown) return importAllocation(context, state, address, lease, requester, end, evict, bytes / 2);
+            countImportRefusal(&AddressReuseCounts::heldImportRefusals, &AddressReuseCounts::heldImportRefusalsHeld);
+            return nullptr;
+        }
         replaced += it->second.pinnedBytes;
     }
     const auto live = state.liveBytes - replaced;
@@ -1751,6 +1816,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         if (evict) state.evictingRefusals.insert_or_assign(std::pair{base, bytes}, EvictingRefusal{base, bytes, GuestAllocations::Mapped(run.ranges.begin(), run.ranges.end()), state.epoch, state.liveBytes, budget, room, importWindow.load(std::memory_order_relaxed), state.buildFloor, ready, readyHeld, joined});
         if (stepDown && containing != run.ranges.end() && room >= (*containing)->bytes) return importAllocation(context, state, address, lease, requester, end, evict, std::min(bytes / 2, room));
         if (containing != run.ranges.end() && run.ranges.size() > 1) remember((*containing)->address, (*containing)->bytes, GuestAllocations::Mapped{*containing});
+        countImportRefusal(&AddressReuseCounts::budgetRefusals, &AddressReuseCounts::budgetRefusalsHeld);
         return nullptr;
     }
     for (auto it = first; it != state.imports.end() && it->first < base + bytes;) {
@@ -1914,6 +1980,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         }
     }
 #endif
+    ++state.inserts;
     const auto inserted = state.imports.emplace(base, entry);
     owner.armed = false;
     return &inserted.first->second;
@@ -2651,6 +2718,56 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
     return checked;
 }
 
+enum class SpaceMiss { None, First, Device, Generation, Epoch };
+
+SpaceMiss spaceMiss(const Context& context, const GuestBufferMemory::AddressSpace* current, std::uint64_t generation, const HostImports& state) {
+    if (current == nullptr) return SpaceMiss::First;
+    if (current->device != context.device) return SpaceMiss::Device;
+    if (current->generation != generation) return SpaceMiss::Generation;
+    if (current->importsEpoch != state.epoch) return SpaceMiss::Epoch;
+    return SpaceMiss::None;
+}
+
+void stampSpaceImports(const GuestBufferMemory::AddressSpace& space, HostImports& state) {
+    const auto stamp = ++state.useCounter;
+    static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+    auto& spaceUse = state.spaceUses[space.serial];
+    if (!stampOnce || spaceUse == 0) {
+        for (const auto& region : space.base) {
+            if (region.direct == nullptr) continue;
+            region.direct->lastUse = stamp;
+            if (stampOnce) region.direct->spaceSerial = space.serial;
+        }
+    }
+    spaceUse = stamp;
+    if (state.spaceUses.size() > 64) {
+        const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
+        for (auto& [base, entry] : state.imports) {
+            if (entry.spaceSerial != oldest->first) continue;
+            entry.lastUse = std::max(entry.lastUse, oldest->second);
+            entry.spaceSerial = 0;
+        }
+        state.spaceUses.erase(oldest);
+    }
+}
+
+bool refreshSparseMirrors(std::shared_ptr<const GuestBufferMemory::AddressSpace>& current, std::vector<RefreshBlock>& blocks) {
+    for (auto* mirror : current->sparseMirrors) {
+        if (refreshSparseMirror(*mirror, blocks)) continue;
+        blocks.clear();
+        Spaces().current.compare_exchange_strong(current, std::shared_ptr<const GuestBufferMemory::AddressSpace>{});
+        return false;
+    }
+    return true;
+}
+
+void appendWritableMirrors(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    for (const auto index : space.writableMirrors) {
+        const auto& region = space.base[index];
+        if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
+    }
+}
+
 bool heapMirrorWatched(ImageMirror& mirror) {
     const auto serial = GuestMemory::UnwatchSerial();
     if (mirror.watchedSerial.load(std::memory_order_relaxed) == serial) return true;
@@ -2778,6 +2895,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         return mirror;
     }
     try {
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestMirror);
         mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     } catch (const std::runtime_error& error) {
         if (heap) {
@@ -2951,6 +3069,11 @@ SnapshotStats& Snapshots() {
     return stats;
 }
 
+bool liveSnapshotCompared(std::uint64_t address, std::size_t bytes) {
+    static const bool checkLive = std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr;
+    return checkLive && !AnyShadowedOverlaps(address, bytes);
+}
+
 bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
     const auto start = std::chrono::steady_clock::now();
     bool synced = false;
@@ -3029,8 +3152,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
         const auto target = state.newestLeaseSerial;
         if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
             Recorder::CountSync(4);
-            recorder->Submit();
-            recorder->FinishUpTo(target);
+            recorder->FinishThroughOpened(target);
             state.finishedLeaseSerial = target;
             synced = true;
         } else if (recorder != nullptr && !recorder->Idle()) {
@@ -3149,9 +3271,8 @@ void FinishLeaseWork() {
     auto* recorder = Recorder::Active();
     const auto target = state.newestLeaseSerial;
     if (recorder == nullptr || recorder != state.leaseRecorder || target <= recorder->CompletedThrough()) return;
-    if (target >= recorder->OpenSerial()) recorder->Submit();
     Recorder::AnnounceSyncSite(__builtin_return_address(0));
-    recorder->FinishUpTo(target);
+    recorder->FinishThroughOpened(target);
 }
 
 LeaseStats LeaseCounters() {
@@ -3164,6 +3285,48 @@ AddressSpaceStats AddressSpaceCounters() {
     const auto& cache = Spaces();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
     return {addressSpaceCacheEnabled(), load(cache.hits), load(cache.rebuiltFirst), load(cache.rebuiltGeneration), load(cache.rebuiltEpoch), load(cache.rebuiltDevice), load(cache.rebuiltWaiterDrop), load(cache.unpublished), load(cache.dissolvedOverlap), load(cache.dissolvedImports), load(cache.waiterDrops)};
+}
+
+void CountAddressReuseProof() {
+    ReuseCounts().proofs.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountSharedAddressUse() {
+    ReuseCounts().sharedUses.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountPerUseAddressSet() {
+    ReuseCounts().perUseSets.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountAddressReuse(AddressReuse outcome, std::uint64_t proofNs) {
+    auto& counts = ReuseCounts();
+    counts.outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    if (outcome != AddressReuse::Reused && proofNs != 0) counts.refusedProofNs.fetch_add(proofNs, std::memory_order_relaxed);
+}
+
+void HoldReusedSpace(bool held) {
+    auto& holds = ReuseCounts().reusedHolds;
+    if (held) holds.fetch_add(1, std::memory_order_relaxed);
+    else holds.fetch_sub(1, std::memory_order_relaxed);
+}
+
+AddressReuseStats AddressReuseCounters() {
+    const auto& counts = ReuseCounts();
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    AddressReuseStats stats;
+    stats.proofs = load(counts.proofs);
+    for (std::size_t index = 0; index < stats.outcomes.size(); ++index) stats.outcomes[index] = load(counts.outcomes[index]);
+    for (std::size_t index = 0; index < stats.resumeMisses.size(); ++index) stats.resumeMisses[index] = load(counts.resumeMisses[index]);
+    stats.refusedProofNs = load(counts.refusedProofNs);
+    stats.reusedHolds = load(counts.reusedHolds);
+    stats.budgetRefusals = load(counts.budgetRefusals);
+    stats.budgetRefusalsHeld = load(counts.budgetRefusalsHeld);
+    stats.heldImportRefusals = load(counts.heldImportRefusals);
+    stats.heldImportRefusalsHeld = load(counts.heldImportRefusalsHeld);
+    stats.sharedUses = load(counts.sharedUses);
+    stats.perUseSets = load(counts.perUseSets);
+    return stats;
 }
 
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit) {
@@ -3180,6 +3343,40 @@ std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t l
         message += text;
     }
     return message;
+}
+
+void AppendGuestBufferMemoryStats(std::string& line) {
+    std::uint64_t mirrorBytes = 0, heapBytes = 0, shadowBytes = 0, buffers = 0;
+    std::size_t mirrors = 0, heapMirrors = 0;
+    {
+        auto& state = Mirrors();
+        std::lock_guard lock(state.mutex);
+        mirrors = state.entries.size();
+        for (const auto& [base, mirror] : state.entries) {
+            if (mirror == nullptr) continue;
+            if (mirror->buffer != nullptr) {
+                mirrorBytes += mirror->bytes;
+                ++buffers;
+                if (mirror->heap) {
+                    heapBytes += mirror->bytes;
+                    ++heapMirrors;
+                }
+            }
+            shadowBytes += mirror->shadow.capacity();
+        }
+    }
+    MemoryStats::AppendMiB(line, "mirror_buffers", mirrorBytes, buffers);
+    MemoryStats::AppendMiB(line, "mirror_heap_buffers", heapBytes, heapMirrors);
+    MemoryStats::AppendMiB(line, "mirror_shadows", shadowBytes, mirrors);
+    std::uint64_t importBytes = 0;
+    std::size_t imports = 0;
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        importBytes = state.liveBytes;
+        imports = state.imports.size();
+    }
+    MemoryStats::AppendMiB(line, "host_imports", importBytes, imports);
 }
 
 MirrorStats MirrorCounters() {
@@ -3309,6 +3506,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::HostImport);
         if ((probe.result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &destination)) != VK_SUCCESS) return "vkCreateBuffer";
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, destination, &requirements);
@@ -3549,13 +3747,13 @@ void SetHostImportDeferredSettles(bool enabled) {
 #endif
 }
 
-std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, const std::uint64_t physicalBytes) {
+std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, const std::uint64_t physicalBytes, const bool halfHeapReserve) {
     std::uint64_t hostHeap = 0;
     for (std::uint32_t index = 0; index < std::min<std::uint32_t>(memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS); ++index) {
         if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) hostHeap = std::max<std::uint64_t>(hostHeap, memory.memoryHeaps[index].size);
     }
     const auto fromMemory = std::max<std::uint64_t>(6144ull << 20u, physicalBytes / 2);
-    const auto reserve = std::max<std::uint64_t>(2048ull << 20u, hostHeap / 2);
+    const auto reserve = std::max<std::uint64_t>(2048ull << 20u, halfHeapReserve ? hostHeap / 2 : 0u);
     return hostHeap > reserve ? std::min(fromMemory, hostHeap - reserve) : fromMemory;
 }
 
@@ -3629,14 +3827,7 @@ std::uint64_t HostImportsSettled() {
     return settledImports.load(std::memory_order_relaxed);
 }
 
-const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester) {
-    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
-    ensurePinWaiter();
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
-#ifdef _WIN32
-    settleUnwatchedImports(context, state);
-#endif
+static const HostImport* hostImportSettled(const Context& context, HostImports& state, std::uint64_t address, std::size_t bytes, ImportRequester requester) {
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) {
@@ -3647,6 +3838,72 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
     return importAccess(context, state, address, address + bytes, lease, requester);
+}
+
+const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester) {
+    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    ensurePinWaiter();
+    auto& state = Imports();
+    if (state.mutex.HeldByThisThread()) {
+        if (state.device != context.device) return nullptr;
+        const auto* entry = findImport(state, address, address + bytes);
+        if (entry == nullptr) return nullptr;
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        return sameRange(*entry, lease) ? entry : nullptr;
+    }
+    std::lock_guard lock(state.mutex);
+#ifdef _WIN32
+    settleUnwatchedImports(context, state);
+#endif
+    return hostImportSettled(context, state, address, bytes, requester);
+}
+
+const HostImport* HostImportForCached(const Context& context, std::uint64_t address, std::size_t bytes, HostImportLookupCache& cache) {
+    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    ensurePinWaiter();
+    auto& state = Imports();
+    // A caller already holding the import mutex (a lookup from inside the import code) takes the
+    // uncached held-lock path of HostImportFor; the cache is neither read nor filled there.
+    if (state.mutex.HeldByThisThread()) return HostImportFor(context, address, bytes, ImportRequester::Access);
+    std::lock_guard lock(state.mutex);
+#ifdef _WIN32
+    settleUnwatchedImports(context, state);
+#endif
+    if (cache.import != nullptr && cache.address == address && cache.bytes == bytes && cache.epoch == state.epoch && cache.inserts == state.inserts && !importsStale(context, state)) {
+        cache.import->lastUse = ++state.useCounter;
+        cache.import->lastUse = ++state.useCounter;
+        return cache.import;
+    }
+    const auto* entry = hostImportSettled(context, state, address, bytes, ImportRequester::Access);
+    if (entry != nullptr && !importsStale(context, state)) cache = {entry, address, bytes, state.epoch, state.inserts};
+    else cache = {};
+    return entry;
+}
+
+namespace {
+
+GuestAllocations::Lease mappedRangesLease(const HostImports& state, const GuestAllocations::Mapped& ranges) {
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    if (window == 0) return GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (const auto& mapped : ranges) {
+        const auto range = mapped.lock();
+        if (range == nullptr) continue;
+        auto low = range->address / window * window;
+        auto high = std::max(low + window, range->address + range->bytes);
+        auto it = state.imports.upper_bound(low);
+        if (it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > low) --it;
+        const auto runEnd = high;
+        for (; it != state.imports.end() && it->first < runEnd; ++it) {
+            low = std::min(low, it->second.base);
+            high = std::max(high, it->second.base + it->second.bytes);
+        }
+        Require(high <= std::numeric_limits<std::uint64_t>::max() - window, "mapped guest range lease span overflows");
+        spans.emplace_back(low / window * window, (high + window - 1) / window * window);
+    }
+    return GuestAllocations::GuestAllocationsAcquireSpans_nid_postfix(spans);
+}
+
 }
 
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
@@ -3671,6 +3928,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     } else if (state.refreshedGeneration > generation) {
         return true;
     }
+    if (!adopting) current = mappedRangesLease(state, ranges);
     for (const auto& mapped : ranges) {
         const auto range = mapped.lock();
         if (range == nullptr || range->bytes <= 0x10000) continue;
@@ -3721,7 +3979,11 @@ bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t
     return state.device == context.device && peekImport(state, address, address + bytes) != nullptr;
 }
 
-GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) {}
+namespace {
+bool bdaStagingEnabled();
+}
+
+GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context), bdaStaging(bdaStagingEnabled()) {}
 
 bool GuestBufferMemory::WritesOverlap(std::uint64_t address, std::size_t bytes) const {
     return std::any_of(writes.begin(), writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
@@ -3787,44 +4049,17 @@ void GuestBufferMemory::AcquireRegistered() {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             const auto keeps = [&](ImageMirror* mirror) { return heapMirrorWatched(*mirror) || !importsNow(context, state, current->lease, mirror->base); };
-            if (current == nullptr) (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed);
-            else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
-            else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
-            else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
-            else hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps);
+            switch (spaceMiss(context, current.get(), generation, state)) {
+                case SpaceMiss::First: (spaces.droppedByWaiter.exchange(false, std::memory_order_relaxed) ? spaces.rebuiltWaiterDrop : spaces.rebuiltFirst).fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::Device: spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::Generation: spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::Epoch: spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed); break;
+                case SpaceMiss::None: hit = std::all_of(current->heapMirrors.begin(), current->heapMirrors.end(), keeps) && std::all_of(current->sparseMirrors.begin(), current->sparseMirrors.end(), keeps); break;
+            }
             importFloor = state.useCounter + 1;
-            if (hit) {
-                const auto stamp = ++state.useCounter;
-                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
-                auto& spaceUse = state.spaceUses[current->serial];
-                if (!stampOnce || spaceUse == 0) {
-                    for (const auto& region : current->base) {
-                        if (region.direct == nullptr) continue;
-                        region.direct->lastUse = stamp;
-                        if (stampOnce) region.direct->spaceSerial = current->serial;
-                    }
-                }
-                spaceUse = stamp;
-                if (state.spaceUses.size() > 64) {
-                    const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
-                    for (auto& [base, entry] : state.imports) {
-                        if (entry.spaceSerial != oldest->first) continue;
-                        entry.lastUse = std::max(entry.lastUse, oldest->second);
-                        entry.spaceSerial = 0;
-                    }
-                    state.spaceUses.erase(oldest);
-                }
-            }
+            if (hit) stampSpaceImports(*current, state);
         }
-        if (hit) {
-            for (auto* mirror : current->sparseMirrors) {
-                if (refreshSparseMirror(*mirror, blocks)) continue;
-                hit = false;
-                blocks.clear();
-                spaces.current.compare_exchange_strong(current, std::shared_ptr<const AddressSpace>{});
-                break;
-            }
-        }
+        if (hit) hit = refreshSparseMirrors(current, blocks);
         if (hit) {
             spaces.hits.fetch_add(1, std::memory_order_relaxed);
             space = std::move(current);
@@ -3838,10 +4073,7 @@ void GuestBufferMemory::AcquireRegistered() {
             // before any of them is dereferenced.
             served = true;
             mirrored = space->mirrored;
-            for (const auto index : space->writableMirrors) {
-                const auto& region = space->base[index];
-                if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
-            }
+            appendWritableMirrors(*space, blocks);
             lap(timing.mirrorsUs, at);
         }
     }
@@ -4042,17 +4274,24 @@ void GuestBufferMemory::validate(std::uint64_t address, std::size_t bytes) const
     Require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "guest memory range overflow");
 }
 
-void GuestBufferMemory::addCopiedRange(const CopiedRange& range) {
+void GuestBufferMemory::addCopiedRange(const CopiedRange& range, const GuestMemory::Commitment* known) {
     validate(range.begin, range.end - range.begin);
     Region region{range.begin, range.end, range.writable, {}, nullptr};
     // Read-only ranges are read from live guest memory at Upload: the lease pins them and the guest
     // cannot write them, so that equals a snapshot taken now without the extra copy. Reserved heaps
     // are registered whole while the guest commits pages on demand: committed pages only.
     region.hostBacked = !range.writable;
-    auto committed = GuestMemory::DescribeCommitted(range.begin, range.end - range.begin);
-    if (!committed.whole) {
-        region.sparse = true;
-        region.backed = std::move(committed.ranges);
+    if (known != nullptr) {
+        if (!known->whole) {
+            region.sparse = true;
+            region.backed = known->ranges;
+        }
+    } else {
+        auto committed = GuestMemory::DescribeCommitted(range.begin, range.end - range.begin);
+        if (!committed.whole) {
+            region.sparse = true;
+            region.backed = std::move(committed.ranges);
+        }
     }
     regions.push_back(std::move(region));
 }
@@ -4121,9 +4360,10 @@ const GuestBufferMemory::Region* GuestBufferMemory::owner(std::uint64_t address,
 
 namespace {
 
+// Device-local staging for address-based compute builds (BDA overlays, see resolveOverlays).
+// APS5_NO_BDA_STAGING=1: their written descriptor ranges stay in the space's imports, as before.
 bool bdaStagingEnabled() {
-    static const bool disabled = std::getenv("APS5_NO_BDA_STAGING") != nullptr;
-    return !disabled;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoBdaStaging);
 }
 
 template<typename Regions>
@@ -4154,7 +4394,7 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
                 overlay = true;
                 break;
             }
-            if (bdaStagingEnabled() && stagingAllowed) servedInsideBase.emplace_back(begin, end);
+            if (bdaStaging && stagingAllowed) servedInsideBase.emplace_back(begin, end);
             return;
         case BaseOverlap::Partial:
             if (readOnly && !mirrorOverlaps(space->base, begin, end) && !WritesOverlap(begin, static_cast<std::size_t>(end - begin))) {
@@ -4277,12 +4517,12 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         // descriptors and specialization still equal what the GPU reads. APS5_NO_SNAPSHOT_CHECK=1
         // skips the compare of live-backed regions (the region serves the GPU whatever the snapshot
         // held; only the diagnostic is lost).
-        static const bool checkLive = std::getenv("APS5_NO_SNAPSHOT_CHECK") == nullptr;
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         const bool live = owner->writable || owner->hostBacked || owner->mirror != nullptr;
+        snapshotUses.push_back({snapshot.address, snapshot.bytes.size(), live});
         // A live region over a unit shadow's fresh results reads the import's stale bytes here
         // (the publish happens when the region is bound, under the device lock): not compared.
-        if (live && (!checkLive || AnyShadowedOverlaps(snapshot.address, snapshot.bytes.size()))) {
+        if (live && !liveSnapshotCompared(snapshot.address, snapshot.bytes.size())) {
             if (profile) Snapshots().skipped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -4309,6 +4549,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
         if (profile) Snapshots().checked.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    snapshotUses.push_back({snapshot.address, snapshot.bytes.size(), false});
     regions.push_back({snapshot.address, end, false, {snapshot.bytes.begin(), snapshot.bytes.end()}, nullptr});
     regionsSorted = false;
 }
@@ -4396,6 +4637,34 @@ bool atomicStagingEnabled() {
     return !disabled;
 }
 
+// APS5_STAGING_DIFF=1: a staged region's copy-back stores only the dwords its work changed. The
+// copy-in also copies the shadow into a device-local `pristine` buffer (VRAM to VRAM), and the
+// copy-back runs Recorder::RecordStagingDiff over each written range: a dword whose result equals
+// the pristine copy is not stored. The import then holds exactly the bytes the whole copy would
+// leave there, except where it changed after the copy-in while the work left the dword alone (a
+// CPU store the whole copy rolls back keeps its value instead). The PCIe writes of the copy-back
+// shrink to the changed dwords. Unaligned edges and imports without a device address copy whole.
+bool stagingDiffEnabled(const Context& context) {
+    static const bool enabled = std::getenv("APS5_STAGING_DIFF") != nullptr;
+    return enabled && context.bufferDeviceAddress;
+}
+
+// APS5_STAGING_DIFF=alt (an in-run A/B for [gputime]): the diff copy-backs run in alternate
+// 60 s phases from the first staged copy-in, whole copies in between; each phase change prints
+// "[buffers] staging diff phase on|off". Any other value: always on. Decided per use at its copy-in.
+bool stagingDiffActive() {
+    static const bool alternate = [] {
+        const char* value = std::getenv("APS5_STAGING_DIFF");
+        return value != nullptr && std::string_view(value) == "alt";
+    }();
+    if (!alternate) return true;
+    static const auto start = std::chrono::steady_clock::now();
+    static std::atomic<int> shown{-1};
+    const auto phase = static_cast<int>((std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count() / 60) % 2);
+    if (shown.exchange(phase, std::memory_order_relaxed) != phase) AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging diff phase %s\n", phase == 0 ? "on" : "off");
+    return phase == 0;
+}
+
 std::uint64_t kibSetting(const char* name, std::uint64_t defaultKib) {
     const char* value = std::getenv(name);
     return (value != nullptr ? std::strtoull(value, nullptr, 10) : defaultKib) << 10u;
@@ -4446,6 +4715,18 @@ struct CopyStats {
     std::atomic<std::uint64_t> stagedOutBytes{0};
     std::atomic<std::uint64_t> stagedLost{0};
     std::atomic<std::uint64_t> stagingRefused{0};
+    // BDA overlays (resolveOverlays): clusters kept for staging, and clusters dropped (served by
+    // the import as before) for crossing another range, leaving one import region or the window.
+    std::atomic<std::uint64_t> overlaysKept{0};
+    std::atomic<std::uint64_t> overlaysCrossed{0};
+    std::atomic<std::uint64_t> overlaysOutside{0};
+    std::atomic<std::uint64_t> overlaysWindow{0};
+    std::atomic<std::uint64_t> overlaysNoSpace{0};
+    // APS5_STAGING_DIFF: written ranges copied back by the diff kernel (their dwords), and the
+    // ranges/bytes that still took a whole copy (unaligned edges, no device address).
+    std::atomic<std::uint64_t> diffRanges{0};
+    std::atomic<std::uint64_t> diffBytes{0};
+    std::atomic<std::uint64_t> diffWholeBytes{0};
     std::atomic<std::int64_t> lastStagingReport{0};
 };
 
@@ -4458,6 +4739,7 @@ CopyStats& Copies() {
 // shadow is its own VkDeviceMemory, retained by cached builds) is no error: nullptr, and the
 // region takes the path it would take without staging (Region::unstaged).
 std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestStaging);
     try {
         return std::make_shared<Buffer>(context, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     } catch (const std::exception& error) {
@@ -4494,6 +4776,22 @@ void reportStaging() {
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    if (const auto kept = stats.overlaysKept.load(); kept != 0 || stats.overlaysCrossed.load() != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[buffers] bda staging (APS5_NO_BDA_STAGING=1 off): %llu overlay clusters staged; dropped: %llu crossing another range, %llu outside one import, %llu outside the window, %llu builds without a space\n", static_cast<unsigned long long>(kept), static_cast<unsigned long long>(stats.overlaysCrossed.load()), static_cast<unsigned long long>(stats.overlaysOutside.load()), static_cast<unsigned long long>(stats.overlaysWindow.load()), static_cast<unsigned long long>(stats.overlaysNoSpace.load()));
+    }
+    if (stats.diffRanges.load() == 0) return;
+    static std::uint64_t lastRanges = 0, lastDiff = 0, lastWhole = 0, lastStored = 0;
+    auto* recorder = Recorder::Active();
+    const auto ranges = stats.diffRanges.load();
+    const auto diff = stats.diffBytes.load();
+    const auto whole = stats.diffWholeBytes.load();
+    const auto stored = recorder != nullptr ? recorder->StagingDiffStoredDwords() * 4u : lastStored;
+    const auto compared = diff - lastDiff;
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging diff (APS5_STAGING_DIFF), last 10 s: %llu written ranges, %.0f KiB compared, %.0f KiB stored (%.1f%%), %.0f KiB copied whole (edges, no device address)\n", static_cast<unsigned long long>(ranges - lastRanges), compared / 1024.0, (stored - lastStored) / 1024.0, compared != 0 ? 100.0 * static_cast<double>(stored - lastStored) / static_cast<double>(compared) : 0.0, (whole - lastWhole) / 1024.0);
+    lastRanges = ranges;
+    lastDiff = diff;
+    lastWhole = whole;
+    lastStored = stored;
 }
 
 }
@@ -4531,33 +4829,80 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
-    return !readOnly && bdaStagingEnabled() && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
+    return !readOnly && bdaStaging && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
 }
 
+// Device-local staging for address-based builds (BDA overlays). Such a build binds its written V#
+// elements in place in the imports of the cached address space (system memory over PCIe; the cloth
+// solver family reads and writes ~0.8 MB per dispatch that way), and its BDA table sends the same
+// guest addresses to the same imports, so a descriptor-only shadow would let the two paths see
+// different bytes. Instead each written element inside an import region becomes a region of its
+// own (Region::overlay), staged like any other written element (copy-in, device-local shadow,
+// copy-back of the written range by RecordCopyBacks, with APS5_STAGING_DIFF storing only the dwords
+// that changed), and AddressRanges cuts the import's table entry around it so that every pointer
+// into the element reaches the shadow too: the shader sees one copy of the bytes whichever way it
+// addresses them. Kept only where that is provable here, per cluster of overlapping overlays (they
+// merge into one region): inside one import region of the space, within the staging window, and
+// crossed by no other descriptor range served in place, no own region and no space (a dissolved
+// space puts the import regions back among the build's own, where they would merge). Anything
+// else is served by the import as before.
 void GuestBufferMemory::resolveOverlays() {
     std::vector<std::size_t> members;
     for (std::size_t index = 0; index < regions.size(); ++index) {
         if (regions[index].overlay) members.push_back(index);
     }
     if (members.empty()) return;
-    std::vector<bool> drop(regions.size(), space == nullptr);
-    std::sort(members.begin(), members.end(), [&](std::size_t left, std::size_t right) { return regions[left].begin < regions[right].begin; });
-    for (std::size_t first = 0; space != nullptr && first < members.size();) {
-        Region cluster{regions[members[first]].begin, regions[members[first]].end, true, {}, nullptr};
-        cluster.overlay = true;
-        auto last = first;
-        for (; last < members.size() && (last == first || regions[members[last]].begin < cluster.end); ++last) {
-            cluster.end = std::max(cluster.end, regions[members[last]].end);
-            cluster.atomic = cluster.atomic || regions[members[last]].atomic;
-            cluster.swept = cluster.swept || regions[members[last]].swept;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& stats = Copies();
+    std::vector<bool> drop(regions.size(), false);
+    if (space == nullptr) {
+        for (const auto index : members) drop[index] = true;
+        if (profile) stats.overlaysNoSpace.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        std::sort(members.begin(), members.end(), [&](std::size_t left, std::size_t right) { return regions[left].begin < regions[right].begin; });
+        for (std::size_t first = 0; first < members.size();) {
+            auto last = first + 1;
+            auto clusterEnd = regions[members[first]].end;
+            bool atomic = regions[members[first]].atomic;
+            bool swept = regions[members[first]].swept;
+            // UploadPrepare merges regions that overlap (not ones that only touch).
+            while (last < members.size() && regions[members[last]].begin < clusterEnd) {
+                clusterEnd = std::max(clusterEnd, regions[members[last]].end);
+                atomic = atomic || regions[members[last]].atomic;
+                swept = swept || regions[members[last]].swept;
+                ++last;
+            }
+            const auto clusterBegin = regions[members[first]].begin;
+            const auto bytes = clusterEnd - clusterBegin;
+            // A range served in place that overlaps the cluster without lying inside it would see the
+            // import's bytes where the cluster's shader stores into the shadow.
+            const auto crosses = [&](std::uint64_t begin, std::uint64_t end) { return begin < clusterEnd && clusterBegin < end && (begin < clusterBegin || end > clusterEnd); };
+            const Region* inside = nullptr;
+            const bool inWindow = (atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) || (bytes >= writtenShadowMin() && bytes <= (swept ? std::max(writtenShadowMax(context.discreteGpu), SweptShadowMax) : writtenShadowMax(context.discreteGpu)));
+            bool keep = true;
+            if (baseOverlap(clusterBegin, clusterEnd, &inside) != BaseOverlap::Inside || inside == nullptr || inside->direct == nullptr || inside->mirror != nullptr) {
+                keep = false;
+                if (profile) stats.overlaysOutside.fetch_add(1, std::memory_order_relaxed);
+            } else if (!inWindow) {
+                keep = false;
+                if (profile) stats.overlaysWindow.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                bool crossed = std::any_of(servedInsideBase.begin(), servedInsideBase.end(), [&](const auto& range) { return crosses(range.first, range.second); });
+                for (std::size_t index = 0; index < regions.size() && !crossed; ++index) {
+                    const auto& region = regions[index];
+                    if (!region.overlay && region.begin < clusterEnd && clusterBegin < region.end) crossed = true;
+                }
+                if (crossed) {
+                    keep = false;
+                    if (profile) stats.overlaysCrossed.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (keep && profile) stats.overlaysKept.fetch_add(1, std::memory_order_relaxed);
+            if (!keep) {
+                for (auto member = first; member < last; ++member) drop[members[member]] = true;
+            }
+            first = last;
         }
-        const auto crosses = [&](std::uint64_t begin, std::uint64_t end) { return begin < cluster.end && cluster.begin < end && (begin < cluster.begin || end > cluster.end); };
-        const Region* inside = nullptr;
-        bool keep = baseOverlap(cluster.begin, cluster.end, &inside) == BaseOverlap::Inside && inside != nullptr && inside->direct != nullptr && inside->mirror == nullptr && stagingEligible(cluster, true);
-        keep = keep && std::none_of(servedInsideBase.begin(), servedInsideBase.end(), [&](const auto& range) { return crosses(range.first, range.second); });
-        keep = keep && std::none_of(regions.begin(), regions.end(), [&](const Region& region) { return !region.overlay && region.begin < cluster.end && cluster.begin < region.end; });
-        for (auto member = first; member < last; ++member) drop[members[member]] = !keep;
-        first = last;
     }
     std::size_t kept = 0;
     for (std::size_t index = 0; index < regions.size(); ++index) {
@@ -4698,7 +5043,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable));
+                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -4710,6 +5055,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 if (!staged) {
                     if (!gpuCopyEligible(region)) continue;
                     const auto allocateStart = std::chrono::steady_clock::now();
+                    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestStaging);
                     region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable), copyBufferProperties(false));
                     if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 }
@@ -4731,7 +5077,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     // GuestMemory::Read stores pending GPU results first (the flush hook locks for itself).
     for (auto& region : regions) {
         if (region.pending || region.mirror != nullptr || region.direct != nullptr) continue;
-        if (sparseHeapCandidate(region) || (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)))) {
+        if (deferHostCopies || sparseHeapCandidate(region) || (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)))) {
             region.pending = true;
             continue;
         }
@@ -4917,6 +5263,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base - entry->lead;
+                region.copySourceAddress = entry->address;
             }
         }
         if (region.direct != nullptr) {
@@ -4939,7 +5286,8 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // in the same batch. The batch is opened first so that an import the flush's own
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
-            static_cast<void>(recorder->Commands());
+            // (OpenBatch, not Commands: an open dispatch run of the ring stays open, see Recorder::RunCommands.)
+            recorder->OpenBatch();
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
@@ -5017,6 +5365,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
     const auto allocated = region.bufferEnd != 0 ? region.bufferEnd - region.begin : bytes;
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestStaging);
     const bool shared = region.buffer == nullptr && !region.hostBacked && !region.writable && !region.sparse && region.bufferEnd == 0 && region.snapshot.size() == bytes;
     if (shared) region.buffer = snapshotCopy(context, region.begin, region.snapshot, usage);
     else if (region.buffer == nullptr) region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), usage);
@@ -5091,16 +5440,36 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
+    // The copy-ins of an unordered dispatch joining an open run of its ring (dispatch overlap, see
+    // Recorder::RunCommands) record no leading barrier: the run's first dispatch ordered everything
+    // before the run for transfers too, and the run's dispatches the title leaves unordered with this
+    // one (their copy-backs wait for the run's end, Recorder::AfterRun). Outside a run the leading
+    // barrier is skipped when the trailing barrier just recorded already orders it (ElideCovered).
+    bool inRun = false;
     VkAccessFlags covered = 0;
-    const auto commands = recorder->Commands(&covered);
-    const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
+    thread_local std::vector<std::array<std::uint64_t, 3>>* runAccessesSlot = nullptr;
+    auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
+    runAccesses.clear();
+    if (recorder->RunOpen()) RunAccesses(runAccesses);
+    auto commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);
+    // Batched staging (Recorder::SplitForRun): a joining dispatch's copies go to the run's prelude,
+    // submitted ahead of the run's dispatches, whose barriers it records once for the whole run.
+    // Not with the capture's read-backs or the hazard validator (both work per copy).
+    bool prelude = false;
+    if (inRun && Recorder::BatchedStagingEnabled() && !capture && !Recorder::BarrierValidate()) {
+        if (const auto preludeCommands = recorder->PreludeCommands(); preludeCommands != VK_NULL_HANDLE) {
+            commands = preludeCommands;
+            prelude = true;
+        }
+    }
+    const auto timing = prelude ? Recorder::NoTiming : recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
     constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
-    if (!Recorder::ElideCovered(Recorder::CommandClass::StagingIn, leading, covered)) {
+    if (!inRun && !Recorder::ElideCovered(Recorder::CommandClass::StagingIn, leading, covered)) {
         RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
         Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     }
@@ -5112,11 +5481,12 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
-            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
             if (region->buffer == nullptr) {
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
                 region->deviceLocal = false;
                 region->unstaged = true;
+                const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestStaging);
                 region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false));
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
@@ -5130,6 +5500,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         auto copySource = region->copySource;
         auto copyOffset = region->begin - region->copySourceBase;
         if (!pendingWriter && !writable) {
+            const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestStaging);
             inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
             copySource = inputSnapshot->Handle();
@@ -5144,6 +5515,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
         }
+        Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -5180,25 +5552,69 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
     }
+    if (stagingDiffEnabled(context)) {
+        // The pristine copies of the staged shadows (APS5_STAGING_DIFF), after the copy-ins.
+        std::vector<Region*> diffed;
+        const bool active = stagingDiffActive();
+        for (auto* region : copies) {
+            region->diffUse = false;
+            if (!active) continue;
+            if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
+                region->pristine.reset();
+                continue;
+            }
+            const auto bytes = static_cast<std::size_t>(region->end - region->begin);
+            if (region->pristine == nullptr) region->pristine = stagingBuffer(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            if (region->pristine == nullptr || region->pristine->DeviceAddress() == 0) {
+                region->pristine.reset();
+                continue;
+            }
+            region->diffUse = true;
+            diffed.push_back(region);
+        }
+        if (!diffed.empty() && prelude) {
+            // Recorded at the prelude's end, behind one transfer barrier for the whole run.
+            for (auto* region : diffed) {
+                recorder->PreludePristine(region->buffer->Handle(), region->pristine->Handle(), region->end - region->begin);
+                recorder->Keep(region->pristine);
+            }
+        } else if (!diffed.empty()) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+            for (auto* region : diffed) {
+                CopyBuffer(context, commands, region->buffer->Handle(), 0, region->pristine->Handle(), 0, region->end - region->begin);
+                recorder->Keep(region->pristine);
+            }
+        }
+    }
     if (stagedAny) reportStaging();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
-    // tessellation shaders too (the batch's own barriers around dispatches are as wide).
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
-    recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    // tessellation shaders too (the batch's own barriers around dispatches are as wide). A
+    // prelude's copies get the prelude's barrier at its end (Recorder::sealPrelude).
+    if (!prelude) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool diff = stagingDiffEnabled(context);
+    bool diffed = false;
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
     bool recording = false;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
     std::uint64_t copiedBytes = 0;
+    // A run's copy-backs share one trailing barrier, recorded by the run after all of them; they
+    // need no leading one (the run's deferred barrier just ordered its dispatches' writes) unless
+    // an earlier one of them wrote an overlapping range (Recorder::AfterRunWrite).
+    const bool merging = recorder.AfterRunMerging();
     if (!writes.empty()) {
         auto sorted = writes;
         std::sort(sorted.begin(), sorted.end());
@@ -5215,10 +5631,20 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             const auto from = begin;
             const auto to = std::min(end, servedEnd(region));
             if (from >= to || std::any_of(heapReadbacks.begin(), heapReadbacks.end(), [&](const auto& entry) { return entry.first == from; })) continue;
+            if (merging) {
+                if (!recording) {
+                    commands = recorder.Commands();
+                    recording = true;
+                }
+                if (recorder.AfterRunWrite(from, to)) {
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
+            }
             if (!recording) {
                 commands = recorder.Commands();
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
-                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (diff ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | (diff ? VK_ACCESS_SHADER_READ_BIT : 0u));
                 Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
                 recording = true;
             }
@@ -5233,12 +5659,25 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
             if (from >= to) continue;
+            if (merging) {
+                if (!recording) {
+                    commands = recorder.Commands();
+                    recording = true;
+                }
+                if (recorder.AfterRunWrite(from, to)) {
+                    // Writes after writes to the same guest bytes stay in recording order.
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
+            }
             if (!recording) {
                 VkAccessFlags covered = 0;
                 commands = recorder.Commands(&covered);
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
-                // The shader's stores into the buffer (whichever stage made them) precede the copy.
-                constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                // The shader's stores into the buffer (whichever stage made them) precede the copy
+                // (and the APS5_STAGING_DIFF kernel's reads), unless the trailing barrier just
+                // recorded already orders them (ElideCovered).
+                const BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (diff ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | (diff ? VK_ACCESS_SHADER_READ_BIT : 0u)};
                 if (!Recorder::ElideCovered(Recorder::CommandClass::StagingOut, leading, covered)) {
                     RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
                     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
@@ -5246,8 +5685,35 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 recording = true;
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
-            // would have stored there itself had the range been bindable.
-            CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
+            // would have stored there itself had the range been bindable. A staged shadow with a
+            // pristine copy (APS5_STAGING_DIFF) stores only the dwords that differ from it; the
+            // unaligned edges copy whole.
+            Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyBack, from);
+            auto whole = from;
+            auto wholeEnd = to;
+            if (diff && region.diffUse && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
+                const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
+                const auto alignedTo = to & ~std::uint64_t{3};
+                if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max()) {
+                    const auto at = alignedFrom - region.begin;
+                    if (recorder.RecordStagingDiff(commands, region.buffer->DeviceAddress() + at, region.pristine->DeviceAddress() + at, region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile)) {
+                        diffed = true;
+                        recorder.Keep(region.pristine);
+                        if (from < alignedFrom) CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, alignedFrom - from);
+                        if (alignedTo < to) CopyBuffer(context, commands, region.buffer->Handle(), alignedTo - region.begin, region.copySource, alignedTo - region.copySourceBase, to - alignedTo);
+                        if (profile) {
+                            Copies().diffRanges.fetch_add(1, std::memory_order_relaxed);
+                            Copies().diffBytes.fetch_add(alignedTo - alignedFrom, std::memory_order_relaxed);
+                            Copies().diffWholeBytes.fetch_add((alignedFrom - from) + (to - alignedTo), std::memory_order_relaxed);
+                        }
+                        whole = wholeEnd;
+                    }
+                }
+            }
+            if (whole < wholeEnd) {
+                CopyBuffer(context, commands, region.buffer->Handle(), whole - region.begin, region.copySource, whole - region.copySourceBase, wholeEnd - whole);
+                if (diff && profile && region.deviceLocal) Copies().diffWholeBytes.fetch_add(wholeEnd - whole, std::memory_order_relaxed);
+            }
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {
@@ -5261,13 +5727,13 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
     }
-    if (!recording) return;
+    if (!recording || merging) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's
     // pending-write note makes CPU readers wait for that.
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | (diffed ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | (diffed ? VK_ACCESS_SHADER_WRITE_BIT : 0u), copiedAccess);
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
@@ -5344,7 +5810,7 @@ void AppendDisjoint(const std::vector<AddressRange>& ranges, std::vector<Address
     }
 }
 
-void AppendUncovered(const std::vector<AddressRange>& ranges, const std::vector<AddressRange>& covering, std::vector<AddressRange>& result) {
+void AppendUncovered(const std::vector<AddressRange>& ranges, std::span<const AddressRange> covering, std::vector<AddressRange>& result) {
     for (const auto& range : ranges) {
         auto cursor = range.begin;
         auto cover = std::partition_point(covering.begin(), covering.end(), [&](const AddressRange& candidate) { return candidate.end <= range.begin; });
@@ -5356,7 +5822,7 @@ void AppendUncovered(const std::vector<AddressRange>& ranges, const std::vector<
     }
 }
 
-std::vector<AddressRange> MergeByBegin(const std::vector<AddressRange>& left, const std::vector<AddressRange>& right) {
+std::vector<AddressRange> MergeByBegin(std::span<const AddressRange> left, const std::vector<AddressRange>& right) {
     std::vector<AddressRange> merged;
     merged.reserve(left.size() + right.size());
     std::merge(left.begin(), left.end(), right.begin(), right.end(), std::back_inserter(merged), [](const AddressRange& first, const AddressRange& second) { return first.begin < second.begin; });
@@ -5365,29 +5831,86 @@ std::vector<AddressRange> MergeByBegin(const std::vector<AddressRange>& left, co
 
 }
 
+// Range lists of merged BDA tables (~9,400 ranges, ~300 KiB each in Yotei's world), recycled: a fresh one
+// for every merge was an mmap of new pages and ~75 first-touch faults, and an munmap when the table left the
+// caches (best135: ~100 us a merge for a ~18 us copy). A list returns here when its last owner (the space's
+// table map, BdaResources' table cache, a build) lets go. Bounded; a list over the bound is freed.
+struct RangeListPool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>>> free;
+};
+RangeListPool& rangeListPool() {
+    static auto* pool = new RangeListPool();
+    return *pool;
+}
+std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>> takeRangeList() {
+    auto& pool = rangeListPool();
+    std::lock_guard lock(pool.mutex);
+    if (pool.free.empty()) return std::make_unique<std::vector<ShaderRecompiler::BdaAbi::Range>>();
+    auto list = std::move(pool.free.back());
+    pool.free.pop_back();
+    return list;
+}
+std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> pooledRangeList(std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>> list) {
+    return std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>(list.release(), [](const std::vector<ShaderRecompiler::BdaAbi::Range>* done) {
+        std::unique_ptr<std::vector<ShaderRecompiler::BdaAbi::Range>> owned(const_cast<std::vector<ShaderRecompiler::BdaAbi::Range>*>(done));
+        auto& pool = rangeListPool();
+        std::lock_guard lock(pool.mutex);
+        if (pool.free.size() < 128u) pool.free.push_back(std::move(owned));
+    });
+}
+
+// APS5_PROFILE_DRAW: CachedAddressTable by path ([address-table], 10 s): quick returns, key lookups that
+// found the ranges, and misses that merged them anew (AddressRanges), with the key's length.
+struct AddressTableTimes {
+    std::atomic<std::uint64_t> quick{0}, hits{0}, hitNs{0}, misses{0}, missNs{0}, mergeNs{0}, keyWords{0};
+    std::atomic<std::uint64_t> spaceRanges{0}, regionCount{0}, overlayCount{0}, writeCount{0}, resultRanges{0};
+    // incrementalAddressRanges: the result vector's allocation and copies of the unchanged ranges, and the rest.
+    std::atomic<std::uint64_t> assembleNs{0}, groupNs{0};
+    std::atomic<long long> lastReport{0};
+};
+AddressTableTimes& addressTableTimes() {
+    static AddressTableTimes times;
+    return times;
+}
+void reportAddressTableTimes() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& t = addressTableTimes();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = t.lastReport.load();
+    if (nowMs - last < 10000 || !t.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto quick = take(t.quick), hits = take(t.hits), hitNs = take(t.hitNs), misses = take(t.misses), missNs = take(t.missNs), mergeNs = take(t.mergeNs), words = take(t.keyWords);
+    const auto per = [&](std::atomic<std::uint64_t>& value) { const auto v = take(value); return misses != 0 ? static_cast<double>(v) / static_cast<double>(misses) : 0.0; };
+    const auto spaceAvg = per(t.spaceRanges), regionAvg = per(t.regionCount), overlayAvg = per(t.overlayCount), writeAvg = per(t.writeCount), resultAvg = per(t.resultRanges);
+    std::fprintf(stderr, "[address-table] (10 s): per merge: space %.0f ranges, regions %.0f, overlays %.0f, writes %.0f -> %.0f ranges; incremental: copies %.1f us, edit groups %.1f us\n", spaceAvg, regionAvg, overlayAvg, writeAvg, resultAvg, per(t.assembleNs) / 1000.0, per(t.groupNs) / 1000.0);
+    std::fprintf(stderr, "[address-table] (10 s): quick %llu; key hits %llu x %.1f us; misses %llu x %.1f us (merge %.1f us); key %.0f words avg\n", static_cast<unsigned long long>(quick), static_cast<unsigned long long>(hits), hits != 0 ? static_cast<double>(hitNs) / 1000.0 / static_cast<double>(hits) : 0.0, static_cast<unsigned long long>(misses), misses != 0 ? static_cast<double>(missNs) / 1000.0 / static_cast<double>(misses) : 0.0, misses != 0 ? static_cast<double>(mergeNs) / 1000.0 / static_cast<double>(misses) : 0.0, hits + misses != 0 ? static_cast<double>(words) / static_cast<double>(hits + misses) : 0.0);
+}
+
 std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() const {
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     std::vector<ShaderRecompiler::BdaAbi::Range> result;
+    std::vector<ShaderRecompiler::BdaAbi::Range> overlays;
+    for (const auto& region : regions) {
+        if (region.overlay) overlays.push_back(addressRange(region));
+    }
     if (space != nullptr) {
         std::vector<ShaderRecompiler::BdaAbi::Range> own;
-        std::vector<ShaderRecompiler::BdaAbi::Range> overlays;
         own.reserve(regions.size());
-        for (const auto& region : regions) (region.overlay ? overlays : own).push_back(addressRange(region));
+        for (const auto& region : regions) {
+            if (!region.overlay) own.push_back(addressRange(region));
+        }
         std::vector<ShaderRecompiler::BdaAbi::Range> uncovered;
         uncovered.reserve(own.size());
         AppendUncovered(own, space->ranges, uncovered);
         result = MergeByBegin(space->ranges, uncovered);
-        if (!overlays.empty()) {
-            std::sort(overlays.begin(), overlays.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
-            std::vector<ShaderRecompiler::BdaAbi::Range> cut;
-            cut.reserve(result.size() + overlays.size());
-            AppendUncovered(result, overlays, cut);
-            result = MergeByBegin(cut, overlays);
-        }
     } else if (regionsOverlap) {
         std::vector<ShaderRecompiler::BdaAbi::Range> live;
         std::vector<ShaderRecompiler::BdaAbi::Range> copies;
-        for (const auto& region : regions) (region.direct != nullptr || region.mirror != nullptr ? live : copies).push_back(addressRange(region));
+        for (const auto& region : regions) {
+            if (!region.overlay) (region.direct != nullptr || region.mirror != nullptr ? live : copies).push_back(addressRange(region));
+        }
         std::vector<ShaderRecompiler::BdaAbi::Range> liveParts;
         AppendDisjoint(live, liveParts);
         std::vector<ShaderRecompiler::BdaAbi::Range> copyParts;
@@ -5397,10 +5920,46 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
         result = MergeByBegin(liveParts, uncovered);
     } else {
         result.reserve(regions.size());
-        for (const auto& region : regions) result.push_back(addressRange(region));
+        for (const auto& region : regions) {
+            if (!region.overlay) result.push_back(addressRange(region));
+        }
     }
-    if (writes.empty()) return result;
-    auto sortedWrites = writes;
+    return applyOverlaysAndWrites(std::move(result), std::move(overlays), writes);
+}
+
+std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::applyOverlaysAndWrites(std::vector<ShaderRecompiler::BdaAbi::Range> result, std::vector<ShaderRecompiler::BdaAbi::Range> overlays, std::span<const std::pair<std::uint64_t, std::uint64_t>> writtenRanges) const {
+    if (!overlays.empty()) {
+        // BDA overlays (resolveOverlays) win over the import entries they lie in: those are cut
+        // around them, so a pointer into an overlay reaches its staged buffer, as its descriptor does.
+        std::sort(overlays.begin(), overlays.end(), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+        std::vector<ShaderRecompiler::BdaAbi::Range> cut;
+        cut.reserve(result.size() + overlays.size() * 2u);
+        std::size_t firstOverlay = 0;
+        for (const auto& range : result) {
+            while (firstOverlay < overlays.size() && overlays[firstOverlay].end <= range.begin) ++firstOverlay;
+            auto cursor = range.begin;
+            for (auto index = firstOverlay; index < overlays.size() && overlays[index].begin < range.end; ++index) {
+                if (cursor < overlays[index].begin) {
+                    auto part = range;
+                    part.begin = cursor;
+                    part.end = overlays[index].begin;
+                    part.deviceAddress += cursor - range.begin;
+                    cut.push_back(part);
+                }
+                cursor = std::max(cursor, overlays[index].end);
+            }
+            if (cursor < range.end) {
+                auto part = range;
+                part.begin = cursor;
+                part.deviceAddress += cursor - range.begin;
+                cut.push_back(part);
+            }
+        }
+        result.clear();
+        std::merge(cut.begin(), cut.end(), overlays.begin(), overlays.end(), std::back_inserter(result), [](const auto& left, const auto& right) { return left.begin < right.begin; });
+    }
+    if (writtenRanges.empty()) return result;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> sortedWrites(writtenRanges.begin(), writtenRanges.end());
     std::sort(sortedWrites.begin(), sortedWrites.end());
     std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
     for (const auto& interval : sortedWrites) {
@@ -5440,11 +5999,106 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     return merged;
 }
 
+// AddressRanges() over the cached space by its neighbourhoods. A build adds a few ranges to the space's
+// (best131: 9,398 space ranges, ~2 own regions, 2 overlays and 6 writes a build, merged ~3,400 times a
+// 10 s at ~375 us each, every merge rewriting the whole list). Every pass of AddressRanges leaves a
+// range no edit (own region, overlay, write) overlaps as it is, and a range it inserts lands between
+// the space ranges around its begin; so the edits are grouped into disjoint address spans, each span's
+// space ranges (the ones overlapping it) go through the same passes with that span's edits, and the
+// space ranges between the spans are copied. The result is the same list. APS5_VERIFY_BDA_INCREMENTAL=1
+// compares every result with AddressRanges(); APS5_NO_INCREMENTAL_BDA_RANGES=1 (runtime switch) merges
+// in full.
+void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::BdaAbi::Range>& result) const {
+    Require(uploaded && !committed && space != nullptr, "incremental BDA ranges need the cached space");
+    using Range = ShaderRecompiler::BdaAbi::Range;
+    const std::span<const Range> spaceRanges(space->ranges);
+    struct Edit {
+        std::uint64_t begin;
+        std::uint64_t end;
+        int kind;  // 0 own region, 1 overlay, 2 write
+        Range range;
+    };
+    std::vector<Edit> edits;
+    edits.reserve(regions.size() + writes.size());
+    for (const auto& region : regions) {
+        const auto range = addressRange(region);
+        edits.push_back({range.begin, range.end, region.overlay ? 1 : 0, range});
+    }
+    for (const auto& [begin, end] : writes) edits.push_back({begin, end, 2, {}});
+    std::stable_sort(edits.begin(), edits.end(), [](const Edit& left, const Edit& right) { return left.begin < right.begin; });
+    // Spans of edits that overlap or touch, then widened to the space ranges they overlap; spans whose
+    // space ranges meet are joined (one space range is never processed twice).
+    struct Group {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::size_t first;  // space ranges [first, last)
+        std::size_t last;
+        std::size_t editsBegin;
+        std::size_t editsEnd;
+    };
+    std::vector<Group> groups;
+    for (std::size_t index = 0; index < edits.size();) {
+        auto begin = edits[index].begin;
+        auto end = edits[index].end;
+        auto next = index + 1;
+        while (next < edits.size() && edits[next].begin <= end) end = std::max(end, edits[next++].end);
+        const auto first = static_cast<std::size_t>(std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const Range& range) { return range.end <= begin; }) - spaceRanges.begin());
+        const auto last = static_cast<std::size_t>(std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const Range& range) { return range.begin < end; }) - spaceRanges.begin());
+        if (!groups.empty() && first < groups.back().last) {
+            auto& previous = groups.back();
+            previous.end = std::max(previous.end, end);
+            previous.last = std::max(previous.last, last);
+            previous.editsEnd = next;
+        } else {
+            groups.push_back({begin, end, first, std::max(first, last), index, next});
+        }
+        index = next;
+    }
+    std::uint64_t groupNs = 0;
+    const auto assembleStart = std::chrono::steady_clock::now();
+    result.clear();
+    result.reserve(spaceRanges.size() + edits.size() * 3u);
+    std::size_t copied = 0;
+    for (const auto& group : groups) {
+        result.insert(result.end(), spaceRanges.begin() + static_cast<std::ptrdiff_t>(copied), spaceRanges.begin() + static_cast<std::ptrdiff_t>(group.first));
+        const auto groupStart = std::chrono::steady_clock::now();
+        std::vector<Range> own;
+        std::vector<Range> overlays;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+        for (auto index = group.editsBegin; index < group.editsEnd; ++index) {
+            const auto& edit = edits[index];
+            if (edit.kind == 0) own.push_back(edit.range);
+            else if (edit.kind == 1) overlays.push_back(edit.range);
+            else written.emplace_back(edit.begin, edit.end);
+        }
+        // Own ranges in region order, as AddressRanges takes them (AppendUncovered appends per range).
+        std::stable_sort(own.begin(), own.end(), [](const Range& left, const Range& right) { return left.begin < right.begin; });
+        const auto slice = spaceRanges.subspan(group.first, group.last - group.first);
+        std::vector<Range> uncovered;
+        AppendUncovered(own, slice, uncovered);
+        auto part = applyOverlaysAndWrites(MergeByBegin(slice, uncovered), std::move(overlays), written);
+        groupNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - groupStart).count());
+        result.insert(result.end(), part.begin(), part.end());
+        copied = group.last;
+    }
+    result.insert(result.end(), spaceRanges.begin() + static_cast<std::ptrdiff_t>(copied), spaceRanges.end());
+    {
+        const auto totalNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - assembleStart).count());
+        addressTableTimes().assembleNs.fetch_add(totalNs - std::min(totalNs, groupNs), std::memory_order_relaxed);
+        addressTableTimes().groupNs.fetch_add(groupNs, std::memory_order_relaxed);
+    }
+    static const bool verify = std::getenv("APS5_VERIFY_BDA_INCREMENTAL") != nullptr;
+    if (verify) {
+        const auto full = AddressRanges();
+        Require(full.size() == result.size() && (full.empty() || std::memcmp(full.data(), result.data(), full.size() * sizeof(Range)) == 0), "the incremental BDA ranges differ from AddressRanges()");
+    }
+}
+
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
-    if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges};
-    if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get()};
+    if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges, nullptr};
+    if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get(), tableRanges};
     const auto& spaceRanges = space->ranges;
     const bool inWritable = regions.empty() && std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
         auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
@@ -5453,11 +6107,16 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
         }
         return true;
     });
-    if (inWritable) return CachedTable{space->serial, &space->ranges};
+    if (inWritable) {
+        addressTableTimes().quick.fetch_add(1, std::memory_order_relaxed);
+        return CachedTable{space->serial, &space->ranges, nullptr};
+    }
+    const auto lookupStart = std::chrono::steady_clock::now();
     std::vector<ShaderRecompiler::BdaAbi::Range> own;
     own.reserve(regions.size());
     for (const auto& region : regions) own.push_back(addressRange(region));
     auto key = AddressTableKey(writes, own);
+    addressTableTimes().keyWords.fetch_add(key.size(), std::memory_order_relaxed);
     static const bool verify = std::getenv("APS5_VERIFY_BDA_TABLES") != nullptr;
     std::lock_guard lock(space->tableMutex);
     const auto found = space->tables.find(key);
@@ -5470,7 +6129,30 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
             Require(built.size() == tableRanges->size() && (built.empty() || std::memcmp(built.data(), tableRanges->data(), built.size() * sizeof(built.front())) == 0), "a cached BDA table differs from the ranges of the build that found it");
         }
     } else {
-        tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
+        const auto mergeStart = std::chrono::steady_clock::now();
+        const bool incremental = !RuntimeSwitches::Set(RuntimeSwitch::NoIncrementalBdaRanges);
+        if (incremental && !RuntimeSwitches::Set(RuntimeSwitch::NoLeanBdaTables)) {
+            auto list = takeRangeList();
+            incrementalAddressRanges(*list);
+            tableRanges = pooledRangeList(std::move(list));
+        } else if (incremental) {
+            std::vector<ShaderRecompiler::BdaAbi::Range> list;
+            incrementalAddressRanges(list);
+            tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(std::move(list));
+        } else {
+            tableRanges = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
+        }
+        {
+            auto& t = addressTableTimes();
+            std::size_t overlayRegions = 0;
+            for (const auto& region : regions) overlayRegions += region.overlay ? 1u : 0u;
+            t.spaceRanges.fetch_add(space->ranges.size(), std::memory_order_relaxed);
+            t.regionCount.fetch_add(regions.size(), std::memory_order_relaxed);
+            t.overlayCount.fetch_add(overlayRegions, std::memory_order_relaxed);
+            t.writeCount.fetch_add(writes.size(), std::memory_order_relaxed);
+            t.resultRanges.fetch_add(tableRanges->size(), std::memory_order_relaxed);
+        }
+        addressTableTimes().mergeNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mergeStart).count()), std::memory_order_relaxed);
         tableSerial = Spaces().serials.fetch_add(1, std::memory_order_relaxed) + 1;
         if (space->tables.size() >= 64u) {
             space->tables.erase(*space->tableRecency.front());
@@ -5479,7 +6161,14 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
         const auto inserted = space->tables.emplace(std::move(key), AddressSpace::Table{tableSerial, tableRanges, {}}).first;
         inserted->second.recent = space->tableRecency.insert(space->tableRecency.end(), &inserted->first);
     }
-    return CachedTable{tableSerial, tableRanges.get()};
+    {
+        auto& t = addressTableTimes();
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lookupStart).count());
+        (found != space->tables.end() ? t.hits : t.misses).fetch_add(1, std::memory_order_relaxed);
+        (found != space->tables.end() ? t.hitNs : t.missNs).fetch_add(ns, std::memory_order_relaxed);
+    }
+    reportAddressTableTimes();
+    return CachedTable{tableSerial, tableRanges.get(), tableRanges};
 }
 
 bool GuestBufferMemory::HasCopiedWrites() const {
@@ -5796,17 +6485,167 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
     return result;
 }
 
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::SpaceRegions() const {
+    if (!uploaded || committed || space == nullptr || !lease.empty()) return std::nullopt;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    for (const auto& region : regions) {
+        const bool snapshotCopy = region.buffer != nullptr && region.direct == nullptr && region.mirror == nullptr && !region.hostBacked && !region.writable && !region.sparse && !region.gpuCopy;
+        if (snapshotCopy) continue;
+        const bool fixedMirror = region.mirror != nullptr && !region.mirror->writable && !region.mirror->heap;
+        if (region.direct == nullptr && !fixedMirror) return std::nullopt;
+        result.emplace_back(region.begin, region.end);
+    }
+    return result;
+}
+
+void GuestBufferMemory::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const {
+    out.clear();
+    if (!uploaded || committed) return;
+    if (HoldsLease()) out.push_back({0, std::numeric_limits<std::uint64_t>::max(), 1u});
+    for (const auto& region : regions) {
+        if (region.gpuCopy) out.push_back({region.begin, region.end, 2u | (region.atomic ? 4u : 0u)});
+        else out.push_back({region.begin, region.direct != nullptr ? inPlaceEnd(region) : region.end, 0});
+    }
+    for (const auto& [begin, end] : mergeWrites(writes)) {
+        const auto* found = owner(begin, end);
+        std::uint64_t flags = 1;
+        if (found != nullptr && found->gpuCopy) flags |= 2;
+        if (found != nullptr && found->atomic) flags |= 4;
+        out.push_back({begin, end, flags});
+    }
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DirectWrites() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    for (const auto& [begin, end] : mergeWrites(writes)) {
+        const auto* found = owner(begin, end);
+        if (found != nullptr && found->direct != nullptr) result.emplace_back(begin, end);
+    }
+    return result;
+}
+
+bool GuestBufferMemory::SameSnapshots(std::span<const GuestMemorySnapshot> snapshots) const {
+    if (snapshots.size() != snapshotUses.size()) return false;
+    for (std::size_t index = 0; index < snapshots.size(); ++index) {
+        const auto& snapshot = snapshots[index];
+        const auto& use = snapshotUses[index];
+        if (snapshot.address != use.address || snapshot.bytes.size() != use.bytes) return false;
+        if (use.live) {
+            if (liveSnapshotCompared(snapshot.address, snapshot.bytes.size()) && std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+            continue;
+        }
+        const auto found = std::upper_bound(regions.begin(), regions.end(), snapshot.address, [](std::uint64_t value, const Region& region) { return value < region.begin; });
+        if (found == regions.begin()) return false;
+        const auto& region = *std::prev(found);
+        if (region.buffer == nullptr || region.direct != nullptr || region.mirror != nullptr || snapshot.address + snapshot.bytes.size() > region.end) return false;
+        const auto bytes = region.buffer->Bytes();
+        const auto offset = static_cast<std::size_t>(snapshot.address - region.begin);
+        if (offset + snapshot.bytes.size() > bytes.size() || std::memcmp(bytes.data() + offset, snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+    }
+    return true;
+}
+
+bool GuestBufferMemory::SnapshotsServed(std::span<const GuestMemorySnapshot> snapshots) const {
+    for (const auto& snapshot : snapshots) {
+        const auto end = snapshot.address + snapshot.bytes.size();
+        const Region* owner = nullptr;
+        if (baseOverlap(snapshot.address, end, &owner) == BaseOverlap::Partial) return false;
+        if (owner == nullptr) {
+            for (const auto& region : regions) {
+                if (region.begin <= snapshot.address && end <= region.end) {
+                    owner = &region;
+                    break;
+                }
+            }
+        }
+        if (owner == nullptr) return false;
+        if (owner->writable || owner->hostBacked || owner->mirror != nullptr) {
+            if (liveSnapshotCompared(snapshot.address, snapshot.bytes.size()) && std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+            continue;
+        }
+        if (owner->buffer == nullptr || owner->direct != nullptr) return false;
+        const auto bytes = owner->buffer->Bytes();
+        const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
+        if (offset + snapshot.bytes.size() > bytes.size() || std::memcmp(bytes.data() + offset, snapshot.bytes.data(), snapshot.bytes.size()) != 0) return false;
+    }
+    for (const auto& use : snapshotUses) {
+        if (use.live) continue;
+        if (std::none_of(snapshots.begin(), snapshots.end(), [&](const GuestMemorySnapshot& snapshot) { return snapshot.address == use.address && snapshot.bytes.size() == use.bytes; })) return false;
+    }
+    return true;
+}
+
+void GuestBufferMemory::SuspendSpace() noexcept {
+    if (space == nullptr) return;
+    suspendedSpace = space->serial;
+    space.reset();
+}
+
+bool GuestBufferMemory::ResumeSpace() {
+    SuspendSpace();
+    if (!uploaded || committed || !lease.empty() || suspendedSpace == 0) {
+        countResumeMiss(SpaceResumeMiss::State);
+        return false;
+    }
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto current = Spaces().current.load();
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (current == nullptr || current->serial != suspendedSpace) {
+            countResumeMiss(SpaceResumeMiss::Replaced);
+            return false;
+        }
+        if (const auto miss = spaceMiss(context, current.get(), generation, state); miss != SpaceMiss::None) {
+            countResumeMiss(miss == SpaceMiss::Device ? SpaceResumeMiss::Device : miss == SpaceMiss::Generation ? SpaceResumeMiss::Generation : miss == SpaceMiss::Epoch ? SpaceResumeMiss::Epoch : SpaceResumeMiss::Replaced);
+            return false;
+        }
+        stampSpaceImports(*current, state);
+    }
+    std::vector<RefreshBlock> blocks;
+    if (!refreshSparseMirrors(current, blocks)) {
+        countResumeMiss(SpaceResumeMiss::Mirrors);
+        return false;
+    }
+    appendWritableMirrors(*current, blocks);
+    const auto checked = refreshHeapRuns(*current, blocks);
+    compareBlocks(blocks);
+    for (const auto& [run, collected] : checked) current->verified[run].store(collected, std::memory_order_relaxed);
+    if (mirrorsEnabled()) {
+        sweepMirrors();
+        reportMirrors();
+    }
+    space = std::move(current);
+    completeSpaceWrites();
+    return true;
+}
+
+bool GuestBufferMemory::SpaceImportsCurrent() {
+    if (space == nullptr) return false;
+    if (context.hostImportAlignment == 0) return true;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (importsStale(context, state)) refreshImports(context, state, space->lease);
+    return state.epoch == space->importsEpoch;
+}
+
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     ResidentBuffer::FlushChanged(context);
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
+    // A previous use in a dispatch run that is still open owes its copy-backs (Recorder::AfterRun):
+    // the run is closed first, which records them from the shadows before they are refilled.
+    if (std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal && !region.copiedBack; })) {
+        if (profile) recorder.NoteOwedCopyBack(this);
+        recorder.CloseRunOwing(this);
+    }
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
-        // The previous use's copy-back was recorded by its MarkGpuWrites (or never, when that use
-        // threw first: counted); this use records its own after its work, from the shadow this
-        // copy-in refills. The import is the one the region was taken from (the caller checked its
-        // serial), so the copy source still stands.
+        // The previous use's copy-back was recorded by its MarkGpuWrites or by the run it was in
+        // (or never, when that use threw first: counted); this use records its own after its work,
+        // from the shadow this copy-in refills. The import is the one the region was taken from
+        // (the caller checked its serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
         region.copiedBack = false;
         copies.push_back(&region);

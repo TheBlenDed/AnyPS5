@@ -112,6 +112,13 @@ struct ImageTableColumnSnapshot {
     SharedValues<std::uint32_t> codes;
     SharedValues<DescriptorValue> words;
     SharedValues<std::pair<std::uint64_t, std::uint64_t>> readRanges;
+    bool pointer = false;
+    bool indirect = false;
+    std::uint32_t addend = 0;
+    std::uint32_t stride = 0;
+    std::uint32_t offset = 0;
+    std::uint32_t dwords = 0;
+    SharedValues<std::uint64_t> addresses;
 
     bool operator==(const ImageTableColumnSnapshot& other) const = default;
 };

@@ -6,6 +6,7 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <optional>
 #include <stdexcept>
@@ -54,19 +55,10 @@ TextureDimension resolveDimension(std::uint32_t raw) {
 }
 
 bool ZeroTail(std::span<const std::uint32_t> words) {
-    return words[4] == 0u && words[5] == 0u && words[6] == 0u && words[7] == 0u;
+    return words.size() == 8 && words[4] == 0u && words[5] == 0u && words[6] == 0u && words[7] == 0u;
 }
 
-bool SameLevels(const TileMipLayout& a, const TileMipLayout& b) {
-    return a.tiledOffset == b.tiledOffset && a.tiledSize == b.tiledSize && a.width == b.width && a.height == b.height && a.blocksPerRow == b.blocksPerRow && a.pitchBytes == b.pitchBytes && a.tail == b.tail && a.tailX == b.tailX && a.tailY == b.tailY;
-}
-
-std::optional<std::array<std::uint32_t, 8>> R128ResidentLevelWords(std::span<const std::uint32_t> words) {
-    const auto baseLevel = (words[3] >> 12u) & 0xfu;
-    const auto lastLevel = (words[3] >> 16u) & 0xfu;
-    const auto typeRaw = (words[3] >> 28u) & 0xfu;
-    if (baseLevel == 0u || baseLevel > lastLevel || (typeRaw != 8u && typeRaw != 9u)) return std::nullopt;
-    const std::array<std::uint32_t, 8> chainWords{words[0], words[1], words[2], words[3], 0u, lastLevel << 4u, 0u, 0u};
+std::array<std::uint32_t, 8> RebasedWords(const std::array<std::uint32_t, 8>& words, std::uint32_t baseLevel, std::uint32_t lastLevel) {
     const auto width = (((words[1] >> 30u) & 0x3u) | ((words[2] & 0xfffu) << 2u)) + 1u;
     const auto height = ((words[2] >> 14u) & 0x3fffu) + 1u;
     const auto minLod = (words[1] >> 8u) & 0xfffu;
@@ -74,24 +66,40 @@ std::optional<std::array<std::uint32_t, 8>> R128ResidentLevelWords(std::span<con
     const auto heightMinus1 = std::max(height >> baseLevel, 1u) - 1u;
     const auto rebasedMinLod = minLod > baseLevel * 256u ? minLod - baseLevel * 256u : 0u;
     const auto levels = lastLevel - baseLevel;
-    auto rebased = chainWords;
-    rebased[1] = (words[1] & ~((0xfffu << 8u) | (0x3u << 30u))) | (rebasedMinLod << 8u) | ((widthMinus1 & 0x3u) << 30u);
-    rebased[2] = (words[2] & ~(0xfffu | (0x3fffu << 14u))) | ((widthMinus1 >> 2u) & 0xfffu) | ((heightMinus1 & 0x3fffu) << 14u);
-    rebased[3] = (words[3] & ~(0xffu << 12u)) | (levels << 16u);
-    rebased[5] = levels << 4u;
-    try {
-        const auto chain = DescribeSurface(DecodeTextureResource(chainWords));
-        const auto view = DescribeSurface(DecodeTextureResource(rebased));
-        if (chain.mips.size() != lastLevel + 1u || view.mips.size() != levels + 1u || chain.layers != view.layers) return std::nullopt;
-        for (std::uint32_t level = baseLevel; level <= lastLevel; ++level) {
-            if (!SameLevels(chain.mips[level], view.mips[level - baseLevel])) return std::nullopt;
-        }
-    } catch (const std::exception&) {
-        return std::nullopt;
-    }
-    return rebased;
+    auto result = words;
+    result[1] = (words[1] & ~((0xfffu << 8u) | (0x3u << 30u))) | (rebasedMinLod << 8u) | ((widthMinus1 & 0x3u) << 30u);
+    result[2] = (words[2] & ~(0xfffu | (0x3fffu << 14u))) | ((widthMinus1 >> 2u) & 0xfffu) | ((heightMinus1 & 0x3fffu) << 14u);
+    result[3] = (words[3] & ~(0xffu << 12u)) | (levels << 16u);
+    result[5] = levels << 4u;
+    return result;
 }
 
+bool SameLevels(const TileMipLayout& a, const TileMipLayout& b) {
+    return a.tiledOffset == b.tiledOffset && a.tiledSize == b.tiledSize && a.width == b.width && a.height == b.height && a.blocksPerRow == b.blocksPerRow && a.pitchBytes == b.pitchBytes && a.tail == b.tail && a.tailX == b.tailX && a.tailY == b.tailY;
+}
+
+}
+
+std::array<std::uint32_t, 8> R128TextureWords(std::span<const std::uint32_t> words) {
+    Require(words.size() == 8, "guest texture descriptor must contain 8 dwords");
+    std::array<std::uint32_t, 8> result{words[0], words[1], words[2], words[3], 0u, 0u, 0u, 0u};
+    const auto baseLevel = (words[3] >> 12u) & 0xfu;
+    const auto lastLevel = (words[3] >> 16u) & 0xfu;
+    const auto typeRaw = (words[3] >> 28u) & 0xfu;
+    result[5] = lastLevel << 4u;
+    if (IsNullTextureResource(result) || baseLevel == 0u || baseLevel > lastLevel || (typeRaw != 8u && typeRaw != 9u)) return result;
+    const auto rebased = RebasedWords(result, baseLevel, lastLevel);
+    try {
+        const auto chain = DescribeSurface(DecodeTextureResource(result));
+        const auto view = DescribeSurface(DecodeTextureResource(rebased));
+        if (chain.mips.size() != lastLevel + 1u || view.mips.size() != lastLevel - baseLevel + 1u || chain.layers != view.layers) return result;
+        for (std::uint32_t level = baseLevel; level <= lastLevel; ++level) {
+            if (!SameLevels(chain.mips[level], view.mips[level - baseLevel])) return result;
+        }
+    } catch (const std::exception&) {
+        return result;
+    }
+    return rebased;
 }
 
 bool IsNullTextureResource(std::span<const std::uint32_t> words) {
@@ -209,6 +217,7 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     }
     // Views may name levels past MAX_MIP (a 512x512 view through 1x1 over a 9-level surface); the
     // hardware never addresses them, so the view ends at the surface's last level.
+    const auto viewLastLevel = lastLevel;
     if (baseLevel <= maxMip) lastLevel = std::min(lastLevel, maxMip);
     std::uint32_t pipeBankXor = 0;
     if (XorSwizzleMode(tileMode) != 0) {
@@ -284,11 +293,20 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.samples = samples;
     if (baseLevel > maxMip) {
         const bool fits = LevelsFitAllocation(result, lastLevel + 1u);
-        if (!fits && ZeroTail(words)) {
-            if (const auto resident = R128ResidentLevelWords(words)) return DecodeTextureResource(*resident);
-        }
+        if (!fits && ZeroTail(words)) return DecodeTextureResource(R128TextureWords(words));
         Require(fits, "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
         result.mipCount = lastLevel + 1u;
+    } else if (viewLastLevel > maxMip && ZeroTail(words)) {
+        static std::atomic<std::uint32_t> reports{0};
+        if (reports.fetch_add(1u, std::memory_order_relaxed) < 16u) {
+            bool fits = false;
+            try {
+                fits = LevelsFitAllocation(result, viewLastLevel + 1u);
+            } catch (const std::exception&) {
+            }
+            std::fprintf(stderr, "[texture] a T# with zero words 4-7 (words %08x %08x %08x %08x) views levels %u..%u past MAX_MIP 0 and decodes as one level; a 128-bit (R128) access would address %u levels%s\n",
+                words[0], words[1], words[2], words[3], baseLevel, viewLastLevel, viewLastLevel + 1u, fits ? "" : " and move level 0");
+        }
     }
     return result;
 }

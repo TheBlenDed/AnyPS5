@@ -115,6 +115,9 @@ VKAPI_ATTR void VKAPI_CALL destroyImage(VkDevice, VkImage image, const VkAllocat
     destroyedImages.push_back(image);
 }
 VKAPI_ATTR void VKAPI_CALL freeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {}
+VKAPI_ATTR VkResult VKAPI_CALL mapMemory(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void**) { return VK_ERROR_MEMORY_MAP_FAILED; }
+VKAPI_ATTR void VKAPI_CALL unmapMemory(VkDevice, VkDeviceMemory) {}
+VKAPI_ATTR void VKAPI_CALL destroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) {}
 VKAPI_ATTR void VKAPI_CALL cmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
 VKAPI_ATTR void VKAPI_CALL cmdClearDepthStencilImage(VkCommandBuffer, VkImage image, VkImageLayout, const VkClearDepthStencilValue*, std::uint32_t, const VkImageSubresourceRange*) {
     clearedImages.push_back(image);
@@ -143,12 +146,6 @@ VKAPI_ATTR void VKAPI_CALL bufferMemoryRequirements(VkDevice, VkBuffer, VkMemory
 VKAPI_ATTR VkResult VKAPI_CALL bindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) {
     return VK_SUCCESS;
 }
-
-VKAPI_ATTR void VKAPI_CALL destroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) {}
-VKAPI_ATTR VkResult VKAPI_CALL mapMemory(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void**) {
-    return VK_ERROR_MEMORY_MAP_FAILED;
-}
-VKAPI_ATTR void VKAPI_CALL unmapMemory(VkDevice, VkDeviceMemory) {}
 
 VKAPI_ATTR void VKAPI_CALL formatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
     *properties = {};
@@ -197,6 +194,9 @@ PFN_vkVoidFunction VKAPI_CALL deviceProc(VkDevice, const char* name) {
         {"vkDestroyImageView", reinterpret_cast<PFN_vkVoidFunction>(destroyImageView)},
         {"vkDestroyImage", reinterpret_cast<PFN_vkVoidFunction>(destroyImage)},
         {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(freeMemory)},
+        {"vkMapMemory", reinterpret_cast<PFN_vkVoidFunction>(mapMemory)},
+        {"vkUnmapMemory", reinterpret_cast<PFN_vkVoidFunction>(unmapMemory)},
+        {"vkDestroyBuffer", reinterpret_cast<PFN_vkVoidFunction>(destroyBuffer)},
         {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(cmdPipelineBarrier)},
         {"vkCmdClearDepthStencilImage", reinterpret_cast<PFN_vkVoidFunction>(cmdClearDepthStencilImage)},
         {"vkCmdCopyImage", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyImage)},
@@ -204,10 +204,7 @@ PFN_vkVoidFunction VKAPI_CALL deviceProc(VkDevice, const char* name) {
         {"vkCmdCopyBufferToImage", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyBufferToImage)},
         {"vkCreateBuffer", reinterpret_cast<PFN_vkVoidFunction>(createBuffer)},
         {"vkGetBufferMemoryRequirements", reinterpret_cast<PFN_vkVoidFunction>(bufferMemoryRequirements)},
-        {"vkBindBufferMemory", reinterpret_cast<PFN_vkVoidFunction>(bindBufferMemory)},
-        {"vkDestroyBuffer", reinterpret_cast<PFN_vkVoidFunction>(destroyBuffer)},
-        {"vkMapMemory", reinterpret_cast<PFN_vkVoidFunction>(mapMemory)},
-        {"vkUnmapMemory", reinterpret_cast<PFN_vkVoidFunction>(unmapMemory)}
+        {"vkBindBufferMemory", reinterpret_cast<PFN_vkVoidFunction>(bindBufferMemory)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;

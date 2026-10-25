@@ -1,10 +1,12 @@
 #include "GraphicsTests.hpp"
+#include "EnvironmentGuards.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -303,6 +305,36 @@ void RunSamplerCacheDegammaTests(const Fields& base) {
     reject([&] { cache.Get(context, words, false); }, "forces sRGB decoding");
 }
 
+void RunGuardedWrapTests() {
+    constexpr auto name = "APS5_UNNORM_WRAP_GUARD";
+    const auto* value = std::getenv(name);
+    const std::string previous = value ? value : "";
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("APS5_UNNORM_WRAP_GUARD", value ? value : "");
+#else
+        if (value) setenv("APS5_UNNORM_WRAP_GUARD", value, 1); else unsetenv("APS5_UNNORM_WRAP_GUARD");
+#endif
+        ShaderRecompiler::RefreshEnvironmentGuards();
+    };
+    struct Restore { decltype(set)& action; const char* value; ~Restore() { action(value); } } restore{set, value ? previous.c_str() : nullptr};
+    const std::array<std::uint32_t, 4> words{0x8000u, 0xfff000u, 0x05000000u, 0u};
+    Context context{};
+    context.limits.maxSamplerAnisotropy = 1.0f;
+    context.deviceProc = captureProc;
+    SamplerCache cache;
+    set("1");
+    const auto first = cache.Get(context, words, false, true, false, false, true);
+    Require(cache.Get(context, words, false, true, false, false, true) == first, "guarded sampler cache missed identical proof");
+    const auto decoded = DecodeSamplerResource(words, true, false, false, true);
+    Require(decoded.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && decoded.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "guarded point repeat was not mapped to edge clamp");
+    for (const auto clamp : {1u, 3u, 4u, 5u, 7u}) {
+        auto unsupported = words;
+        unsupported[0] |= clamp;
+        reject([&] { DecodeSamplerResource(unsupported, true, false, false, true); }, "clamp mode " + std::to_string(clamp) + " on X");
+    }
+}
+
 }
 
 void RunGuestSamplerResourceTests() {
@@ -466,6 +498,7 @@ void RunGuestSamplerResourceTests() {
     Require(forced.forceDegamma && !plain.forceDegamma, "FORCE_DEGAMMA must be decoded into forceDegamma");
     Require(forced.magFilter == plain.magFilter && forced.minFilter == plain.minFilter && forced.mipmapMode == plain.mipmapMode && forced.maxLod == plain.maxLod, "FORCE_DEGAMMA must not change the host sampler state");
     RunSamplerCacheDegammaTests(base);
+    RunGuardedWrapTests();
 
     Fields truncated = base;
     truncated.truncCoord = true;

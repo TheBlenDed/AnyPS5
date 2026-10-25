@@ -192,7 +192,6 @@ static void CheckCaseInsensitiveComparison() {
 }
 
 static void CheckSscanfS() {
-#ifndef _WIN32
     int number = 0;
     char word[4] = "zz";
     char letter = 0;
@@ -209,7 +208,6 @@ static void CheckSscanfS() {
     Require(sscanf_s_nid_postfix("7 %", "%d %%%n", &number, &position) == 1 && position == 3);
     Require(sscanf_s_nid_postfix("   ", "%d", &number) == EOF);
     Require(sscanf_s_nid_postfix("x", "%d", &number) == 0);
-#endif
 }
 
 static bool CheckDirnameLengths() {

@@ -13,10 +13,13 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -101,7 +104,7 @@ std::uint32_t byteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-    explicit Tracker(IrProgram& program) : m_program(program), m_info(program.Resources().info), m_builder(program) {
+    Tracker(IrProgram& program, bool bindlessHandles) : m_program(program), m_info(program.Resources().info), m_builder(program), m_bindlessHandles(bindlessHandles) {
         m_info.buffers.clear();
         m_info.images.clear();
         m_info.samplers.clear();
@@ -137,6 +140,7 @@ public:
         if (m_bdaTraces > bdaTraceLimit) std::fprintf(stderr, "[bda] %u more address accesses in this program not shown\n", m_bdaTraces - bdaTraceLimit);
         CheckTableStores();
         AssignTables();
+        RequireRuntimeAddressesLowered();
         LinkImageAliases();
         for (const auto& patch : m_handlePatches) {
             patch.handle->SetFlags<std::uint32_t>(patch.resource);
@@ -156,6 +160,7 @@ public:
                 plan.handle->ReplaceArgument(argument, offset);
             }
             KeepSourceAlive(*plan.handle, m_sources[column.heapSource], referenced);
+            if (m_bindlessHandles) KeepBindlessWords(*plan.handle, plan.heap);
             if (column.selected) {
                 KeepSourceAlive(*plan.handle, m_sources[column.selection], referenced);
             }
@@ -163,6 +168,7 @@ public:
                 KeepSourceAlive(*plan.handle, m_sources[plan.keyDomain->source], referenced);
             }
         }
+        for (const auto& [handle, words] : m_directSamplerWords) KeepBindlessWords(*handle, words);
         for (const auto index : m_tablePlanningMemory) {
             m_program.Resources().memoryInfo[index].planningOnly = true;
         }
@@ -197,6 +203,8 @@ private:
         std::vector<std::uint32_t> hopMemory;
         std::vector<const IrValue*> hopReads;
         std::optional<KeyDomain> keyDomain;
+        std::vector<IrValue*> heap;
+        bool dynamic = false;
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -516,6 +524,113 @@ private:
         return MatchScale(scaled, key, stride) && std::has_single_bit(stride) && stride >= 4u && (mask & ~(stride - 1u)) != 0u && key->Type() == IrType::U32;
     }
 
+    static IrValue* ActiveLaneValue(IrValue* value, const IrValue* mask) {
+        value = value->Resolve();
+        while (mask != nullptr && Detail::IsRuntimeSelect(value->Opcode()) && value->ArgumentCount() == 3u && Detail::ActiveMaskImplies(mask, value->Argument(0))) {
+            value = value->Argument(1)->Resolve();
+        }
+        return value;
+    }
+
+    static std::uint32_t ScaledBase(IrValue* value, const IrValue* mask, IrValue*& base) {
+        value = ActiveLaneValue(value, mask);
+        std::uint32_t immediate = 0;
+        std::uint32_t scale = 1u;
+        while (value->ArgumentCount() == 2u && immediateU32(value->Argument(1), immediate) && ((value->Opcode() == IrOpcode::ShiftLeftLogical32 && immediate < 32u) || value->Opcode() == IrOpcode::IMul32)) {
+            const std::uint64_t next = static_cast<std::uint64_t>(scale) * (value->Opcode() == IrOpcode::IMul32 ? immediate : 1u << immediate);
+            if (next > std::numeric_limits<std::uint32_t>::max()) {
+                break;
+            }
+            scale = static_cast<std::uint32_t>(next);
+            value = ActiveLaneValue(value->Argument(0), mask);
+        }
+        base = value;
+        return scale;
+    }
+
+    struct MultipleSearch {
+        std::vector<const IrValue*> visiting;
+        std::unordered_map<const IrValue*, std::uint32_t> known;
+        const IrValue* mask = nullptr;
+        bool cycle = false;
+    };
+
+    std::uint32_t KnownMultiple(IrValue* value, MultipleSearch& search, std::uint32_t depth) const {
+        value = ActiveLaneValue(value, search.mask);
+        std::uint32_t immediate = 0;
+        if (immediateU32(value, immediate)) {
+            return immediate;
+        }
+        if (std::ranges::find(search.visiting, value) != search.visiting.end()) {
+            search.cycle = true;
+            return 0u;
+        }
+        if (const auto found = search.known.find(value); found != search.known.end()) {
+            return found->second;
+        }
+        if (depth == 0u || value->Type() != IrType::U32) {
+            return 1u;
+        }
+        const bool outerCycle = search.cycle;
+        search.cycle = false;
+        auto& visiting = search.visiting;
+        visiting.push_back(value);
+        const auto product = [](std::uint32_t multiple, std::uint32_t scale) {
+            const std::uint64_t result = static_cast<std::uint64_t>(multiple) * scale;
+            return result > std::numeric_limits<std::uint32_t>::max() ? std::uint32_t{1u} << std::countr_zero(scale) : static_cast<std::uint32_t>(result);
+        };
+        std::uint32_t multiple = 1u;
+        const auto op = value->Opcode();
+        if (value->IsPhi()) {
+            multiple = 0u;
+            for (std::size_t index = 0; index < value->ArgumentCount(); index++) {
+                multiple = std::gcd(multiple, KnownMultiple(value->Argument(index), search, depth - 1u));
+            }
+        } else if ((op == IrOpcode::ShiftLeftLogical32 || op == IrOpcode::IMul32) && value->ArgumentCount() == 2u && immediateU32(value->Argument(1), immediate)) {
+            IrValue* base = nullptr;
+            const auto scale = ScaledBase(value, search.mask, base);
+            multiple = product(KnownMultiple(base, search, depth - 1u), scale);
+        } else if (op == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
+            IrValue* left = nullptr;
+            IrValue* right = nullptr;
+            const auto leftScale = ScaledBase(value->Argument(0), search.mask, left);
+            const auto rightScale = ScaledBase(value->Argument(1), search.mask, right);
+            const std::uint64_t sum = static_cast<std::uint64_t>(leftScale) + rightScale;
+            if (EquivalentValue(m_program.Resources(), left, right) && sum <= std::numeric_limits<std::uint32_t>::max()) {
+                multiple = product(KnownMultiple(left, search, depth - 1u), static_cast<std::uint32_t>(sum));
+            } else {
+                multiple = std::gcd(KnownMultiple(value->Argument(0), search, depth - 1u), KnownMultiple(value->Argument(1), search, depth - 1u));
+            }
+        } else if (Detail::IsRuntimeSelect(op) && value->ArgumentCount() == 3u) {
+            multiple = std::gcd(KnownMultiple(value->Argument(1), search, depth - 1u), KnownMultiple(value->Argument(2), search, depth - 1u));
+        } else if (op == IrOpcode::ReadFirstLane && value->ArgumentCount() == 2u && search.mask == nullptr) {
+            search.mask = value->Argument(1)->Resolve();
+            multiple = KnownMultiple(value->Argument(0), search, depth - 1u);
+            search.mask = nullptr;
+        }
+        visiting.pop_back();
+        if (!search.cycle) {
+            search.known.emplace(value, multiple);
+        }
+        search.cycle = search.cycle || outerCycle;
+        return multiple;
+    }
+
+    bool MatchFirstLaneOffset(IrValue* value, IrValue*& key, std::uint32_t& stride) const {
+        value = value->Resolve();
+        if (value->Opcode() != IrOpcode::ReadFirstLane || value->ArgumentCount() != 2u || value->Type() != IrType::U32) {
+            return false;
+        }
+        MultipleSearch search;
+        const auto multiple = KnownMultiple(value, search, firstLaneMultipleDepth);
+        if (multiple < 4u || multiple % 4u != 0u) {
+            return false;
+        }
+        key = value;
+        stride = multiple;
+        return true;
+    }
+
     static bool ReadsThroughDescriptor(const IrValue* value) {
         std::vector<const IrValue*> pending{value};
         std::vector<const IrValue*> seen;
@@ -609,7 +724,7 @@ private:
         return left.shift == right.shift && EquivalentValue(m_program.Resources(), left.mask, right.mask) && EquivalentValue(m_program.Resources(), left.lane, right.lane);
     }
 
-    bool TryMakeTableColumn(IrValue& handle, bool sampler, bool r128, TableColumnPlan& plan) {
+    bool TryMakeTableColumn(IrValue& handle, bool sampler, bool r128, bool dynamic, TableColumnPlan& plan) {
         const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
         const std::uint32_t width = sampler ? 4u : 8u;
         if (handle.Opcode() != expected || handle.ArgumentCount() != width) {
@@ -696,20 +811,29 @@ private:
         std::uint32_t addend = 0;
         bool masked = false;
         std::uint32_t descriptorOffset = 0;
+        const auto runtimeAddress = [&] {
+            if (!dynamic) return false;
+            DescriptorSource direct;
+            MakeSource(handle, width, sampler, false, direct);
+            std::uint32_t badDword = 0;
+            return !ValidateSource(direct, badDword) && MakeDynamicColumn(handle, *heapHandle, sampler, words, first, address, offset, folded ? baseAddend : 0u, folded ? carry : 0u, plan);
+        };
         if (address && immediateU32(offset, descriptorOffset)) {
-            return TryMakeIndirectColumn(handle, *heapHandle, sampler, words, descriptorOffset, first, plan);
+            return TryMakeIndirectColumn(handle, *heapHandle, sampler, words, descriptorOffset, first, plan) || runtimeAddress();
         }
         if (!MatchAffineOffset(offset, key, stride, addend)) {
-            if (!MatchMaskedOffset(offset, key, stride)) {
-                return false;
+            if (!MatchMaskedOffset(offset, key, stride) && (address || !MatchFirstLaneOffset(offset, key, stride))) {
+                return runtimeAddress();
             }
             masked = true;
         }
         DescriptorSource heapSource;
         std::uint32_t heapIndex = 0;
         if (!MakeRuntimeSource(*heapHandle, address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource, address ? 2u : 4u, heapIndex, heapSource)) {
-            return false;
+            return runtimeAddress();
         }
+        plan.heap.clear();
+        for (std::uint32_t dword = 0; dword < heapHandle->ArgumentCount(); dword++) plan.heap.push_back(heapHandle->Argument(dword)->Resolve());
         TableColumn column;
         column.heapSource = heapIndex;
         column.stride = stride;
@@ -721,7 +845,7 @@ private:
         column.address = address;
         column.foldedAddend = folded ? baseAddend : 0u;
         column.foldedCarry = folded ? carry : 0u;
-        if (!address && !sampler && std::ranges::find(m_unselectedHandles, &handle) == m_unselectedHandles.end()) {
+        if (!dynamic && !address && !sampler && std::ranges::find(m_unselectedHandles, &handle) == m_unselectedHandles.end()) {
             DescriptorSource direct;
             MakeSource(handle, width, false, false, direct);
             DescriptorSource selection;
@@ -881,6 +1005,8 @@ private:
         if (!MakeRuntimeSource(*bufferHandle, IrOpcode::GetBufferResource, 4u, heapIndex, heapSource)) {
             return false;
         }
+        plan.heap.clear();
+        for (std::uint32_t dword = 0; dword < bufferHandle->ArgumentCount(); dword++) plan.heap.push_back(bufferHandle->Argument(dword)->Resolve());
         TableColumn column;
         column.heapSource = heapIndex;
         column.stride = stride;
@@ -911,6 +1037,40 @@ private:
         return true;
     }
 
+    bool MakeDynamicColumn(IrValue& handle, IrValue& heapHandle, bool sampler, std::uint32_t words, std::uint32_t first, bool address, IrValue* offset, std::uint32_t foldedAddend, std::uint32_t foldedCarry, TableColumnPlan& plan) {
+        const auto heapOpcode = address ? IrOpcode::GetAddressResource : IrOpcode::GetBufferResource;
+        const std::uint32_t heapWords = address ? 2u : 4u;
+        if (heapHandle.Opcode() != heapOpcode || heapHandle.ArgumentCount() != heapWords || offset == nullptr || offset->Type() != IrType::U32) {
+            return false;
+        }
+        plan.heap.clear();
+        for (std::uint32_t dword = 0; dword < heapWords; dword++) {
+            IrValue* word = heapHandle.Argument(dword)->Resolve();
+            if (word->Type() != IrType::U32) {
+                return false;
+            }
+            plan.heap.push_back(word);
+        }
+        TableColumn column;
+        column.heapSource = InternSource(DescriptorSource{});
+        column.offset = first;
+        column.dwordCount = words;
+        column.sampler = sampler;
+        column.address = address;
+        column.unkeyed = true;
+        column.foldedAddend = foldedAddend;
+        column.foldedCarry = foldedCarry;
+        column.dynamic = true;
+        DescriptorSource columnSource;
+        columnSource.tableColumn = column;
+        plan.handle = &handle;
+        plan.source = InternSource(columnSource);
+        plan.keyDomain.reset();
+        plan.offset = offset;
+        plan.dynamic = true;
+        return true;
+    }
+
     const TableColumnPlan* FindTableColumn(const IrValue& handle) const {
         const auto found = std::ranges::find_if(m_tableColumns, [&](const TableColumnPlan& plan) {
             return plan.handle == &handle;
@@ -918,12 +1078,12 @@ private:
         return found == m_tableColumns.end() ? nullptr : &*found;
     }
 
-    bool PlanTableColumn(IrValue& handle, bool sampler, bool r128) {
+    bool PlanTableColumn(IrValue& handle, bool sampler, bool r128, bool dynamic) {
         if (FindTableColumn(handle) != nullptr) {
             return true;
         }
         TableColumnPlan plan;
-        if (!TryMakeTableColumn(handle, sampler, r128, plan)) {
+        if (!TryMakeTableColumn(handle, sampler, r128, dynamic, plan)) {
             return false;
         }
         m_tableColumns.push_back(std::move(plan));
@@ -931,6 +1091,7 @@ private:
     }
 
     static constexpr std::uint32_t phiSearchDepth = 8u;
+    static constexpr std::uint32_t firstLaneMultipleDepth = 32u;
 
     static bool SplittableImageRead(const IrValue& inst) {
         switch (inst.Opcode()) {
@@ -1083,6 +1244,9 @@ private:
                 }
             }
         }
+        if (SplitDescriptorWaterfall(inst, handles, handleCount)) {
+            return;
+        }
         if (phis.empty()) {
             return;
         }
@@ -1153,12 +1317,17 @@ private:
     }
 
     template <typename Dword>
-    void ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword) {
+    void ReplaceWithArmCopies(IrValue& inst, const std::array<IrValue*, 2>& handles, const std::array<bool, 2>& split, std::uint32_t handleCount, std::span<IrValue* const> conditions, Dword&& dword, IrValue* selector = nullptr) {
         std::vector<IrValue*> copies;
         const auto flags = inst.Flags<MemoryFlags>();
         const auto memory = m_program.Resources().memoryInfo.at(flags.index);
         for (std::uint32_t arm = 0; arm <= conditions.size(); arm++) {
             std::vector<IrValue*> arguments(inst.Arguments().begin(), inst.Arguments().end());
+            if (selector != nullptr) {
+                const std::array<IrValue*, 2> compare {selector, &m_builder.Constant(arm)};
+                const std::array<IrValue*, 2> active {arguments.back(), EmitBefore(inst, IrOpcode::IEqual32, IrType::Bool, compare)};
+                arguments.back() = EmitBefore(inst, IrOpcode::LogicalAnd, IrType::Bool, active);
+            }
             for (std::uint32_t slot = 0; slot < handleCount; slot++) {
                 if (!split[slot]) {
                     continue;
@@ -1225,6 +1394,12 @@ private:
         std::vector<std::pair<IrBlock*, IrValue*>> phis;
         std::vector<std::tuple<IrBlock*, IrValue*, IrValue*>> lanes;
         std::unordered_map<IrValue*, IrValue*> resolved;
+        bool lifted = false;
+        struct Pending {
+            IrValue* before;
+            IrValue* value;
+        };
+        std::vector<Pending> pending;
         std::unordered_map<const IrBlock*, std::size_t> order;
     };
 
@@ -1244,12 +1419,49 @@ private:
         if (const auto known = web.selectors.find(tuple); known != web.selectors.end()) {
             return known->second;
         }
+        if (web.lifted && web.selectors.size() == DescriptorWeb::maxStates) {
+            return nullptr;
+        }
         const auto phi = std::ranges::find_if(tuple, [](const IrValue* value) { return value->IsPhi(); });
         const auto lane = std::ranges::find_if(tuple, [](const IrValue* value) { return value->Opcode() == IrOpcode::SelectU32 || value->Opcode() == IrOpcode::ReadFirstLane; });
-        if (phi == tuple.end() && lane != tuple.end()) {
+        if (phi == tuple.end() && lane != tuple.end() && !web.lifted) {
             return LaneSelector(tuple, **lane, web, position);
         }
         if (phi == tuple.end()) {
+            const auto select = std::ranges::find_if(tuple, [](const IrValue* value) { return value->Opcode() == IrOpcode::SelectU32; });
+            if (web.lifted && select != tuple.end()) {
+                IrBlock* block = (*select)->Parent();
+                if (block == nullptr || (*select)->ArgumentCount() != 3u) return nullptr;
+                IrValue* condition = (*select)->Argument(0)->Resolve();
+                std::vector<IrValue*> selected;
+                for (IrValue* value : tuple) {
+                    if (value->Opcode() == IrOpcode::SelectU32) {
+                        if (value->Parent() != block || value->ArgumentCount() != 3u || value->Argument(0)->Resolve() != condition) return nullptr;
+                        selected.push_back(value);
+                    } else if (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr) {
+                        return nullptr;
+                    }
+                }
+                IrValue* anchor = nullptr;
+                for (IrValue* value : block->Instructions()) {
+                    if (std::ranges::find(selected, value) != selected.end()) anchor = value;
+                }
+                if (anchor == nullptr) return nullptr;
+                IrValue& selector = m_program.CreateValue(IrOpcode::SelectU32, IrType::U32);
+                web.selectors.emplace(tuple, &selector);
+                web.pending.push_back({anchor, &selector});
+                selector.AddArgument(condition);
+                for (std::size_t arm = 1u; arm < 3u; arm++) {
+                    auto incoming = tuple;
+                    for (IrValue*& value : incoming) {
+                        if (value->Opcode() == IrOpcode::SelectU32) value = value->Argument(arm);
+                    }
+                    IrValue* branch = WebSelector(std::move(incoming), web, position);
+                    if (branch == nullptr) return nullptr;
+                    selector.AddArgument(branch);
+                }
+                return &selector;
+            }
             for (IrValue* value : tuple) {
                 if (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr) {
                     return nullptr;
@@ -1259,13 +1471,17 @@ private:
                 return std::ranges::equal(tuple, arm, [&](IrValue* left, IrValue* right) { return EquivalentValue(m_program.Resources(), left, right); });
             });
             if (same != web.arms.end()) {
-                return &m_builder.Constant(static_cast<std::uint32_t>(same - web.arms.begin()));
+                IrValue* arm = &m_builder.Constant(static_cast<std::uint32_t>(same - web.arms.begin()));
+                if (web.lifted) web.selectors.emplace(tuple, arm);
+                return arm;
             }
             if (web.arms.size() == DescriptorWeb::maxArms) {
                 return nullptr;
             }
+            IrValue* arm = &m_builder.Constant(static_cast<std::uint32_t>(web.arms.size()));
+            if (web.lifted) web.selectors.emplace(tuple, arm);
             web.arms.push_back(std::move(tuple));
-            return &m_builder.Constant(static_cast<std::uint32_t>(web.arms.size() - 1u));
+            return arm;
         }
         if (web.order.empty()) {
             const auto& order = m_program.BlockOrder();
@@ -1295,8 +1511,11 @@ private:
         if (predecessors.size() < 2u) {
             return nullptr;
         }
-        for (const IrValue* value : tuple) {
+        for (IrValue* value : tuple) {
             if (value->IsPhi() && value->Parent() == block && value->PhiBlockCount() != predecessors.size()) {
+                return nullptr;
+            }
+            if (web.lifted && !value->IsPhi() && (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, position, false, phiSearchDepth) == nullptr)) {
                 return nullptr;
             }
         }
@@ -1319,6 +1538,153 @@ private:
             selector.AddPhiOperand(predecessor, edgeSelector);
         }
         return &selector;
+    }
+
+    bool WaterfallPlacementValid(const DescriptorWeb& web, IrValue& first, IrValue& consumer, std::span<IrValue* const> inputs) const {
+        const auto& order = m_program.BlockOrder();
+        if (order.empty()) return false;
+        struct Site { IrBlock* block; std::size_t index; };
+        std::unordered_map<const IrValue*, Site> sites;
+        for (const auto& block : m_program.Blocks()) {
+            std::size_t index = 1u;
+            for (IrValue* value : block->Instructions()) sites.emplace(value, Site{block.get(), index++});
+        }
+        for (const auto& [block, phi] : web.phis) sites.emplace(phi, Site{block, 0u});
+        for (const auto& [block, before, node] : web.lanes) sites.emplace(node, before != nullptr ? sites.at(before) : Site{block, std::numeric_limits<std::size_t>::max()});
+        for (const auto& pending : web.pending) sites.emplace(pending.value, sites.at(pending.before));
+        std::map<std::pair<IrBlock*, IrBlock*>, bool> dominators;
+        const auto dominates = [&](IrValue* definition, Site use) {
+            definition = definition->Resolve();
+            if (definition->HasImmediate()) return true;
+            const auto found = sites.find(definition);
+            if (found == sites.end()) return false;
+            const auto site = found->second;
+            if (site.block == use.block) return site.index < use.index;
+            const auto key = std::pair{site.block, use.block};
+            if (const auto known = dominators.find(key); known != dominators.end()) return known->second;
+            std::vector<IrBlock*> pending{use.block};
+            std::unordered_set<IrBlock*> visited;
+            bool reachesDefinition = false;
+            while (!pending.empty()) {
+                IrBlock* block = pending.back();
+                pending.pop_back();
+                if (block == site.block) {
+                    reachesDefinition = true;
+                    continue;
+                }
+                if (!visited.insert(block).second) continue;
+                if (visited.size() > DescriptorWeb::maxStates || block == order.front() || block->Predecessors().empty()) {
+                    dominators.emplace(key, false);
+                    return false;
+                }
+                pending.insert(pending.end(), block->Predecessors().begin(), block->Predecessors().end());
+            }
+            dominators.emplace(key, reachesDefinition);
+            return reachesDefinition;
+        };
+        for (IrValue* input : inputs) {
+            if (!dominates(input, sites.at(&first))) return false;
+        }
+        for (const auto& [block, phi] : web.phis) {
+            for (std::size_t index = 0; index < phi->ArgumentCount(); index++) {
+                if (!dominates(phi->Argument(index), {phi->PhiBlock(index), std::numeric_limits<std::size_t>::max()})) return false;
+            }
+        }
+        for (const auto& [block, before, node] : web.lanes) {
+            for (IrValue* argument : node->Arguments()) {
+                if (!dominates(argument, sites.at(node))) return false;
+            }
+        }
+        for (const auto& pending : web.pending) {
+            for (IrValue* argument : pending.value->Arguments()) {
+                if (!dominates(argument, sites.at(pending.value))) return false;
+            }
+        }
+        return dominates(web.pending.back().value, sites.at(&consumer));
+    }
+
+    bool SplitDescriptorWaterfall(IrValue& inst, const std::array<IrValue*, 2>& handles, std::uint32_t handleCount) {
+        if (m_program.Resources().stage != IrShaderStage::Compute || (inst.Opcode() != IrOpcode::ImageSampleRaw && inst.Opcode() != IrOpcode::ImageRead)) return false;
+        const auto index = inst.Flags<MemoryFlags>().index;
+        if (index >= m_program.Resources().memoryInfo.size()) return false;
+        const auto& memory = m_program.Resources().memoryInfo[index];
+        const auto allowedFlags = inst.Opcode() == IrOpcode::ImageSampleRaw ? RdnaImageSampleFlagLevelZero : 0u;
+        if (memory.dataBits != 32u || memory.d16 || memory.imageR128 || memory.imagePacked || memory.imageSampleFlags != allowedFlags) return false;
+        std::vector<IrValue*> tuple;
+        std::vector<IrValue*> reads;
+        std::array<std::size_t, 2> offsets{};
+        IrValue* mask = nullptr;
+        IrBlock* block = nullptr;
+        for (std::uint32_t slot = 0; slot < handleCount; slot++) {
+            offsets[slot] = tuple.size();
+            for (IrValue* argument : handles[slot]->Arguments()) {
+                IrValue* value = argument->Resolve();
+                if (value->Opcode() == IrOpcode::ReadFirstLane) {
+                    if (value->Parent() == nullptr || value->ArgumentCount() != 2u || value->Argument(1)->Type() != IrType::Bool) return false;
+                    if (mask != nullptr && (mask != value->Argument(1)->Resolve() || block != value->Parent())) return false;
+                    mask = value->Argument(1)->Resolve();
+                    block = value->Parent();
+                    reads.push_back(value);
+                    value = value->Argument(0)->Resolve();
+                } else if (HoldsProgramCounter(value, phiSearchDepth) || Rematerialize(value, inst, false, phiSearchDepth) == nullptr) {
+                    return false;
+                }
+                tuple.push_back(value);
+            }
+        }
+        if (reads.empty()) return false;
+        IrValue* first = nullptr;
+        for (IrValue* value : block->Instructions()) {
+            if (std::ranges::find(reads, value) != reads.end()) {
+                first = value;
+                break;
+            }
+        }
+        if (first == nullptr) return false;
+        DescriptorWeb web;
+        web.lifted = true;
+        const auto discard = [&] {
+            for (const auto& [owner, phi] : web.phis) {
+                for (std::size_t arg = 0; arg < phi->ArgumentCount(); arg++) phi->ReplaceArgument(arg, nullptr);
+            }
+            for (const auto& pending : web.pending) {
+                for (std::size_t arg = 0; arg < pending.value->ArgumentCount(); arg++) pending.value->ReplaceArgument(arg, nullptr);
+            }
+            for (const auto& [owner, before, node] : web.lanes) {
+                for (std::size_t arg = 0; arg < node->ArgumentCount(); arg++) node->ReplaceArgument(arg, nullptr);
+            }
+            for (const auto& [owner, phi] : web.phis) phi->Invalidate();
+            for (const auto& pending : web.pending) pending.value->Invalidate();
+            for (const auto& [owner, before, node] : web.lanes) node->Invalidate();
+        };
+        IrValue* selector = WebSelector(tuple, web, inst);
+        if (selector == nullptr || web.arms.empty() || web.selectors.size() == DescriptorWeb::maxStates) {
+            discard();
+            return false;
+        }
+        IrValue& scalar = m_program.CreateValue(IrOpcode::ReadFirstLane, IrType::U32);
+        scalar.AddArgument(selector);
+        scalar.AddArgument(mask);
+        web.pending.push_back({first, &scalar});
+        if (!WaterfallPlacementValid(web, *first, inst, tuple)) {
+            discard();
+            return false;
+        }
+        for (const auto& [owner, phi] : web.phis) owner->InsertInstructionBefore(nullptr, phi);
+        for (const auto& [owner, before, node] : web.lanes) {
+            if (before == nullptr) owner->AppendInstruction(node);
+            else owner->InsertInstructionBefore(before, node);
+        }
+        for (const auto& pending : web.pending) pending.before->Parent()->InsertInstructionBefore(pending.before, pending.value);
+        std::vector<IrValue*> conditions;
+        for (std::uint32_t arm = 0; arm + 1u < web.arms.size(); arm++) {
+            const std::array<IrValue*, 2> compare{&scalar, &m_builder.Constant(arm)};
+            conditions.push_back(EmitBefore(inst, IrOpcode::IEqual32, IrType::Bool, compare));
+        }
+        ReplaceWithArmCopies(inst, handles, {true, true}, handleCount, conditions, [&](std::uint32_t arm, std::uint32_t slot, std::size_t dword) {
+            return Rematerialize(web.arms[arm][offsets[slot] + dword], inst, true, phiSearchDepth);
+        }, &scalar);
+        return true;
     }
 
     IrValue* LaneSelector(const std::vector<IrValue*>& tuple, IrValue& first, DescriptorWeb& web, IrValue& position) {
@@ -1578,12 +1944,13 @@ private:
                     continue;
                 }
                 const auto memory = m_program.Resources().memoryInfo[flags.index];
+                const bool dynamic = m_bindlessHandles && imageInfo.resourceClass == ImageResourceClass::Sampled;
                 IrValue& image = *inst->Argument(0)->Resolve();
                 if (std::ranges::none_of(directImages, [&](const IrValue* handle) { return SameHandle(*handle, image); })) {
-                    static_cast<void>(PlanTableColumn(image, false, memory.imageR128));
+                    static_cast<void>(PlanTableColumn(image, false, memory.imageR128, dynamic));
                 }
                 if (imageInfo.needsSampler && inst->ArgumentCount() > 1u && !DirectSampler(*inst->Argument(1)->Resolve())) {
-                    static_cast<void>(PlanTableColumn(*inst->Argument(1)->Resolve(), true, false));
+                    static_cast<void>(PlanTableColumn(*inst->Argument(1)->Resolve(), true, false, dynamic));
                 }
             }
         }
@@ -1622,6 +1989,15 @@ private:
         }
         m_memoryUsersIndexed = false;
         m_memoryUsers.clear();
+    }
+
+    void KeepBindlessWords(IrValue& handle, const std::vector<IrValue*>& words) {
+        std::vector<IrValue*> references;
+        for (auto* word : words) {
+            const std::array<IrValue*, 1> arguments{word};
+            references.push_back(EmitBefore(handle, IrOpcode::ReferenceU32, IrType::Void, arguments));
+        }
+        m_program.Metadata().bindlessHandleWords[&handle] = std::move(references);
     }
 
     void KeepSourceAlive(IrValue& position, const DescriptorSource& source, std::vector<const IrValue*>& referenced) {
@@ -1775,13 +2151,53 @@ private:
                 continue;
             }
             image.table = next++;
-            if (image.atomic64 || image.packed || image.byElements != 0u) {
+            const bool storage = image.resourceClass == ImageResourceClass::Storage || image.written || image.atomic;
+            const bool store2D = image.resourceClass == ImageResourceClass::Storage && image.written && !image.read && !image.atomic && image.dimension == RdnaImageDimension::Dim2D && image.mipMode == ImageMipMode::None;
+            if ((storage && !store2D) || image.packed || image.byElements != 0u) {
                 image.tableOperation = TableOperation::Unsupported;
             }
         }
         for (auto& sampler : m_info.samplers) {
             if (TableSource(sampler.source)) {
                 sampler.table = next++;
+            }
+        }
+    }
+
+    bool DynamicSource(std::uint32_t source) const {
+        return TableSource(source) && m_sources[source].tableColumn->dynamic;
+    }
+
+    bool LoweredImage(const ImageResource& image) const {
+        const auto stage = m_program.Resources().stage;
+        return image.table != NoTable && DynamicLoweringStage(stage) && image.resourceClass == ImageResourceClass::Sampled && image.tableOperation == TableOperation::Supported;
+    }
+
+    static bool DynamicLoweringStage(IrShaderStage stage) {
+        return stage != IrShaderStage::Unknown && stage != IrShaderStage::Fetch;
+    }
+
+    [[noreturn]] void FailRuntimeAddress(std::uint32_t source) {
+        for (const auto& plan : m_tableColumns) {
+            if (plan.source != source) continue;
+            const bool sampler = m_sources[source].tableColumn->sampler;
+            DescriptorSource descriptor;
+            MakeSource(*plan.handle, sampler ? 4u : 8u, sampler, false, descriptor);
+            std::uint32_t badDword = 0;
+            static_cast<void>(ValidateSource(descriptor, badDword));
+            fail(std::string(IrOpcodeName(sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u) + " (its descriptor address is known only at run time, which only a sampled image on the bindless heap can read)");
+        }
+        fail("a runtime descriptor address column has no handle");
+    }
+
+    void RequireRuntimeAddressesLowered() {
+        for (const auto& image : m_info.images) {
+            if (DynamicSource(image.source) && !LoweredImage(image)) FailRuntimeAddress(image.source);
+        }
+        for (std::uint32_t sampler = 0; sampler < m_info.samplers.size(); sampler++) {
+            if (!DynamicSource(m_info.samplers[sampler].source)) continue;
+            for (const auto& pair : m_info.sampledPairs) {
+                if (pair.sampler == sampler && (pair.image >= m_info.images.size() || !LoweredImage(m_info.images[pair.image]))) FailRuntimeAddress(m_info.samplers[sampler].source);
             }
         }
     }
@@ -1947,6 +2363,9 @@ private:
         const bool flatLineAccess = image.dimension == RdnaImageDimension::Dim2DArray ? flatLineLevelZero || flatLineExplicitLod : flatLineLoad || flatLineSample || flatLineExplicitLod;
         image.flatLineCompatible = image.flatLineCompatible && flatLineAccess && !memory.imagePacked && memory.imageByElements == 0u;
         image.flatVolumeLineCompatible = image.flatVolumeLineCompatible && (flatLineLoad || flatLineSample) && !memory.imagePacked && memory.imageByElements == 0u;
+        if (op == IrOpcode::ImageQueryDimensions) image.levelUses |= ImageLevelUseQuery;
+        if (op == IrOpcode::ImageQueryLod) image.levelUses |= ImageLevelUseLodQuery;
+        if (op == IrOpcode::ImageRead && memory.imageByElements == 0u) image.levelUses |= memory.imageHasMip ? ImageLevelUseMipLoad : ImageLevelUseLoad;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
             if (op == IrOpcode::ImageGatherRaw || (memory.imageSampleFlags & unsupported) != 0u) image.emulatedCompare |= EmulatedCompare::Unsupported;
@@ -2104,6 +2523,11 @@ private:
             } else {
                 const bool sampleAdjust = (memory.imageSampleFlags & RdnaImageSampleFlagAdjust) != 0;
                 GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+                if (m_bindlessHandles && !m_directSamplerWords.contains(samplerHandle)) {
+                    DescriptorSource local;
+                    MakeSource(*samplerHandle, 4u, true, sampleAdjust, local);
+                    m_directSamplerWords.emplace(samplerHandle, std::vector<IrValue*>(local.dwords.begin(), local.dwords.begin() + 4));
+                }
             }
             sampler = AddSampler(samplerSource, flags.pc);
             if (sampler == std::numeric_limits<std::uint32_t>::max()) {
@@ -2145,6 +2569,8 @@ private:
     IrProgram& m_program;
     ShaderInfo m_info;
     IrBuilder m_builder;
+    bool m_bindlessHandles = false;
+    std::map<IrValue*, std::vector<IrValue*>> m_directSamplerWords;
     std::vector<DescriptorSource> m_sources;
     std::vector<std::vector<std::uint32_t>> m_blockSources;
     std::vector<std::vector<std::uint32_t>> m_blockImages;
@@ -2169,8 +2595,8 @@ private:
 
 }
 
-void ResourceTracker::Track(IrProgram& program) const {
-    Tracker(program).Run();
+void ResourceTracker::Track(IrProgram& program, bool bindlessHandles) const {
+    Tracker(program, bindlessHandles).Run();
 }
 
 }

@@ -747,7 +747,7 @@ void EmitBdaStore(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t
     });
 }
 
-void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, std::uint32_t value) {
+void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, std::uint32_t value, bool unchecked) {
     auto& state = ctx.state;
     if (dwords < 2u || dwords > 4u) ctx.Fail(inst, "unsupported BDA dword store count");
     if (state.bdaWritePointerFunction == 0 || state.bdaNoteWriteFunction == 0) ctx.Fail(inst, "BDA write functions are missing");
@@ -759,7 +759,7 @@ void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
     for (std::uint32_t dword = 0; dword < dwords; ++dword) {
         values[dword] = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, u32, values[dword], value, dword);
-        addresses[dword] = AddBdaImmediate(ctx, inst, address, static_cast<std::int32_t>(offset + dword * 4u));
+        addresses[dword] = unchecked && offset + dword * 4u != 0u ? Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, offset + dword * 4u)) : AddBdaImmediate(ctx, inst, address, static_cast<std::int32_t>(offset + dword * 4u));
     }
     const auto storeDwords = [&] {
         for (std::uint32_t dword = 0; dword < dwords; ++dword) EmitBdaStore(ctx, inst, addresses[dword], values[dword], 32u);
@@ -905,6 +905,25 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
         if (state.bdaStopsInvocations) state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), values[dword], read, 0u, dword);
         else state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), values[dword], read, dword);
     }
+    return values;
+}
+
+bool HasBdaSpanReads(const SpirvEmitterState& state, const IrValue& inst) {
+    return state.bdaProbeFunction != 0 && state.bdaSpanReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)] != 0;
+}
+
+std::uint32_t EmitBdaSpanRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t used) {
+    auto& state = ctx.state;
+    const auto function = state.bdaSpanReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)];
+    if (state.bdaProbeFunction == 0 || function == 0) ctx.Fail(inst, "BDA span read function is missing");
+    const auto read = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), read, function, address, offset, used, BdaInstructionPc(state, inst));
+    if (!state.bdaStopsInvocations) return read;
+    const auto stopped = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stopped, read, 1u);
+    StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, TypeBool(state), stopped, ConstantU32(state, 0u)));
+    const auto values = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32Vector(state, 4), values, read, 0u);
     return values;
 }
 

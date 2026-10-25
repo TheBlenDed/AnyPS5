@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -195,10 +196,17 @@ struct Heap {
     std::byte* base = nullptr;
     bool first = false;
     bool second = false;
+    bool arena = false;
 
-    Heap() {
+    explicit Heap(bool watched = false) {
 #ifdef _WIN32
-        base = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * RangeBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        arena = watched && AgcDriver::GuestMemory::WriteWatched();
+        if (arena) {
+            base = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * RangeBytes, Alignment));
+            if (base != nullptr) GuestArena::GuestArenaCommit_nid_postfix(base, 2 * RangeBytes, PAGE_READWRITE, 2 * RangeBytes);
+        } else {
+            base = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * RangeBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
 #else
         base = static_cast<std::byte*>(std::aligned_alloc(Alignment, 2 * RangeBytes));
 #endif
@@ -226,7 +234,12 @@ struct Heap {
         } catch (...) {
         }
 #ifdef _WIN32
-        VirtualFree(base, 0, MEM_RELEASE);
+        if (arena) {
+            GuestArena::GuestArenaReset_nid_postfix(base, 2 * RangeBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(base, 2 * RangeBytes);
+        } else {
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
 #else
         std::free(base);
 #endif
@@ -360,6 +373,87 @@ void BusyRetireOutlivesALaterBatch() {
     Expect(!Live(retired), "the dropped import outlived every batch of its hold");
 }
 
+std::uint64_t nestedImportAddress = 0;
+unsigned nestedImportCallbacks = 0;
+
+void UnwatchReentryUsesExistingImports() {
+    Heap first(true);
+    Heap second(true);
+    const auto context = mockContext();
+    nestedImportAddress = first.Address();
+    const auto* existing = HostImportFor(context, nestedImportAddress, 4096);
+    Expect(existing != nullptr, "the callback's existing import was not created");
+    if (existing == nullptr) return;
+    const auto buffer = existing->buffer;
+    struct RestoreHook {
+        ~RestoreHook() { AgcDriver::GuestMemory::SetUnwatchHook(nullptr); }
+    } restore;
+    AgcDriver::GuestMemory::SetUnwatchHook([](std::uint64_t address, std::size_t bytes) {
+        ++nestedImportCallbacks;
+        const auto context = mockContext();
+        const auto before = mock.memories.size();
+        const auto* existing = HostImportFor(context, nestedImportAddress, 4096);
+        Expect(existing != nullptr && existing->base == nestedImportAddress, "unwatch reentry lost an existing import");
+        Expect(HostImportFor(context, address, bytes) == nullptr, "unwatch reentry recursively created its unfinished import");
+        auto otherDevice = context;
+        otherDevice.device = reinterpret_cast<VkDevice>(0x9876);
+        Expect(HostImportFor(otherDevice, nestedImportAddress, 4096) == nullptr, "unwatch reentry used another device's import");
+        Expect(mock.memories.size() == before, "unwatch reentry allocated or retired memory");
+    });
+    const auto* added = HostImportFor(context, second.Address(), 4096);
+    Expect(added != nullptr, "the outer import did not finish after unwatch reentry");
+    Expect(nestedImportCallbacks != 0, "the import did not call the unwatch hook");
+    Expect(Live(buffer) && existing->buffer == buffer, "unwatch reentry invalidated the existing import");
+}
+
+void CachedLookupMatchesTheFullLookup() {
+    Heap heap;
+    ActiveRecorder active;
+    const auto context = mockContext();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    HostImportLookupCache cache;
+    const auto* first = HostImportForCached(context, heap.Address(), 4096, cache);
+    Expect(first != nullptr && cache.import == first, "the first cached lookup did not import and remember the range");
+    if (first == nullptr) return;
+    Expect(HostImportFor(context, heap.Address(), 4096) == first, "the full lookup answered another import than the cached one");
+    const auto before = first->lastUse;
+    Expect(HostImportForCached(context, heap.Address(), 4096, cache) == first, "a repeat lookup did not answer from the cache");
+    const auto cachedUse = first->lastUse;
+    static_cast<void>(HostImportFor(context, heap.Address(), 4096));
+    Expect(cachedUse - before == first->lastUse - cachedUse, "a cached lookup and a full lookup stamp the last use differently");
+    Expect(HostImportForCached(context, heap.Address(), 8192, cache) == HostImportFor(context, heap.Address(), 8192) && cache.bytes == 8192, "another range was answered from the cache");
+    Expect(HostImportForCached(context, 0, 0, cache) == nullptr && HostImportForCached(context, heap.Address(), 0, cache) == nullptr, "an empty range was answered");
+}
+
+void CachedLookupFollowsTheImportTable() {
+    Heap heap;
+    ActiveRecorder active;
+    const auto context = mockContext();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    HostImportLookupCache cache;
+    const auto* first = HostImportForCached(context, heap.Address(), 4096, cache);
+    Expect(first != nullptr, "the first range was not imported");
+    if (first == nullptr) return;
+    const auto firstBuffer = first->buffer;
+    {
+        Heap other;
+        const auto* added = HostImportFor(context, other.Address(), 4096);
+        Expect(added != nullptr && added != first, "an import of another range was not made");
+        Expect(HostImportForCached(context, heap.Address(), 4096, cache) == HostImportFor(context, heap.Address(), 4096), "an import added between two lookups changed the cached answer");
+        Expect(HostImportForCached(context, other.Address(), 4096, cache) == added, "the cache answered the range of another import");
+        Expect(HostImportForCached(context, heap.Address(), 4096, cache) == first, "the cache lost the import that stayed");
+    }
+    HostImportLookupCache removed;
+    static_cast<void>(HostImportForCached(context, heap.Address(), 4096, removed));
+    heap.Grow();
+    const auto* grown = HostImportForCached(context, heap.Address(), 4096, removed);
+    Expect(grown != nullptr && grown == HostImportFor(context, heap.Address(), 4096) && grown->buffer != firstBuffer && grown->bytes == 2 * RangeBytes, "a dropped import was still answered from the cache");
+    Expect(removed.import == grown && HostImportForCached(context, heap.Address(), 4096, removed) == grown, "the cache did not refill after the import was dropped");
+    HostImportLookupCache gone;
+    Expect(HostImportForCached(context, heap.Address(), 4096, gone) == grown, "a cache filled after the drop answered another import");
+    Expect(HostImportForCached(context, heap.Address(2 * RangeBytes), 4096, gone) == nullptr && gone.import == nullptr, "a range outside every registered range was answered or remembered");
+}
+
 }
 
 int main() {
@@ -370,9 +464,12 @@ int main() {
     setenv("APS5_WRITE_WATCH_IMPORTS", "unwatch", 1);
 #endif
     try {
+        UnwatchReentryUsesExistingImports();
         WindowPromotionOutlivesTheHold();
         IdleRetireOutlivesTheHold();
         BusyRetireOutlivesALaterBatch();
+        CachedLookupMatchesTheFullLookup();
+        CachedLookupFollowsTheImportTable();
         AgcDriver::Tests::RunHostImportFailureTests(mockContext(), false);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

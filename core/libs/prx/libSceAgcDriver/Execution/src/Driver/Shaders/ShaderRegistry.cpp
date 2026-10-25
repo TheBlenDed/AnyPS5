@@ -5,9 +5,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ResultFootprint.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "CacheKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
@@ -30,6 +35,7 @@
 #include <exception>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <list>
 #include <map>
 #include <mutex>
@@ -48,12 +54,112 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
+#include <unordered_set>
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 namespace AgcDriver::DriverDetail {
+
+RegisteredShaderMemory InspectRegisteredShaderMemory(const ShaderRegistry& registry) {
+    RegisteredShaderMemory result;
+    result.registryEntries = registry.size();
+    std::unordered_set<const ShaderSnapshot*> snapshots;
+    std::unordered_set<const ShaderRecompiler::SourceHandle*> handles;
+    std::unordered_set<const ShaderRecompiler::SourceEntry*> sources;
+    std::unordered_set<const ShaderRecompiler::CompiledVariant*> artifacts;
+    std::vector<std::shared_ptr<const ShaderRecompiler::SourceHandle>> entries;
+    for (const auto& [address, registered] : registry) {
+        for (const auto& snapshot : registered) {
+            if (snapshot == nullptr || !snapshots.insert(snapshot.get()).second) continue;
+            ++result.snapshots;
+            result.codeBytes += snapshot->code.size() * sizeof(std::uint32_t);
+            result.codeCapacityBytes += snapshot->code.capacity() * sizeof(std::uint32_t);
+            result.headerBytes += snapshot->header.size();
+            result.headerCapacityBytes += snapshot->header.capacity();
+            {
+                std::lock_guard lock(snapshot->prepared->mutex);
+                result.pending += snapshot->prepared->pending;
+                result.failed += snapshot->prepared->failure != nullptr;
+                result.excludedRectangles += snapshot->prepared->rectangles.size();
+                result.entryReferences += snapshot->prepared->entries.size();
+                for (const auto& entry : snapshot->prepared->entries) entries.push_back(entry.handle);
+            }
+        }
+    }
+    // DEBUG: pin copied handles until deduplication ends, including replaced preparations.
+    for (const auto& handle : entries) {
+        if (handle == nullptr) {
+            ++result.missingArtifacts;
+            continue;
+        }
+        if (!handles.insert(handle.get()).second) continue;
+        if (handle->source != nullptr) sources.insert(handle->source.get());
+        if (handle->artifact == nullptr) {
+            ++result.missingArtifacts;
+            continue;
+        }
+        if (!artifacts.insert(handle->artifact.get()).second) continue;
+        const auto& spirv = ShaderRecompiler::GetPreparedArtifact(*handle).spirv;
+        const auto logical = spirv.size() * sizeof(std::uint32_t);
+        result.rawArtifacts += spirv.HeapBytes() != 0;
+        result.coldArtifacts += spirv.Mapped();
+        result.cacheArtifacts += spirv.Mapped();
+        result.logicalBytes += logical;
+        result.rawBytes += spirv.Mapped() ? 0u : logical;
+        result.rawCapacityBytes += spirv.HeapBytes();
+        result.cacheBytes += spirv.Mapped() ? logical : 0u;
+    }
+    result.handles = handles.size();
+    result.sources = sources.size();
+    result.artifacts = artifacts.size();
+    return result;
+}
+
+namespace {
+
+// DEBUG: an opt-in, coarse census, not a per-frame walk or a retention policy.
+bool RegisteredShaderMemoryEnabled() noexcept {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_TRACE_SHADER_MEMORY");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+bool RegisteredShaderMemoryDue(std::size_t entries) noexcept {
+    if (!RegisteredShaderMemoryEnabled()) return false;
+    static std::atomic<std::size_t> next{1024};
+    auto expected = next.load(std::memory_order_relaxed);
+    return entries >= expected && next.compare_exchange_strong(expected, entries + 1024, std::memory_order_relaxed);
+}
+
+}
+
+bool RegisteredShaderMemoryAfterWorkDue() noexcept {
+    if (!RegisteredShaderMemoryEnabled()) return false;
+    static const auto started = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - started).count();
+    static std::atomic<std::int64_t> next{0};
+    auto expected = next.load(std::memory_order_relaxed);
+    return seconds >= expected && next.compare_exchange_strong(expected, seconds + 60, std::memory_order_relaxed);
+}
+
+void ReportRegisteredShaderMemory(const ShaderRegistry& registry, const char* phase) noexcept {
+    try {
+        const auto started = std::chrono::steady_clock::now();
+        const auto m = InspectRegisteredShaderMemory(registry);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr, "[shader-memory] complete=1 phase=%s scope=current_registered_snapshots sampling=per_prepared_lock backing=per_unique_artifact_may_alias exposed_is_not_hydrated unmeasured=plans,variant_metadata,old_registries,specialized_modules,results,disk_temporaries,allocator_overhead,total_process registry_entries=%zu snapshots=%zu pending=%zu failed=%zu entry_refs=%zu handles=%zu sources=%zu artifacts=%zu missing_artifacts=%zu rectangle_pairs_excluded=%zu raw_artifacts=%zu cold_artifacts=%zu exposed_artifacts=%zu logical_bytes=%zu raw_bytes=%zu raw_capacity_bytes=%zu cold_bytes=%zu cold_capacity_bytes=%zu file_artifacts=%zu file_bytes=%zu cache_artifacts=%zu cache_bytes=%zu code_bytes=%zu code_capacity_bytes=%zu header_bytes=%zu header_capacity_bytes=%zu elapsed_us=%lld\n",
+                     phase, m.registryEntries, m.snapshots, m.pending, m.failed, m.entryReferences, m.handles, m.sources, m.artifacts, m.missingArtifacts, m.excludedRectangles,
+                     m.rawArtifacts, m.coldArtifacts, m.exposedArtifacts, m.logicalBytes, m.rawBytes, m.rawCapacityBytes, m.coldBytes, m.coldCapacityBytes,
+                     m.fileArtifacts, m.fileBytes, m.cacheArtifacts, m.cacheBytes, m.codeBytes, m.codeCapacityBytes, m.headerBytes, m.headerCapacityBytes, static_cast<long long>(elapsed));
+    } catch (...) {
+        std::fprintf(stderr, "[shader-memory] complete=0 phase=%s census_failed\n", phase);
+    }
+}
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
     std::exception_ptr failure;
@@ -69,16 +175,22 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     }
     try {
         std::rethrow_exception(failure);
+    } catch (const ShaderRefusal&) {
+        throw;
     } catch (const std::exception& error) {
         std::ostringstream where;
         where << "shader 0x" << std::hex << request.shader.codeAddress << " stage " << static_cast<unsigned>(request.shader.stage);
         if (!dump.empty()) where << " (" << dump << ")";
         where << ": ";
+        // Under APS5_SKIP_REFUSED_SHADERS every caller (draw, dispatch, ABI resolution, registration)
+        // sees the refusal as one, wherever the program is first prepared.
+        if (SkipRefusedShaders()) throw ShaderRefusal(where.str() + error.what(), RefusedShaderSubject(static_cast<std::uint32_t>(request.shader.stage), request.shader.codeAddress));
         throw std::runtime_error(where.str() + error.what());
     }
 }
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
+    if (GuestMemory::SpeculativeReader()) throw std::runtime_error("AGC driver: a raw shader program is not available to a speculative reader");
     const auto drain = [](std::uint64_t first, std::size_t bytes) {
         if (!DrawPipeline::Active()) return;
         auto& pipeline = DrawPipeline::Queue0();
@@ -175,6 +287,7 @@ std::map<std::uint64_t, std::uint64_t> rawGraphicsRanges;
 }
 
 void NoteRawGraphicsDraw(const ShaderSnapshot& snapshot) {
+    if (GuestMemory::SpeculativeReader()) throw std::runtime_error("AGC driver: a raw graphics draw is not noted by a speculative reader");
     if (snapshot.rawGraphicsNoted->load(std::memory_order_acquire)) return;
     auto begin = snapshot.codeAddress;
     auto end = snapshot.codeAddress + snapshot.code.size() * sizeof(std::uint32_t);
@@ -581,6 +694,10 @@ const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapsh
     return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, false, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
 }
 
+void ShaderPreparationTransaction::ContinueAfterRefusal() {
+    if (State::active != nullptr) State::active->failed = false;
+}
+
 bool ShaderPreparationTransaction::Tracks(const ShaderSnapshot& snapshot) const {
     return root->changes.contains(snapshot.prepared.get());
 }
@@ -698,7 +815,38 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     std::memcpy(&used, static_cast<const void*>(shader), sizeof(Shader));
     std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
     used.user_data = registered.user_data;
-    return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0 || RelocatedRegisters(snapshot, used, registered) || RelocatedCopy(snapshot, used, registered) || FusedHullHeader(snapshot, used, registered);
+    if (std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0 || RelocatedRegisters(snapshot, used, registered) || FusedHullHeader(snapshot, used, registered)) return true;
+    static const bool relocatedCopies = std::getenv("APS5_RELOCATED_HEADER_COPIES") != nullptr;
+    Shader fixed = used;
+    fixed.cx_registers = registered.cx_registers;
+    fixed.sh_registers = registered.sh_registers;
+    fixed.specials = registered.specials;
+    fixed.input_semantics = registered.input_semantics;
+    fixed.output_semantics = registered.output_semantics;
+    if (std::memcmp(&fixed, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) != 0) return false;
+    const auto base = reinterpret_cast<std::uintptr_t>(shader);
+    const auto headerSize = std::min<std::size_t>(registered.header_size, snapshot.header.size());
+    const auto same = [&](const void* bound, const void* original, std::size_t bytes) {
+        if (bound == original) return true;
+        if (bound == nullptr || original == nullptr) return false;
+        const auto value = reinterpret_cast<std::uintptr_t>(original);
+        if (value < snapshot.headerAddress) return false;
+        const auto offset = value - snapshot.headerAddress;
+        if (offset > headerSize || bytes > headerSize - offset) return false;
+        if (offset > std::numeric_limits<std::uintptr_t>::max() - base) return false;
+        const auto address = base + offset;
+        if (reinterpret_cast<std::uintptr_t>(bound) != address) return false;
+        if (bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+        if (bytes == 0) return true;
+        GuestMemory::CheckRange(bound, bytes, 1);
+        return std::memcmp(bound, snapshot.header.data() + offset, bytes) == 0;
+    };
+    return (same(used.cx_registers, registered.cx_registers, registered.num_cx_registers * sizeof(ShaderRegister))
+        && same(used.sh_registers, registered.sh_registers, registered.num_sh_registers * sizeof(ShaderRegister))
+        && same(used.specials, registered.specials, std::max<std::size_t>(sizeof(ShaderSpecialRegs), registered.special_sizes_bytes))
+        && same(used.input_semantics, registered.input_semantics, registered.num_input_semantics * sizeof(ShaderSemantic))
+        && same(used.output_semantics, registered.output_semantics, registered.num_output_semantics * sizeof(ShaderSemantic)))
+        || (relocatedCopies && RelocatedCopy(snapshot, used, registered));
 }
 
 std::size_t ShaderRegistry::chunkFor(std::uint64_t address) const {
@@ -1060,7 +1208,59 @@ ShaderRecompiler::LinkedCalls LinkUserDataCallees(const ShaderRecompiler::Recomp
 
 }
 
+// APS5_PROFILE_DRAW: InvocationFor's outcomes ([invocation-for], 10 s): calls, hits on a prepared entry, artifacts
+// prepared at use (and appended), refusals repeated from the memo, entries scanned, and the time spent.
+struct InvocationForCounts {
+    std::atomic<std::uint64_t> calls{0}, hits{0}, prepared{0}, refused{0}, scanned{0}, ns{0}, prepareNs{0};
+    std::atomic<long long> lastReport{0};
+};
+InvocationForCounts& invocationForCounts() {
+    static InvocationForCounts counts;
+    return counts;
+}
+void reportInvocationFor() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& c = invocationForCounts();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load();
+    if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto calls = take(c.calls), hits = take(c.hits), prepared = take(c.prepared), refused = take(c.refused), scanned = take(c.scanned), ns = take(c.ns), prepareNs = take(c.prepareNs);
+    std::fprintf(stderr, "[invocation-for] (10 s): %llu calls, %llu hits, %llu prepared at use (%.0f ms), %llu refusals repeated, %.1f entries scanned a call, %.0f ms in all\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(hits), static_cast<unsigned long long>(prepared), static_cast<double>(prepareNs) / 1e6, static_cast<unsigned long long>(refused), calls != 0 ? static_cast<double>(scanned) / static_cast<double>(calls) : 0.0, static_cast<double>(ns) / 1e6);
+}
+
+bool sameBindingLayout(const ShaderRecompiler::BindingLayout& left, const ShaderRecompiler::BindingLayout& right) {
+    return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
+}
+
+// Keeps a recompiler refusal of a preparation at use, with its reason cut before the serialized request that
+// PrepareShader appends; other failures (memory, invalidated snapshots) are not kept.
+void noteRefusal(PreparedShaders& prepared, std::size_t codeOffset, std::span<const std::uint64_t> key, std::span<const std::uint32_t> linkedCode, const ShaderRecompiler::BindingLayout& layout, const std::exception& error) {
+    static constexpr std::string_view marker = "\nRecompileRequest:\n";
+    static constexpr std::size_t kept = 32;
+    if (dynamic_cast<const Graphics::LiveSnapshotInvalidated*>(&error) != nullptr) return;
+    std::string_view what = error.what();
+    if (what.find("ShaderRecompiler::Recompile: ") == std::string_view::npos) return;
+    if (const auto request = what.find(marker); request != std::string_view::npos) what = what.substr(0, request);
+    const auto* refusal = dynamic_cast<const ShaderRefusal*>(&error);
+    auto failure = refusal != nullptr ? std::make_exception_ptr(ShaderRefusal(std::string(what), refusal->subject)) : std::make_exception_ptr(std::runtime_error(std::string(what)));
+    if (prepared.refusals.size() >= kept) prepared.refusals.erase(prepared.refusals.begin());
+    prepared.refusals.push_back({codeOffset, {key.begin(), key.end()}, {linkedCode.begin(), linkedCode.end()}, layout, std::move(failure)});
+}
+
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+    const auto callStart = std::chrono::steady_clock::now();
+    auto& counts = invocationForCounts();
+    struct NoteCall {
+        InvocationForCounts& counts;
+        std::chrono::steady_clock::time_point start;
+        ~NoteCall() {
+            counts.calls.fetch_add(1, std::memory_order_relaxed);
+            counts.ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            reportInvocationFor();
+        }
+    } noteCall{counts, callStart};
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
@@ -1082,16 +1282,40 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     if (!snapshot.prepared->deferredAbis.empty() || snapshot.prepared->deferredPreparing) preparedAtUse = PrepareDeferredAbis(snapshot, lock);
     for (auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
+        counts.scanned.fetch_add(1, std::memory_order_relaxed);
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (!linked.code.empty() && !std::ranges::equal(invocationRequest.shader.code, linked.code)) continue;
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) {
+            counts.hits.fetch_add(1, std::memory_order_relaxed);
             NoteMatchedEntry(entry, preparedAtUse);
             return std::move(*invocation);
         }
     }
+    // A refused preparation is refused again: the recompiler memoizes the failure by source and layout, but each
+    // call still rethrew it through PrepareShader, which appends the whole serialized request (54-64 KB here) to
+    // the reason, copied and hashed again by the draw's skip report (best141: the merged hull draws refused in
+    // tessellation lowering, ~2,500 a 10 s, ~5.5 % of the queue worker in Serialize). A repeat rethrows the
+    // first refusal without the request. APS5_NO_REFUSAL_MEMO=1 (runtime switch) prepares again each time.
+    const bool memo = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoRefusalMemo);
+    if (memo) {
+        for (const auto& refusal : snapshot.prepared->refusals) {
+            if (refusal.codeOffset != codeOffset || !sameBindingLayout(refusal.layout, source.layout) || !std::ranges::equal(refusal.key, key) || !std::ranges::equal(refusal.linkedCode, linked.code)) continue;
+            counts.refused.fetch_add(1, std::memory_order_relaxed);
+            std::rethrow_exception(refusal.failure);
+        }
+    }
     NoteOwnPreparation(preparedAtUse);
     ReportPreparedAtUse(snapshot, source);
-    auto handle = PrepareShaderWithDiagnostics(source);
+    counts.prepared.fetch_add(1, std::memory_order_relaxed);
+    const auto prepareStart = std::chrono::steady_clock::now();
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    try {
+        handle = PrepareShaderWithDiagnostics(source);
+    } catch (const std::exception& error) {
+        if (memo) noteRefusal(*snapshot.prepared, codeOffset, key, linked.code, source.layout, error);
+        throw;
+    }
+    counts.prepareNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepareStart).count()), std::memory_order_relaxed);
     invocationRequest = source;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
@@ -1468,7 +1692,7 @@ public:
     static RegistrationPreparePool& Instance() {
         static auto* pool = [] {
             std::lock_guard lifecycle(Lifecycle());
-            auto* created = new RegistrationPreparePool(Closing() ? 0u : std::max(2u, std::thread::hardware_concurrency() / 2u));
+            auto* created = new RegistrationPreparePool(std::getenv("APS5_INLINE_SHADER_PREPARE") != nullptr || Closing() ? 0u : std::max(2u, std::thread::hardware_concurrency() / 2u));
             PreparationSlot().store(created);
             return created;
         }();
@@ -1546,6 +1770,11 @@ public:
             }
         }
         task();
+    }
+
+    std::pair<std::size_t, unsigned> Load() {
+        std::lock_guard lock(mutex);
+        return {tasks.size(), running};
     }
 
     void Prioritize(const PreparedShaders& prepared) {
@@ -2330,7 +2559,13 @@ void Driver::RegisterShader(const Shader* shader) {
         if (preparation != nullptr && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
         snapshot.prepared->pending = preparation != nullptr;
     } else {
-        snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
+        try {
+            snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
+        } catch (const ShaderRefusal& refusal) {
+            // As a failed background preparation: its uses rethrow the refusal and are skipped.
+            APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration: %s", static_cast<unsigned long long>(snapshot.codeAddress), refusal.what());
+            snapshot.prepared->failure = std::current_exception();
+        }
         if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
             std::vector<std::uint64_t> key;
             BuildRegisteredAbiKey(registered, *localDevice, key);
@@ -2353,7 +2588,7 @@ void Driver::RegisterShader(const Shader* shader) {
         std::fprintf(stderr, "\n");
     }
     const auto published = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     rethrowFailure();
     PublishRegisteredShader(shaders, published);
     if (shaders->find(NullPixelProgramAddress()) == shaders->end()) {
@@ -2361,6 +2596,105 @@ void Driver::RegisterShader(const Shader* shader) {
     }
     transaction.Commit();
     if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
+    if (RegisteredShaderMemoryDue(shaders->size())) {
+        const auto registry = shaders;
+        lock.unlock();
+        ReportRegisteredShaderMemory(*registry, "registration");
+    }
+}
+
+}
+
+namespace AgcDriver::DriverDetail {
+
+// DEBUG (APS5_MEM_STATS): sampled on the reporter thread. Compiled results pinned by the caches are
+// deduplicated by result object, their SPIR-V by specialization id (a specialized module) or else by
+// variant id (the artifact itself).
+void Driver::AppendMemoryStats(std::string& line) {
+    auto& driver = Get();
+    std::shared_ptr<const ShaderRegistry> registry;
+    for (int attempt = 0; attempt < 50 && registry == nullptr; ++attempt) {
+        std::unique_lock lock(driver.mutex, std::try_to_lock);
+        if (lock.owns_lock()) registry = driver.shaders;
+        else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    if (registry != nullptr) {
+        const auto m = InspectRegisteredShaderMemory(*registry);
+        MemoryStats::AppendCount(line, "reg_snapshots", m.snapshots);
+        MemoryStats::AppendMiB(line, "reg_code", m.codeCapacityBytes + m.headerCapacityBytes);
+        MemoryStats::AppendCount(line, "reg_pending", m.pending);
+        MemoryStats::AppendMiB(line, "reg_spirv_logical", m.logicalBytes, m.artifacts);
+        MemoryStats::AppendMiB(line, "reg_spirv_resident", m.rawCapacityBytes, m.rawArtifacts);
+        MemoryStats::AppendMiB(line, "reg_spirv_mapped", m.cacheBytes, m.cacheArtifacts);
+        MemoryStats::AppendCount(line, "reg_sources", m.sources);
+    } else {
+        line += " reg=busy";
+    }
+    const auto [queued, running] = RegistrationPreparePool::Instance().Load();
+    MemoryStats::AppendCount(line, "prepare_queued", queued);
+    MemoryStats::AppendCount(line, "prepare_running", running);
+
+    std::unordered_set<const ShaderRecompiler::RecompileResult*> results;
+    std::unordered_set<const ShaderSnapshot*> snapshots;
+    std::unordered_set<std::uint64_t> modules;
+    std::uint64_t residentSpirv = 0, logicalSpirv = 0, residentModules = 0, snapshotBytes = 0, variantCount = 0;
+    std::uint64_t specialized = 0, specializedBytes = 0, resultBytes = 0;
+    const auto visit = [&](const DispatchVariant& variant) {
+        ++variantCount;
+        if (variant.shader != nullptr && snapshots.insert(variant.shader.get()).second) snapshotBytes += variant.shader->code.capacity() * sizeof(std::uint32_t) + variant.shader->header.capacity();
+        const auto* result = variant.compiled.get();
+        if (result == nullptr || !results.insert(result).second) return;
+        resultBytes += ShaderRecompiler::ResultHeapBytes(*result);
+        const auto module = result->specializationId != 0 ? result->specializationId : (result->variantId | (1ull << 63u));
+        if (!modules.insert(module).second) return;
+        logicalSpirv += result->spirv.size() * sizeof(std::uint32_t);
+        residentSpirv += result->spirv.HeapBytes();
+        residentModules += result->spirv.HeapBytes() != 0;
+        if (result->specializationId != 0) {
+            ++specialized;
+            specializedBytes += result->spirv.HeapBytes();
+        }
+    };
+    std::size_t dispatchEntries = 0;
+    std::uint64_t dispatchVariantBytes = 0;
+    {
+        std::lock_guard lock(driver.dispatchCacheMutex);
+        dispatchEntries = driver.dispatchCache.size();
+        dispatchVariantBytes = driver.dispatchCacheVariantBytes;
+        for (const auto& [key, entry] : driver.dispatchCache) {
+            for (const auto& variant : entry->variants) if (variant != nullptr) visit(*variant);
+        }
+    }
+    MemoryStats::AppendMiB(line, "dispatch_cache_counted", dispatchVariantBytes, dispatchEntries);
+    std::size_t drawEntries = 0;
+    std::uint64_t drawVariantBytes = 0, drawUserData = 0;
+    {
+        std::lock_guard lock(driver.drawCacheMutex);
+        drawEntries = driver.drawCache.size();
+        drawVariantBytes = driver.drawCacheVariantBytes;
+        for (const auto& [key, entry] : driver.drawCache) {
+            if (entry->decode != nullptr) {
+                for (const auto& program : entry->decode->programs) {
+                    drawUserData += program.userData.capacity() * sizeof(std::uint32_t);
+                    if (program.snapshot != nullptr && snapshots.insert(program.snapshot.get()).second) snapshotBytes += program.snapshot->code.capacity() * sizeof(std::uint32_t) + program.snapshot->header.capacity();
+                }
+            }
+            for (const auto& stage : entry->stages) {
+                for (const auto& variant : stage) if (variant != nullptr) visit(*variant);
+            }
+        }
+    }
+    MemoryStats::AppendMiB(line, "draw_cache_counted", drawVariantBytes + drawUserData, drawEntries);
+    MemoryStats::AppendCount(line, "cache_variants", variantCount);
+    MemoryStats::AppendCount(line, "cache_results", results.size());
+    MemoryStats::AppendMiB(line, "cache_result_bytes", resultBytes, results.size());
+    const auto memo = ShaderRecompiler::ResultMemoTotals();
+    MemoryStats::AppendMiB(line, "result_memo", memo.bytes, memo.entries);
+    MemoryStats::AppendMiB(line, "result_memo_evicted", memo.evictedBytes, memo.evictions);
+    MemoryStats::AppendMiB(line, "cache_snapshot_code", snapshotBytes, snapshots.size());
+    MemoryStats::AppendMiB(line, "cache_spirv_logical", logicalSpirv, modules.size());
+    MemoryStats::AppendMiB(line, "cache_spirv_resident", residentSpirv, residentModules);
+    MemoryStats::AppendMiB(line, "cache_spirv_specialized", specializedBytes, specialized);
 }
 
 }

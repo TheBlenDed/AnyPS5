@@ -8,8 +8,10 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/ContentHash.hpp"
 
 namespace AgcDriver::GuestMemory {
 
@@ -52,6 +54,39 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 // Stores the parts of `current` that differ from `original` (the guest bytes the GPU started from), so
 // guest writes made meanwhile to untouched bytes survive. Compares in 256-byte blocks.
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
+
+// Content hashes standing in for a byte copy where only "do the guest bytes still match" is asked:
+// one ContentHash per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`,
+// each block clipped to the range), so a range starting at the same address or on a block boundary
+// shares the blocks. Uncommitted pages hash as the zeros ReadCommitted reads. No flush hook: the
+// caller flushes first where EqualsCommitted would.
+inline constexpr std::uint64_t HashBlockBytes = 65536;
+std::size_t HashBlockCount(std::uint64_t address, std::size_t bytes);
+void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out);
+// The same blocks of a host copy of the guest bytes at `address`.
+void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::span<ContentHash::Hash128> out);
+// Whether every block of the range still hashes to `expected` (stops at the first differing block).
+bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected);
+struct BlockMatch {
+    std::size_t hashed = 0;
+    std::size_t skipped = 0;
+    std::uint64_t hashedBytes = 0;
+    std::uint64_t skippedBytes = 0;
+};
+bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match = nullptr, const Commitment* layout = nullptr);
+struct UntrackedBlocks {
+    std::size_t covered = 0;
+    std::size_t hinted = 0;
+    std::size_t outside = 0;
+    std::size_t hostRegion = 0;
+    std::size_t unhinted = 0;
+    std::size_t refused = 0;
+    std::size_t partial = 0;
+    std::size_t layoutChanged = 0;
+};
+bool UntrackedLayoutWalks();
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr, const Commitment* before = nullptr, Commitment* now = nullptr);
+bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match = nullptr);
 
 // Write tracking. The guest arena is reserved with page write watching, so CollectWrites learns which
 // pages of a range the CPU wrote since they were last collected, stamps their 64 KiB blocks with a new
@@ -108,6 +143,11 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+// Back to no epoch (a fresh epoch for every collect, as a thread that never bumped): the presenter's
+// revalidation at a present is one epoch (BumpCollectEpoch at its start, this at its end; the present
+// is its ordering point), so a surface it walks for its staleness check, for the entry's generation and
+// for the texture cache's lookup is walked once.
+void EndCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
@@ -211,11 +251,37 @@ void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void GuardRead(std::uint64_t address, std::size_t bytes);
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
+void PrepareHostWrite(std::uintptr_t address, std::size_t bytes);
+class ISpeculativeReadGate {
+public:
+    virtual void Enter() = 0;
+    virtual void Leave() = 0;
+
+protected:
+    ~ISpeculativeReadGate() = default;
+};
+class SpeculativeReadRefused : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+class SpeculativeReadScope {
+public:
+    explicit SpeculativeReadScope(ISpeculativeReadGate& gate);
+    ~SpeculativeReadScope();
+    SpeculativeReadScope(const SpeculativeReadScope&) = delete;
+    SpeculativeReadScope& operator=(const SpeculativeReadScope&) = delete;
+
+private:
+    ISpeculativeReadGate* previous;
+};
+bool SpeculativeReadsSupported();
+bool SpeculativeReader();
 // Moves with every ForgetPages call (the libc invalidator: memory unmapped or re-registered): odd
 // while the call stores its page states, moved past it after, so a reader that loads an even
 // value before consulting the page states and reading directly, and the same value after, knows
 // the states it consulted were current and no page it read changed its mapping meanwhile.
 std::uint64_t ForgetSerial();
+std::uint64_t ForgetStamp(std::uint64_t address, std::size_t bytes);
 
 // Attribution of guest memory accesses (the [hooksync] line in Recorder.cpp and the read-site
 // counts of the [guestmem] line, APS5_PROFILE_DRAW): a sync the flush hook makes for an access has

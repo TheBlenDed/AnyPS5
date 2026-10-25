@@ -1,12 +1,17 @@
 #include "VulkanTestDevice.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "CompiledVariant.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
+#include "RdnaDecoder/RdnaInstruction.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
-#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
@@ -32,6 +37,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <thread>
 #ifdef _WIN32
@@ -104,6 +110,62 @@ void NullPixelAtDraw(AgcDriver::VulkanDevice& device) {
     Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries.back().handle && snapshot.prepared->entries.size() == 2, "the null pixel program was prepared again for the same draw");
 }
 
+void RegisteredMemoryCensus(const std::shared_ptr<const ShaderRecompiler::SourceHandle>& source) {
+    using AgcDriver::DriverDetail::InspectRegisteredShaderMemory;
+    using AgcDriver::DriverDetail::ShaderRegistry;
+    using AgcDriver::DriverDetail::ShaderSnapshot;
+    Require(InspectRegisteredShaderMemory({}) == AgcDriver::DriverDetail::RegisteredShaderMemory{}, "empty registry census is not empty");
+    auto raw = std::make_shared<ShaderRecompiler::CompiledVariant>();
+    std::vector<std::uint32_t> words{1u, 2u, 3u};
+    words.reserve(128u);
+    raw->artifact.spirv = std::move(words);
+    const auto backing = std::make_shared<const std::vector<std::uint32_t>>(16u * 1024u, 0u);
+    auto mapped = std::make_shared<ShaderRecompiler::CompiledVariant>();
+    mapped->artifact.spirv = ShaderRecompiler::SharedSpirv(backing, std::span<const std::uint32_t>(*backing));
+    Require(mapped->artifact.spirv.Mapped() && mapped->artifact.spirv.HeapBytes() == 0u && !raw->artifact.spirv.Mapped(), "census fixture storage kinds are wrong");
+    const auto rawBytes = raw->artifact.spirv.size() * sizeof(std::uint32_t);
+    const auto rawCapacity = raw->artifact.spirv.HeapBytes();
+    const auto mappedBytes = backing->size() * sizeof(std::uint32_t);
+    const auto handleFor = [&](const std::shared_ptr<ShaderRecompiler::CompiledVariant>& artifact) {
+        auto handle = std::make_shared<ShaderRecompiler::SourceHandle>();
+        handle->source = source->source;
+        handle->artifact = artifact;
+        return handle;
+    };
+    const auto rawHandle = handleFor(raw);
+    const auto rawAlias = handleFor(raw);
+    const auto mappedHandle = handleFor(mapped);
+    auto first = std::make_shared<ShaderSnapshot>(ShaderSnapshot{1u, 11u, 0u, {1u, 2u}, {std::byte{1}}});
+    auto second = std::make_shared<ShaderSnapshot>(ShaderSnapshot{1u, 12u, 0u, {1u, 2u}, {std::byte{2}}});
+    first->code.reserve(64u);
+    first->header.reserve(128u);
+    second->code.reserve(32u);
+    second->header.reserve(64u);
+    first->prepared->entries = {{0u, rawHandle}, {0u, rawAlias}, {0u, mappedHandle}};
+    second->prepared->entries = {{0u, rawHandle}, {0u, nullptr}};
+    second->prepared->pending = true;
+    second->prepared->failure = std::make_exception_ptr(std::runtime_error("census fixture"));
+    second->prepared->rectangles.push_back({1u, 2u, nullptr});
+    const ShaderRegistry registry{{1u, {first, second}}, {2u, {second}}, {3u, {first}}};
+    const auto census = InspectRegisteredShaderMemory(registry);
+    Require(census.registryEntries == 3u && census.snapshots == 2u && census.pending == 1u && census.failed == 1u, "census lost registration status or counted an aliased snapshot twice");
+    Require(census.entryReferences == 5u && census.handles == 3u && census.sources == 1u && census.artifacts == 2u && census.missingArtifacts == 1u && census.excludedRectangles == 1u, "census did not deduplicate shared source/artifact owners or disclose omitted records");
+    Require(census.rawArtifacts == 1u && census.cacheArtifacts == 1u, "census storage state counts are wrong");
+    Require(census.logicalBytes == rawBytes + mappedBytes && census.rawBytes == rawBytes && census.rawCapacityBytes == rawCapacity && census.cacheBytes == mappedBytes, "census conflated logical bytes, heap capacity or mapped bytes");
+    Require(census.rawCapacityBytes > census.rawBytes && census.codeBytes == 4u * sizeof(std::uint32_t) && census.codeCapacityBytes == (first->code.capacity() + second->code.capacity()) * sizeof(std::uint32_t) && census.headerBytes == 2u && census.headerCapacityBytes == first->header.capacity() + second->header.capacity(), "census registry capacity accounting is wrong");
+    Require(InspectRegisteredShaderMemory(registry) == census, "repeated census changed the sampled storage");
+    Require(mapped->artifact.spirv.Mapped() && mapped->artifact.spirv.HeapBytes() == 0u, "census copied mapped SPIR-V to the heap");
+
+    const auto mappedAlias = std::make_shared<ShaderRecompiler::CompiledVariant>(*mapped);
+    first->prepared->entries.push_back({0u, handleFor(mappedAlias)});
+    const auto aliased = InspectRegisteredShaderMemory(registry);
+    Require(aliased.artifacts == 3u && aliased.sources == 1u && aliased.cacheArtifacts == 2u && aliased.cacheBytes == 2u * mappedBytes, "census hid the distinct-artifact shared-mapping limit");
+    static_cast<void>(mappedAlias->artifact.spirv.data());
+    const auto written = InspectRegisteredShaderMemory(registry);
+    Require(written.cacheArtifacts == 1u && written.rawArtifacts == 2u && written.rawBytes == rawBytes + mappedBytes && written.rawCapacityBytes == rawCapacity + mappedAlias->artifact.spirv.HeapBytes(), "census reports mapped storage for a module copied on write");
+    std::cout << "registered shader memory census reports mapped SPIR-V and deduplicates artifact references\n";
+}
+
 void Run(AgcDriver::VulkanDevice& device) {
     NullPixelAtDraw(device);
     alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
@@ -121,6 +183,7 @@ void Run(AgcDriver::VulkanDevice& device) {
     AgcDriver::DriverDetail::ShaderSnapshot snapshot{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
     snapshot.header.resize(sizeof(Shader));
     const auto handle = ShaderRecompiler::PrepareShader(request);
+    RegisteredMemoryCensus(handle);
     snapshot.prepared->entries.push_back({0, handle});
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 1, request)); }, "outside the snapshot");
     const auto& artifact = ShaderRecompiler::GetPreparedArtifact(*handle);
@@ -195,12 +258,30 @@ void Run(AgcDriver::VulkanDevice& device) {
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request)); }, "does not refer to registered code");
 }
 
-void FailureCapture(AgcDriver::VulkanDevice& device) {
+void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) {
     using namespace ShaderRecompiler;
     const std::array<std::uint32_t, 1> code{0xffffffffu};
     const std::vector<std::byte> header(2048, std::byte{0x5a});
     RecompileRequest request{{ShaderStage::Compute, 0x12345cafeull, code, 0x20000, header},
         {32, 0, {}, ShaderComputeStageInfo{{1, 1, 1}, 0, {}, false, 1, {}}, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    const std::array<std::uint32_t, 2> oldWords{1, 2};
+    const std::array<MemoryRegion, 1> oldMemory{{{0x40000, std::as_bytes(std::span(oldWords))}}};
+    request.context.memory = oldMemory;
+    alignas(4096) std::array<std::uint32_t, 1024> dependencyPage{};
+    const auto dependencyAddress = reinterpret_cast<std::uintptr_t>(dependencyPage.data());
+    const auto leafAddress = reinterpret_cast<std::uintptr_t>(dependencyPage.data() + 4);
+    const std::array<std::uint32_t, 4> terminalWords{static_cast<std::uint32_t>(leafAddress), static_cast<std::uint32_t>(leafAddress >> 32u), 16u, 0x31016facu};
+    std::copy(terminalWords.begin(), terminalWords.end(), dependencyPage.begin());
+    const std::array<std::uint32_t, 2> users{static_cast<std::uint32_t>(dependencyAddress), static_cast<std::uint32_t>(dependencyAddress >> 32u)};
+    const std::array<std::uint32_t, 7> captureCode{0xf4080100u, 0xfa000000u, 0xf4280202u, 0xfa1ffffcu, 0xe0700000u, 0x80020000u, 0xbf810000u};
+    auto captureRequest = request;
+    captureRequest.shader = {ShaderStage::Compute, request.shader.codeAddress, captureCode, 0, {}};
+    captureRequest.context.userData = users;
+    captureRequest.context.memory = {};
+    captureRequest.useCache = false;
+    AgcDriver::ShaderMemory partialMemory({});
+    Require(partialMemory.Regions().empty(), "partial capture started with supplied dependency regions");
+    std::vector<MemoryRegion> terminalMemory;
     const auto failure = [&](auto action) {
         try { action(); }
         catch (const std::exception& error) { return std::string(error.what()); }
@@ -224,6 +305,7 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
     Require(diagnosed.rfind(prefix.str(), 0) == 0, "diagnosed failure names no shader address and stage");
     Require(diagnosed.substr(prefix.str().size()) == expected, "diagnosed failure changed the reason");
     Require(!std::ifstream(path, std::ios::binary).is_open(), "disabled shader capture created a request");
+    Require(!AgcDriver::DriverDetail::CaptureTerminalComputeFailure(request, terminalMemory, "disabled", 0, 1, 2), "disabled terminal capture created a request");
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", "1") == 0, "cannot enable shader capture");
 #else
@@ -241,6 +323,45 @@ void FailureCapture(AgcDriver::VulkanDevice& device) {
     capture.close();
     std::remove(capturePath.c_str());
     Require(captureText.str() == RequestSerializer{}.Serialize(request), "an earlier preparation failure dump suppressed the dispatch request dump");
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-terminal-capture-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(std::filesystem::create_directory(directory), "cannot create terminal capture test directory");
+    const auto destination = (terminalWriteFailure ? directory / "missing" / "child" : directory).string();
+    bool written = false;
+    std::string captureError;
+    const auto terminalError = failure([&] {
+        try { static_cast<void>(partialMemory.Capture(captureRequest)); }
+        catch (const std::exception& error) {
+            captureError = error.what();
+            terminalMemory = partialMemory.Regions();
+            written = AgcDriver::DriverDetail::CaptureTerminalComputeFailure(captureRequest, terminalMemory, error.what(), 7, 11, 13, destination.c_str());
+            throw;
+        }
+    });
+    Require(captureError.find("SrtWalker::EvaluateRuntimeSources") != std::string::npos && captureError.find("ReadConstBuffer") != std::string::npos, "partial capture did not refuse the unsupported negative scalar-buffer offset");
+    Require(terminalError == captureError, "terminal capture changed the original exception");
+    Require(terminalMemory.size() == 1 && terminalMemory[0].guestAddress == dependencyAddress && terminalMemory[0].bytes.size() == sizeof(terminalWords)
+        && std::memcmp(terminalMemory[0].bytes.data(), terminalWords.data(), sizeof(terminalWords)) == 0, "failed capture did not retain its actual descriptor reads");
+    Require(written == !terminalWriteFailure, "terminal capture write outcome was incorrect");
+    Require(!AgcDriver::DriverDetail::CaptureTerminalComputeFailure(request, oldMemory, "second failure", 7, 12, 13, directory.string().c_str()), "terminal capture exceeded its one-attempt budget");
+    std::size_t terminalFiles = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        Require(entry.path().extension() == ".req", "terminal capture left a staging file");
+        Require(entry.path().filename().string().starts_with("shader_12345cafe_terminal_"), "terminal capture cannot be collected by the runner");
+        std::ifstream terminalFile(entry.path(), std::ios::binary);
+        const std::string bytes{std::istreambuf_iterator<char>(terminalFile), std::istreambuf_iterator<char>()};
+        auto terminalRequest = captureRequest;
+        terminalRequest.context.memory = terminalMemory;
+        const RequestSerializer terminalSerializer;
+        Require(bytes == terminalSerializer.Serialize(terminalRequest), "terminal capture used stale same-address request bytes");
+        const auto decoded = terminalSerializer.Deserialize(bytes);
+        Require(decoded.request.context.memory.size() == 1 && decoded.request.context.memory[0].guestAddress == dependencyAddress && decoded.request.context.memory[0].bytes.size() == sizeof(terminalWords)
+            && std::memcmp(decoded.request.context.memory[0].bytes.data(), terminalWords.data(), sizeof(terminalWords)) == 0, "terminal captured memory did not roundtrip");
+        terminalFile.close();
+        Require(std::filesystem::remove(entry.path()), "cannot remove terminal capture test file");
+        ++terminalFiles;
+    }
+    Require(terminalFiles == (terminalWriteFailure ? 0u : 1u), "terminal capture file count was incorrect");
+    Require(std::filesystem::remove(directory), "cannot remove terminal capture test directory");
 #ifdef _WIN32
     Require(_putenv_s("APS5_DUMP_SHADERS", saved.c_str()) == 0, "cannot restore shader capture");
 #else
@@ -514,6 +635,10 @@ void Registration(bool indirect) {
         std::array<ShaderRegister, 9> registers{};
         std::array<ShaderRegister, 2> context{{{0x1b6, 0}, {0x1b6, 1}}};
         ShaderSpecialRegs specials{};
+        std::array<std::byte, 8> specialTail{};
+        std::array<ShaderSemantic, 2> inputs{};
+        std::array<ShaderSemantic, 1> outputs{};
+        std::array<ShaderSemantic, 2> inputAlias{};
     } header;
     const auto address = reinterpret_cast<std::uintptr_t>(code.data());
     header.shader.file_header = 0x34333231u;
@@ -526,7 +651,19 @@ void Registration(bool indirect) {
     header.shader.cx_registers = header.context.data();
     header.shader.num_cx_registers = header.context.size();
     header.shader.specials = &header.specials;
+    header.shader.input_semantics = header.inputs.data();
+    header.shader.num_input_semantics = header.inputs.size();
+    header.shader.output_semantics = header.outputs.data();
+    header.shader.num_output_semantics = header.outputs.size();
     header.specials.dispatch_modifier = 0x8000;
+    header.specialTail.fill(std::byte{0x5a});
+    header.inputs[0].semantic = 3;
+    header.inputs[0].size_in_elements = 4;
+    header.inputs[1].semantic = 7;
+    header.inputs[1].hardware_mapping = 1;
+    header.outputs[0].semantic = 11;
+    header.outputs[0].size_in_elements = 2;
+    header.inputAlias = header.inputs;
     header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 2}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}, {0x207, 1}, {0x207, 1}}};
     const auto threadRegisterIndex = header.registers.size() - 1;
     AgcDriverRegisterShader_nid_postfix(&header.shader);
@@ -553,6 +690,57 @@ void Registration(bool indirect) {
     AgcDriverResolveShaderAbi_nid_postfix(reinterpret_cast<Shader*>(unaligned), {}, {});
     copy.target ^= 1u;
     ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&copy, {}, {}); }, "replaced shader header");
+    Header moved{};
+    const auto relocate = [&] {
+        moved = header;
+        moved.shader.sh_registers = moved.registers.data();
+        moved.shader.cx_registers = moved.context.data();
+        moved.shader.specials = &moved.specials;
+        moved.shader.input_semantics = moved.inputs.data();
+        moved.shader.output_semantics = moved.outputs.data();
+    };
+    relocate();
+    AgcDriverResolveShaderAbi_nid_postfix(&moved.shader, {}, {});
+    moved.shader.cx_registers = header.context.data();
+    moved.shader.output_semantics = header.outputs.data();
+    moved.shader.user_data = reinterpret_cast<ShaderUserData*>(&moved);
+    AgcDriverResolveShaderAbi_nid_postfix(&moved.shader, {}, {});
+    const auto rejectRelocated = [&](auto mutate) {
+        relocate();
+        mutate(moved);
+        ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&moved.shader, {}, {}); }, "replaced shader header");
+    };
+    rejectRelocated([&](Header& changed) { ++changed.registers[threadRegisterIndex].value; });
+    rejectRelocated([](Header& changed) { ++changed.context.back().value; });
+    rejectRelocated([](Header& changed) { changed.specials.ge_user_vgpr_en.value ^= 1u; });
+    rejectRelocated([](Header& changed) { changed.inputs.back().hardware_mapping ^= 1u; });
+    rejectRelocated([](Header& changed) { changed.outputs.front().semantic ^= 1u; });
+    rejectRelocated([](Header& changed) { ++changed.shader.sh_registers; });
+    rejectRelocated([](Header& changed) { changed.shader.input_semantics = changed.inputAlias.data(); });
+    rejectRelocated([](Header& changed) { changed.shader.specials = &changed.specials + 1; });
+    rejectRelocated([](Header& changed) { changed.shader.sh_registers = nullptr; });
+    rejectRelocated([](Header& changed) { changed.shader.input_semantics = nullptr; });
+    rejectRelocated([](Header& changed) { changed.shader.specials = nullptr; });
+    rejectRelocated([](Header& changed) { changed.shader.target ^= 1u; });
+    rejectRelocated([](Header& changed) { changed.shader.header_size = sizeof(Shader); });
+    ++header.registers[threadRegisterIndex].value;
+    rejectRelocated([](Header&) {});
+    --header.registers[threadRegisterIndex].value;
+    relocate();
+    AgcDriverResolveShaderAbi_nid_postfix(&moved.shader, {}, {});
+    header.shader.special_sizes_bytes = sizeof(header.specials) + sizeof(header.specialTail);
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    relocate();
+    AgcDriverResolveShaderAbi_nid_postfix(&moved.shader, {}, {});
+    rejectRelocated([](Header& changed) { changed.specialTail.back() ^= std::byte{1}; });
+    header.shader.special_sizes_bytes = 0;
+    header.shader.header_size = offsetof(Header, inputs) + sizeof(ShaderSemantic);
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    Header truncated = header;
+    truncated.shader.input_semantics = truncated.inputs.data();
+    ExpectFailure([&] { AgcDriverResolveShaderAbi_nid_postfix(&truncated.shader, {}, {}); }, "replaced shader header");
+    header.shader.header_size = sizeof(header);
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
     header.registers[1].value |= 0x100u;
     ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "invalid registered program address");
     header.registers[1].value &= 0xffu;
@@ -750,8 +938,9 @@ void LazyRegistration() {
     ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "s_code_end");
 }
 
-void DeferredRegistration() {
+void DeferredRegistration(bool preparationFailure = false) {
     alignas(256) std::array<std::uint32_t, 2> code{0xbe842104u, 0xbf810000u};
+    if (preparationFailure) code[0] = 0xbe802004u;
     struct Header {
         Shader shader{};
         std::array<ShaderRegister, 8> registers{};
@@ -772,13 +961,41 @@ void DeferredRegistration() {
     std::vector<std::uint32_t> commands;
     for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
     commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+    std::uint32_t destination = 0;
+    const auto destinationAddress = reinterpret_cast<std::uintptr_t>(&destination);
+    commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7u});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "not statically resolvable");
-    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "not statically resolvable");
+    const auto reason = preparationFailure ? "unsupported dynamic s_setpc_b64 at program counter 0x0" : "not statically resolvable";
+    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, reason);
+    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, reason);
+    Require(destination == 0u, "failed preparation executed a subsequent memory write");
 }
 
-void DeferredUndecodableRegistration() {
+void AperturePreparationClassification(AgcDriver::VulkanDevice& device) {
+    using namespace ShaderRecompiler;
+    std::array<std::uint32_t, 2> code{0xbeea04ebu, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x35800u, code, 0, {}};
+    request.context.waveSize = 32;
+    request.context.compute = ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
+    request.target = device.ComputeTarget(32);
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    for (std::uint32_t source = 234u; source <= 238u; ++source) {
+        code[0] = 0xbeea0400u | source;
+        bool rejected = false;
+        try { static_cast<void>(GetResourcePlan(request)); }
+        catch (const std::invalid_argument& error) {
+            Require(source == 234u, "an aperture scalar source remained a malformed-input error");
+            Require(std::string(error.what()).find("unsupported scalar source operand code 234") != std::string::npos, "reserved scalar source lost its diagnostic");
+            rejected = true;
+        }
+        Require(rejected == (source == 234u), "a reserved scalar source compiled successfully");
+    }
+}
+
+void DeferredUndecodableRegistration(bool skipRefused = false) {
     alignas(256) std::array<std::uint32_t, 3> code{0xbe842104u, 0xf1949f05u, 0x00060018u};
     struct Header {
         Shader shader{};
@@ -800,10 +1017,25 @@ void DeferredUndecodableRegistration() {
     std::vector<std::uint32_t> commands;
     for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
     commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, 0x8041});
+    std::uint32_t destination = 0;
+    const auto destinationAddress = reinterpret_cast<std::uintptr_t>(&destination);
+    commands.insert(commands.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(destinationAddress), static_cast<std::uint32_t>(destinationAddress >> 32u), 7u});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     sceAgcDriverSubmitAcb(0x20, &packet);
-    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, "unsupported MIMG opcode");
-    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, "unsupported MIMG opcode");
+    if (skipRefused) {
+        AgcDriverWaitIdle_nid_postfix();
+        Require(destination == 7u, "a skipped refused dispatch stopped the rest of its submission");
+        destination = 0;
+        sceAgcDriverSubmitAcb(0x20, &packet);
+        AgcDriverWaitIdle_nid_postfix();
+        Require(destination == 7u, "a refused dispatch was not skipped when it was used again");
+        AgcDriverShutdown_nid_postfix();
+        return;
+    }
+    const auto reason = "unsupported MIMG opcode";
+    ExpectFailure([] { AgcDriverWaitIdle_nid_postfix(); }, reason);
+    ExpectFailure([] { AgcDriverShutdown_nid_postfix(); }, reason);
+    Require(destination == 0u, "a deferred unsupported dispatch executed a subsequent memory write");
 }
 
 class StderrCapture {
@@ -1419,7 +1651,7 @@ int main(int argc, char** argv) {
     try {
         const std::string_view abiMode = argc == 2 ? argv[1] : "";
         const bool abiDeferred = abiMode == "--abi-deferred-compute" || abiMode == "--abi-deferred-concurrent" || abiMode == "--abi-deferred-pixel" || abiMode == "--abi-deferred-stages" || abiMode == "--abi-deferred-rectangle" || abiMode == "--abi-deferred-undecodable-state" || abiMode == "--abi-deferred-registration-failure" || abiMode == "--abi-deferred-vertex-inputs" || abiMode == "--abi-deferred-rectangle-pairs";
-        Require(argc == 1 || abiDeferred || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
+        Require(argc == 1 || abiDeferred || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--deferred-aperture" || std::string_view(argv[1]) == "--skip-refused" || std::string_view(argv[1]) == "--preparation-failure" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
         if (abiDeferred) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
             if (abiMode == "--abi-deferred-compute") AbiDeferredCompute();
@@ -1447,10 +1679,23 @@ int main(int argc, char** argv) {
             AgcDriverShutdown_nid_postfix();
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--deferred") {
+        if (argc == 2 && std::string_view(argv[1]) == "--deferred-aperture") {
+            auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            AperturePreparationClassification(*device);
+            std::cout << "aperture scalar source preparation tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--preparation-failure")) {
             if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
-            DeferredRegistration();
+            DeferredRegistration(std::string_view(argv[1]) == "--preparation-failure");
             std::cout << "deferred shader preparation tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--skip-refused") {
+            if (!OpenVulkanTestDevice()) return VulkanTestSkipped;
+            DeferredUndecodableRegistration(true);
+            std::cout << "skipped refused dispatch tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred-undecodable") {
@@ -1463,7 +1708,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         Run(*device);
         RegisteredVertexWorkgroup(device->Target());
-        FailureCapture(*device);
+        FailureCapture(*device, argc == 2 && std::string_view(argv[1]) == "--indirect");
         PendingRegistrationPreparation(*device);
         AwaitedRegistrationPreparation();
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");

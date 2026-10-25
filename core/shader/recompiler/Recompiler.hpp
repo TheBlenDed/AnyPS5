@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "BindlessImageAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
@@ -10,9 +11,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <ranges>
 #include <utility>
 #include <string_view>
@@ -63,6 +66,13 @@ struct ShaderComputeStageInfo {
     std::uint32_t threadIdComponentCount;
     std::array<std::uint32_t, 3> partialThreads;
     std::uint32_t scratchDwords = 0;
+    // The dispatch runs exactly one workgroup (a direct dispatch of 1x1x1 groups, set by the driver):
+    // the guest's glc buffer loads then only need workgroup-scope coherence, since every other
+    // writer of the buffer that can run beside them is an invocation of the same workgroup on the
+    // same SM (other dispatches are ordered by the barriers between them). The SPIR-V reads them
+    // through the L1-cached binding and s_barrier also orders buffer memory (SpirvRuntimeBuffer,
+    // SpirvFlowEmitter). Set only with APS5_SINGLE_GROUP_COHERENCE=1 (driver, opt-in: not shown exact).
+    bool singleWorkgroup = false;
 
     [[nodiscard]] bool PartialGroups() const {
         return partialThreads != std::array<std::uint32_t, 3>{};
@@ -135,6 +145,15 @@ enum class RasterPrimitive : std::uint8_t {
     Line,
     Triangle,
     Rectangle
+};
+
+struct ColorTargetBlend {
+    bool enable = false;
+    std::uint8_t sourceFactor = 0;
+    std::uint8_t destinationFactor = 0;
+    std::uint8_t function = 0;
+    std::uint8_t writeMask = 0;
+    bool operator==(const ColorTargetBlend&) const = default;
 };
 
 enum class PixelPositionLocation : std::uint8_t {
@@ -211,6 +230,7 @@ struct ShaderPixelStageInfo {
     bool ditheredAlphaToCoverage = false;
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    std::array<ColorTargetBlend, 8> targetBlend;
     std::uint32_t reversedBlend = 0;
     bool iteratesSamples = false;
     PixelPositionLocation positionLocation = PixelPositionLocation::Center;
@@ -239,6 +259,13 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
     std::uint32_t paClVsOutCntl = 0;
+    // GPU-side indirect draw parameters (gpuind): the user SGPRs the CP writes a record's base
+    // vertex and start instance into for an indirect draw on the vertex path, or -1. A stage
+    // compiled with one of them set reads that SGPR from BaseVertex / BaseInstance and takes the
+    // vertex / instance index VGPR as VertexIndex - BaseVertex / InstanceIndex - BaseInstance (the
+    // record's raw index), so the driver records vkCmdDraw*Indirect without reading the records.
+    std::int32_t drawBaseVertexSgpr = -1;
+    std::int32_t drawStartInstanceSgpr = -1;
     std::uint32_t depthRemapMode = 0;
     bool pointList = false;
     float pointSize = 1.0f;
@@ -317,7 +344,11 @@ struct SpirvTarget {
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
     bool float16DenormPreserve = false;
+    bool bindlessImages = false;
     bool spannedWaves = false;
+    // GLSL.std.450 Fma is a fused multiply-add on the device (the driver's startup probe, VulkanDevice
+    // FusedFmaProbe): v_fma_mix* then takes an exact f32 path instead of the f64 helper.
+    bool fusedFma = false;
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;
@@ -488,6 +519,130 @@ enum class DescriptorRole {
     ImageStorageTable
 };
 
+class ElementFlags {
+public:
+    class reference {
+    public:
+        reference(ElementFlags& flags, std::size_t index) : flags(flags), index(index) {}
+        operator bool() const { return static_cast<const ElementFlags&>(flags)[index]; }
+        reference& operator=(bool flag) {
+            flags.set(index, flag);
+            return *this;
+        }
+        reference& operator=(const reference& other) { return *this = static_cast<bool>(other); }
+        void flip() { flags.set(index, !static_cast<bool>(*this)); }
+
+    private:
+        ElementFlags& flags;
+        std::size_t index;
+    };
+
+    class const_iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = bool;
+        using difference_type = std::ptrdiff_t;
+        using pointer = void;
+        using reference = bool;
+        const_iterator() = default;
+        const_iterator(const ElementFlags* flags, std::size_t index) : flags(flags), index(index) {}
+        bool operator*() const { return (*flags)[index]; }
+        const_iterator& operator++() {
+            ++index;
+            return *this;
+        }
+        const_iterator operator++(int) {
+            auto previous = *this;
+            ++index;
+            return previous;
+        }
+        bool operator==(const const_iterator& other) const { return index == other.index; }
+        bool operator!=(const const_iterator& other) const { return index != other.index; }
+
+    private:
+        const ElementFlags* flags = nullptr;
+        std::size_t index = 0;
+    };
+
+    ElementFlags() = default;
+    ElementFlags(std::initializer_list<bool> flags) {
+        for (const bool flag : flags) push_back(flag);
+    }
+    std::size_t size() const { return count; }
+    bool empty() const { return count == 0; }
+    bool operator[](std::size_t index) const { return count <= InlineFlags ? ((bits >> index) & 1u) != 0 : spill[index]; }
+    reference operator[](std::size_t index) { return {*this, index}; }
+    bool back() const { return (*this)[count - 1]; }
+    reference back() { return {*this, count - 1}; }
+    bool at(std::size_t index) const {
+        if (index >= count) throw std::out_of_range("ElementFlags::at");
+        return (*this)[index];
+    }
+    void push_back(bool flag) {
+        if (count < InlineFlags) {
+            if (flag) bits |= std::uint64_t{1} << count;
+            ++count;
+            return;
+        }
+        if (count == InlineFlags) {
+            for (std::size_t index = 0; index < InlineFlags; ++index) spill.push_back(((bits >> index) & 1u) != 0);
+        }
+        spill.push_back(flag);
+        ++count;
+    }
+    void clear() {
+        bits = 0;
+        count = 0;
+        spill.clear();
+    }
+    void assign(std::size_t size, bool flag) {
+        clear();
+        for (std::size_t index = 0; index < size; ++index) push_back(flag);
+    }
+    void resize(std::size_t size, bool flag = false) {
+        if (size < count) {
+            ElementFlags kept;
+            for (std::size_t index = 0; index < size; ++index) kept.push_back((*this)[index]);
+            *this = std::move(kept);
+            return;
+        }
+        while (count < size) push_back(flag);
+    }
+    // Heap bytes held (the spill past the inline word), for the result memo's footprint.
+    std::size_t HeapBytes() const { return (spill.capacity() + 7u) / 8u; }
+    const_iterator begin() const { return {this, 0}; }
+    const_iterator end() const { return {this, count}; }
+    bool operator==(const ElementFlags& other) const {
+        if (count != other.count) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((*this)[index] != other[index]) return false;
+        }
+        return true;
+    }
+    bool operator==(const std::vector<bool>& other) const {
+        if (count != other.size()) return false;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((*this)[index] != other[index]) return false;
+        }
+        return true;
+    }
+
+private:
+    void set(std::size_t index, bool flag) {
+        if (count > InlineFlags) {
+            spill[index] = flag;
+            return;
+        }
+        const auto bit = std::uint64_t{1} << index;
+        bits = flag ? bits | bit : bits & ~bit;
+    }
+
+    static constexpr std::size_t InlineFlags = 64;
+    std::uint64_t bits = 0;
+    std::size_t count = 0;
+    std::vector<bool> spill;
+};
+
 struct DescriptorBinding {
     DescriptorKind kind;
     DescriptorRole role;
@@ -497,30 +652,30 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> guestDescriptor;
     bool readOnly = false;
     std::optional<DescriptorImageShape> imageShape;
-    std::vector<bool> samplerDepthCompare;
+    ElementFlags samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
-    std::vector<bool> imageWritten;
-    std::vector<bool> imageDepthCompare;
-    std::vector<bool> imageAtomic;
-    std::vector<bool> imageAtomic64;
+    ElementFlags imageWritten;
+    ElementFlags imageDepthCompare;
+    ElementFlags imageAtomic;
+    ElementFlags imageAtomic64;
     std::vector<DescriptorImageShape> imageShapes;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
-    std::vector<bool> bufferAtomic;
+    ElementFlags bufferAtomic;
     // Guest buffer elements the shader may store to through this V# (any store or atomic in the
     // program, whatever its offset), one entry per element of a GuestBuffers binding, empty
     // otherwise. A false entry is proved: every access of that element is a load. A driver may then
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
-    std::vector<bool> bufferWritten;
-    std::vector<bool> samplerUnnormalized;
-    std::vector<bool> samplerIntegerBorder;
-    std::vector<bool> samplerCoordinatesIgnored;
-    std::vector<bool> imageUnnormalized;
-    std::vector<bool> imageUnnormalizedBaseLevel;
+    ElementFlags bufferWritten;
+    ElementFlags samplerUnnormalized;
+    ElementFlags samplerIntegerBorder;
+    ElementFlags samplerCoordinatesIgnored;
+    ElementFlags imageUnnormalized;
+    ElementFlags imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
-    std::vector<bool> bufferRead;
+    ElementFlags bufferRead;
     std::vector<std::uint32_t> bufferExtent;
 };
 
@@ -627,6 +782,8 @@ public:
     [[nodiscard]] std::vector<std::uint32_t> Copy() const { return {Words().begin(), Words().end()}; }
     [[nodiscard]] std::size_t size() const { return Words().size(); }
     [[nodiscard]] bool empty() const { return Words().empty(); }
+    [[nodiscard]] bool Mapped() const { return holder != nullptr && holder->owner != nullptr; }
+    [[nodiscard]] std::size_t HeapBytes() const { return holder != nullptr && holder->owner == nullptr ? holder->words.capacity() * sizeof(std::uint32_t) : 0; }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }
     [[nodiscard]] std::uint32_t* data() { return Mutable().data(); }
     [[nodiscard]] const std::uint32_t& operator[](std::size_t index) const { return Words()[index]; }
@@ -712,6 +869,7 @@ struct CompiledShaderArtifact {
     bool stencilReplaySafe = false;
     bool bdaWrites = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
+    bool bindlessHeap = false;
     std::uint64_t variantId = 0;
 };
 
@@ -729,6 +887,9 @@ struct ShaderInvocation {
     std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
     std::uint64_t imageTableShader = 0;
     std::uint32_t imageTableFaults = 0;
+    bool hasDeferredDirectImage = false;
+    bool hasGuardedUnnormalizedWrap = false;
+    std::vector<BindlessImageAbi::TableRegistration> bindlessTables;
 };
 
 // What a Vulkan pipeline built from a result depends on besides the fixed-function state and the
@@ -802,6 +963,7 @@ struct MeshOutputBudget {
 [[nodiscard]] MeshOutputBudget MeshBarycentricOutputBudget(const MeshConfiguration& mesh, const MeshTargetLimits& limits, const MeshOutputUse& use);
 
 [[nodiscard]] RecompileResult Recompile(const RecompileRequest& request);
+[[nodiscard]] std::uint64_t ResultHeapBytes(const RecompileResult& result);
 
 struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);

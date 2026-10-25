@@ -5,9 +5,8 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
+#include <bit>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace GuestArena {
 
@@ -152,7 +152,7 @@ public:
                     const auto shared = pageOf(*slot);
                     if (slot->saved) {
                         std::memcpy(reinterpret_cast<void*>(base + at), slot->saved->bytes + slot->savedOffset, pageBytes);
-                        slot->saved.reset();
+                        restored(*slot);
                     }
                     shared->aliases.push_back(base + at);
                     views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, slot});
@@ -295,6 +295,10 @@ public:
             if (store) invalidate(*it->second.page, subpagesOf(it->first, address, end));
             else if (it->second.resident) forgetClean(it->first, it->first + pageBytes);
         }
+    }
+
+    std::pair<std::uint64_t, std::uint64_t> SavedMemory() const {
+        return {savedBytes.load(std::memory_order_relaxed), savedBlocks.load(std::memory_order_relaxed)};
     }
 
     void* MapAlias(std::uintptr_t address, std::size_t bytes) {
@@ -560,6 +564,8 @@ private:
         Section& operator=(const Section&) = delete;
         ~Section() { CloseHandle(handle); }
     };
+    static inline std::atomic<std::uint64_t> savedBytes{0};
+    static inline std::atomic<std::uint64_t> savedBlocks{0};
     struct Saved {
         unsigned char* bytes = nullptr;
         std::size_t length;
@@ -567,10 +573,17 @@ private:
         explicit Saved(std::size_t length) : length(length) {
             bytes = static_cast<unsigned char*>(VirtualAlloc(nullptr, length, MEM_RESERVE, PAGE_READWRITE));
             if (bytes == nullptr) fail("reserve unmapped direct memory");
+            savedBlocks.fetch_add(1, std::memory_order_relaxed);
         }
         Saved(const Saved&) = delete;
         Saved& operator=(const Saved&) = delete;
-        ~Saved() { VirtualFree(bytes, 0, MEM_RELEASE); }
+        ~Saved() {
+            VirtualFree(bytes, 0, MEM_RELEASE);
+            std::uint64_t pages = 0;
+            for (const auto word : committed) pages += static_cast<std::uint64_t>(std::popcount(word));
+            savedBytes.fetch_sub(pages * pageBytes, std::memory_order_relaxed);
+            savedBlocks.fetch_sub(1, std::memory_order_relaxed);
+        }
 
         void Commit(std::size_t offset) {
             const auto page = offset / pageBytes;
@@ -578,6 +591,16 @@ private:
             if ((committed[page >> 6] & bit) != 0) return;
             if (!VirtualAlloc(bytes + offset, pageBytes, MEM_COMMIT, PAGE_READWRITE)) fail("keep unmapped direct memory");
             committed[page >> 6] |= bit;
+            savedBytes.fetch_add(pageBytes, std::memory_order_relaxed);
+        }
+
+        void Decommit(std::size_t offset) {
+            const auto page = offset / pageBytes;
+            const auto bit = std::uint64_t{1} << (page & 63);
+            if ((committed[page >> 6] & bit) == 0) return;
+            if (!VirtualFree(bytes + offset, pageBytes, MEM_DECOMMIT)) fail("drop the saved copy of remapped direct memory");
+            committed[page >> 6] &= ~bit;
+            savedBytes.fetch_sub(pageBytes, std::memory_order_relaxed);
         }
     };
     struct Physical {
@@ -736,6 +759,11 @@ private:
         void* zeros = reinterpret_cast<void*>(base + viewBytes);
         if (!allocate(GetCurrentProcess(), zeros, pageBytes - viewBytes, MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) fail("replace guest placeholder past the end of a file with zero pages");
         if (!VirtualProtect(zeros, pageBytes - viewBytes, protection, &previous)) fail("protect guest pages past the end of a file");
+    }
+
+    static void restored(Physical& slot) {
+        if (slot.saved) slot.saved->Decommit(slot.savedOffset);
+        slot.saved.reset();
     }
 
     static bool blank(std::uintptr_t page) {

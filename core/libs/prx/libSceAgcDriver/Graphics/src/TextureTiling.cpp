@@ -7,6 +7,8 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 
 namespace AgcDriver::Graphics {
@@ -277,6 +279,58 @@ std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint
     return {block.blockSize, block.blockWidth, block.blockHeight};
 }
 
+namespace {
+
+std::array<std::uint32_t, 2> ComputeSwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor) {
+    const auto storedMode = EquationSwizzleMode(stored);
+    const auto viewedMode = EquationSwizzleMode(viewed);
+    if (storedMode == 0 || viewedMode == 0) return {0u, 0u};
+    const auto* storedEquation = FindTextureSwizzleEquation(storedMode, bytesPerElement);
+    const auto* viewedEquation = FindTextureSwizzleEquation(viewedMode, bytesPerElement);
+    const auto block = ThinBlockLayout(stored, bytesPerElement);
+    if (storedEquation == nullptr || viewedEquation == nullptr || ThinBlockLayout(viewed, bytesPerElement) != block || viewedPipeBankXor >= block[0] || viewedPipeBankXor % bytesPerElement != 0) return {0u, 0u};
+    const auto offset = [](const TextureSwizzleEquation& equation, std::uint32_t x, std::uint32_t y) {
+        std::uint32_t result = 0;
+        for (std::uint32_t bit = 0; bit < 16; ++bit) result |= static_cast<std::uint32_t>(std::popcount((x & equation.bits[bit] & 0xfffu) | ((y << 12u) & equation.bits[bit] & 0xfff000u)) & 1) << bit;
+        return result;
+    };
+    std::vector<std::uint32_t> element(block[0] / bytesPerElement, 0xffffffffu);
+    for (std::uint32_t y = 0; y < block[2]; ++y) {
+        for (std::uint32_t x = 0; x < block[1]; ++x) {
+            const auto at = offset(*storedEquation, x, y);
+            if (at >= block[0] || at % bytesPerElement != 0 || element[at / bytesPerElement] != 0xffffffffu) return {0u, 0u};
+            element[at / bytesPerElement] = (y << 16u) | x;
+        }
+    }
+    std::uint32_t columns = 0;
+    std::uint32_t rows = 0;
+    for (std::uint32_t y = 0; y < block[2]; ++y) {
+        for (std::uint32_t x = 0; x < block[1]; ++x) {
+            const auto at = offset(*viewedEquation, x, y) ^ viewedPipeBankXor;
+            if (at >= block[0] || at % bytesPerElement != 0 || element[at / bytesPerElement] == 0xffffffffu) return {0u, 0u};
+            columns |= x ^ (element[at / bytesPerElement] & 0xffffu);
+            rows |= y ^ (element[at / bytesPerElement] >> 16u);
+        }
+    }
+    return {std::bit_ceil(columns + 1u), std::bit_ceil(rows + 1u)};
+}
+
+}
+
+std::array<std::uint32_t, 2> SwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor) {
+    static std::mutex mutex;
+    static std::map<std::array<std::uint32_t, 4>, std::array<std::uint32_t, 2>> tiles;
+    const std::array<std::uint32_t, 4> key{static_cast<std::uint32_t>(stored), static_cast<std::uint32_t>(viewed), bytesPerElement, viewedPipeBankXor};
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = tiles.find(key); found != tiles.end()) return found->second;
+    }
+    const auto tile = ComputeSwizzleRemapTile(stored, viewed, bytesPerElement, viewedPipeBankXor);
+    std::lock_guard lock(mutex);
+    tiles.emplace(key, tile);
+    return tile;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CoveredMipBytes(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
     if (mip.tail || mip.width == 0 || mip.height == 0) return covered;
@@ -382,6 +436,10 @@ ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, s
     return result;
 }
 
+std::uint32_t FullMipChainLevels(std::uint32_t width, std::uint32_t height, std::uint32_t depth) {
+    return static_cast<std::uint32_t>(std::bit_width(std::max({width, height, depth, 1u})));
+}
+
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
     SurfaceGeometry geometry;
     if (descriptor.samples != 1u && descriptor.tileMode != TextureTileMode::kLinear) {
@@ -396,6 +454,7 @@ SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
         geometry.mips = ComputeMipLayout(descriptor.tileMode, descriptor.format, descriptor.width, descriptor.height, descriptor.mipCount);
         geometry.layers = depth;
         geometry.imageDepth = depth;
+        geometry.imageLevels = std::min(descriptor.mipCount, FullMipChainLevels(descriptor.width, descriptor.height, depth));
         geometry.guestBytes = ComputeSurfaceSize(geometry.mips, depth);
         geometry.layerBytes = geometry.guestBytes / depth;
         for (const auto& mip : geometry.mips) geometry.sliceLinearBytes = std::max(geometry.sliceLinearBytes, mip.linearOffset + mip.linearSize);
@@ -407,6 +466,7 @@ SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
         geometry.mips = thick.mips;
         geometry.layers = depth;
         geometry.imageDepth = depth;
+        geometry.imageLevels = std::min(descriptor.mipCount, FullMipChainLevels(descriptor.width, descriptor.height, depth));
         geometry.guestBytes = thick.guestBytes;
         geometry.sliceLinearBytes = thick.sliceLinearBytes;
         geometry.thick = descriptor.tileMode != TextureTileMode::kLinear;
@@ -441,6 +501,7 @@ SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
     const bool layered = descriptor.dimension == TextureDimension::k2DArray || descriptor.dimension == TextureDimension::k1DArray || descriptor.dimension == TextureDimension::kCube;
     geometry.layers = layered ? descriptor.depthOrLastArray + 1u : 1u;
     geometry.imageLayers = geometry.layers;
+    geometry.imageLevels = std::min(descriptor.mipCount, FullMipChainLevels(descriptor.width, descriptor.height, 1u));
     geometry.guestBytes = ComputeSurfaceSize(geometry.mips, geometry.layers);
     geometry.layerBytes = geometry.guestBytes / geometry.layers;
     for (const auto& mip : geometry.mips) geometry.sliceLinearBytes = std::max(geometry.sliceLinearBytes, mip.linearOffset + mip.linearSize);

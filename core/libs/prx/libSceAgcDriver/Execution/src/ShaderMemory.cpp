@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -7,6 +8,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -14,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -72,6 +75,11 @@ constexpr std::uint64_t WordWaitNanoseconds = 50000;
 bool WordwisePages() {
     static const bool wordwise = std::getenv("APS5_NO_WORDWISE_CAPTURE") == nullptr;
     return wordwise;
+}
+
+bool FastLazyWords() {
+    static const bool fast = std::getenv("APS5_NO_FAST_CAPTURE_WORDS") == nullptr;
+    return fast;
 }
 
 bool CaptureProfiled() {
@@ -163,6 +171,7 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
 }
 
 ShaderMemory::~ShaderMemory() {
+    MemoryStats::Add(MemoryStats::Counter::ShaderMemoryPages, -static_cast<std::int64_t>(pages.size() * sizeof(Page)), -static_cast<std::int64_t>(pages.size()));
     if (sharedPagePools() && !pages.empty()) {
         auto& shared = sharedPagePool<Page>();
         std::lock_guard lock(shared.mutex);
@@ -240,6 +249,7 @@ ShaderMemory::Page& ShaderMemory::addPage(std::size_t position, std::uint64_t ba
     owned->wordwise = false;
     owned->lazy = false;
     pages.insert(pages.begin() + static_cast<std::ptrdiff_t>(position), {base, owned.get()});
+    MemoryStats::Add(MemoryStats::Counter::ShaderMemoryPages, sizeof(Page));
     lastBase = base;
     lastPage = owned.release();
     return *lastPage;
@@ -264,10 +274,15 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             return page;
         }
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        GuestMemory::GuardRead(base, PageBytes);
-        GuestMemory::FlushGpuWrites(base, PageBytes);
+        if (GuestMemory::SpeculativeReader()) {
+            GuestMemory::Read(base, std::as_writable_bytes(std::span(page.words)), sizeof(std::uint32_t));
+            page.valid.SetAll();
+        } else {
+            GuestMemory::GuardRead(base, PageBytes);
+            GuestMemory::FlushGpuWrites(base, PageBytes);
+            page.lazy = true;
+        }
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
-        page.lazy = true;
     }
     return page;
 }
@@ -382,7 +397,7 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
         const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
         Page* page = nullptr;
         if (address % sizeof(std::uint32_t) == 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && !self.overlapsInitial(address, address + bytes)) page = &self.page(base);
-        if (page != nullptr && page->lazy) {
+        if (page != nullptr && page->lazy && FastLazyWords()) {
             const auto end = (index + words + BlockWords - 1u) / BlockWords * BlockWords;
             auto first = index / BlockWords * BlockWords;
             while (first < end) {
@@ -397,7 +412,7 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
                 first = last;
             }
         }
-        if (page != nullptr && (page->lazy || page->valid.All())) {
+        if (page != nullptr && ((page->lazy && FastLazyWords()) || page->valid.All())) {
             std::memcpy(values, page->words.data() + index, bytes);
             page->read.SetRun(index, words);
             page->recent.SetRun(index, words);
@@ -416,6 +431,12 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
 
 bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
     auto& self = *static_cast<ShaderMemory*>(context);
+    const bool answer = accessibleProbe(self, address, bytes);
+    if (self.recordProbes) self.probes.push_back({address, bytes, false, answer});
+    return answer;
+}
+
+bool ShaderMemory::accessibleProbe(ShaderMemory& self, std::uint64_t address, std::uint64_t bytes) {
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
     const auto end = address + bytes;
     while (address < end) {
@@ -440,13 +461,19 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
 
 bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
-    if (self.pendingWrite == nullptr || bytes == 0) return false;
+    if (self.pendingWrite == nullptr || bytes == 0) {
+        if (self.recordProbes) self.probes.push_back({address, bytes, true, false});
+        return false;
+    }
     const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
-    return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
+    const bool answer = policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
+    if (self.recordProbes) self.probes.push_back({address, bytes, true, answer});
+    return answer;
 }
 
 ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
+    if (GuestMemory::SpeculativeReader()) return {};
     if (bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || self.overlapsInitial(address, address + bytes)) return {};
     const auto fetched = self.pageAtOrAfter(address & ~static_cast<std::uint64_t>(PageBytes - 1));
     if (fetched != self.pages.size() && self.pages[fetched].first < address + bytes) return {};
@@ -460,6 +487,7 @@ ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::ui
 
 bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
     CaptureTotals().vouchCalls.fetch_add(1, std::memory_order_relaxed);
+    if (GuestMemory::SpeculativeReader()) return false;
     if (stamp.generation == 0 || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || stamp.layout != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
     if (pending != nullptr && pending(address, static_cast<std::size_t>(bytes), {}) != PendingWrite::None) return false;
     GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
@@ -672,7 +700,26 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     return capture;
 }
 
+// APS5_VERIFY_COLLECT_HEAP=1: every collect merges both ways and reports the first difference.
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnly) const {
+    const bool heap = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoCollectHeap);
+    auto result = merge(recentOnly, heap);
+    static const bool verify = std::getenv("APS5_VERIFY_COLLECT_HEAP") != nullptr;
+    if (!verify) return result;
+    static std::atomic<std::uint64_t> checked{0}, differed{0};
+    const auto other = merge(recentOnly, !heap);
+    std::size_t first = 0;
+    while (first < result.size() && first < other.size() && result[first].guestAddress == other[first].guestAddress && result[first].bytes.data() == other[first].bytes.data() && result[first].bytes.size() == other[first].bytes.size()) ++first;
+    const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (first != result.size() || first != other.size()) {
+        const auto bad = differed.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (bad <= 20) std::fprintf(stderr, "[collect-verify] DIFFERENT (%llu of %llu): %zu vs %zu regions, first difference at %zu: 0x%llx+%zu vs 0x%llx+%zu\n", static_cast<unsigned long long>(bad), static_cast<unsigned long long>(count), result.size(), other.size(), first, first < result.size() ? static_cast<unsigned long long>(result[first].guestAddress) : 0ull, first < result.size() ? result[first].bytes.size() : 0u, first < other.size() ? static_cast<unsigned long long>(other[first].guestAddress) : 0ull, first < other.size() ? other[first].bytes.size() : 0u);
+    }
+    if ((count & 0xffffu) == 0u) std::fprintf(stderr, "[collect-verify] %llu collects checked, %llu different\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(differed.load(std::memory_order_relaxed)));
+    return result;
+}
+
+std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::merge(bool recentOnly, bool heap) const {
     struct Cursor {
         const ShaderRecompiler::SrtGuestWords* words;
         std::size_t run;
@@ -688,11 +735,27 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnl
     std::vector<ShaderRecompiler::MemoryRegion> result;
     result.reserve((recentOnly ? 0u : initial.size()) + pages.size() + runs);
     auto next = recentOnly ? initial.end() : initial.begin();
+    // The cursors by their next run's address, then their position (the scan below keeps the first of equal
+    // addresses), so the merge takes the lowest at once: the scan over every cursor for each region emitted was
+    // ~60 % of collect (best141, ~2 % of the queue worker). APS5_NO_COLLECT_HEAP=1 (runtime switch) scans.
+    using Key = std::pair<std::uint64_t, std::size_t>;
+    std::vector<Key> order;
+    if (heap) {
+        order.reserve(cursors.size());
+        for (std::size_t i = 0; i < cursors.size(); ++i) {
+            if (cursors[i].run < cursors[i].words->runs.size()) order.push_back({cursors[i].words->runs[cursors[i].run].first, i});
+        }
+        std::ranges::make_heap(order, std::greater<>{});
+    }
     const auto emitBefore = [&](std::uint64_t address) {
         while (true) {
             Cursor* lowest = nullptr;
-            for (auto& cursor : cursors) {
-                if (cursor.run < cursor.words->runs.size() && (lowest == nullptr || cursor.words->runs[cursor.run].first < lowest->words->runs[lowest->run].first)) lowest = &cursor;
+            if (heap) {
+                if (!order.empty()) lowest = &cursors[order.front().second];
+            } else {
+                for (auto& cursor : cursors) {
+                    if (cursor.run < cursor.words->runs.size() && (lowest == nullptr || cursor.words->runs[cursor.run].first < lowest->words->runs[lowest->run].first)) lowest = &cursor;
+                }
             }
             const auto run = lowest != nullptr ? lowest->words->runs[lowest->run].first : std::numeric_limits<std::uint64_t>::max();
             if (next != initial.end() && next->first < address && next->first < run) {
@@ -709,6 +772,14 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnl
                 }
                 lowest->at += count;
                 ++lowest->run;
+                if (heap) {
+                    std::ranges::pop_heap(order, std::greater<>{});
+                    order.pop_back();
+                    if (lowest->run < lowest->words->runs.size()) {
+                        order.push_back({lowest->words->runs[lowest->run].first, static_cast<std::size_t>(lowest - cursors.data())});
+                        std::ranges::push_heap(order, std::greater<>{});
+                    }
+                }
             } else {
                 return;
             }

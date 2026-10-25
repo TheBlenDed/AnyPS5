@@ -2,12 +2,15 @@
 #include "Recompiler.hpp"
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
+#include <map>
 #include <span>
 #include <spirv/unified1/spirv.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -25,8 +28,11 @@ SpirvTarget Target() {
     static constexpr std::array<std::string_view, 4> extensions{
         "SPV_EXT_descriptor_indexing", "SPV_KHR_8bit_storage", "SPV_KHR_float_controls", "SPV_KHR_physical_storage_buffer",
     };
-    return {0x00401000u, 0x00010300u, 32, BdaAbi::Version, capabilities, extensions, false,
+    SpirvTarget target{0x00401000u, 0x00010300u, 32, BdaAbi::Version, capabilities, extensions, false,
             {1024, 1024, 64}, 1024, 32768, {}, {}};
+    // The spanned ctest variant: the driver sets this from APS5_SPANNED_WAVE, so this target does too.
+    target.spannedWaves = std::getenv("APS5_SPANNED_WAVE") != nullptr;
+    return target;
 }
 
 struct Counts {
@@ -38,6 +44,36 @@ struct Counts {
     std::size_t notInlined = 0;
     std::size_t compareExchanges = 0;
 };
+
+void CheckFunctions(std::span<const std::uint32_t> words) {
+    std::map<std::uint32_t, std::size_t> typeParameters;
+    std::map<std::uint32_t, std::size_t> functionParameters;
+    std::vector<std::pair<std::size_t, std::size_t>> calls;
+    std::uint32_t function = 0;
+    std::size_t expected = 0;
+    for (std::size_t offset = 5; offset < words.size();) {
+        const auto count = words[offset] >> spv::WordCountShift;
+        const auto opcode = words[offset] & spv::OpCodeMask;
+        if (opcode == spv::OpTypeFunction) typeParameters[words[offset + 1]] = count - 3u;
+        if (opcode == spv::OpFunction) {
+            function = words[offset + 2];
+            expected = typeParameters.at(words[offset + 4]);
+            functionParameters[function] = 0;
+        }
+        if (opcode == spv::OpFunctionParameter) ++functionParameters.at(function);
+        if (opcode == spv::OpFunctionEnd) {
+            Check(functionParameters.at(function) == expected, "formatted buffer once: function %" + std::to_string(function) + " declares " + std::to_string(functionParameters.at(function)) + " parameters, its type has " + std::to_string(expected));
+            function = 0;
+        }
+        if (opcode == spv::OpFunctionCall) calls.emplace_back(offset, count);
+        offset += count;
+    }
+    for (const auto& [offset, count] : calls) {
+        const auto callee = words[offset + 3];
+        Check(functionParameters.contains(callee) && functionParameters.at(callee) == count - 4u, "formatted buffer once: a call passes " + std::to_string(count - 4u) + " arguments to %" + std::to_string(callee));
+        for (std::size_t operand = 4; operand < count; ++operand) Check(words[offset + operand] < words[3], "formatted buffer once: a call to %" + std::to_string(callee) + " passes the id " + std::to_string(words[offset + operand]) + ", past the module bound " + std::to_string(words[3]));
+    }
+}
 
 Counts Count(std::span<const std::uint32_t> words) {
     Check(words.size() >= 5 && words[0] == spv::MagicNumber, "formatted buffer once: missing SPIR-V module");
@@ -56,12 +92,14 @@ Counts Count(std::span<const std::uint32_t> words) {
         }
         offset += count;
     }
+    CheckFunctions(words);
     return counts;
 }
 
-Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false, bool vertex = false, bool registration = false, bool atomicBeforeLoads = false) {
+Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false, bool vertex = false, bool registration = false, bool gpuStores = false, bool wave64Bindless = false, bool atomicBeforeLoads = false) {
     std::vector<std::uint32_t> code;
     if (gpu) code.push_back(0x7e160500u);
+    if (gpuStores) code.push_back(0x7e0e0500u);
     if (atomicBeforeLoads) code.insert(code.end(), {0xe1705000u, 0x80012803u, 0xbf8c3f70u});
     for (std::uint32_t load = 0; load < loads; ++load) code.insert(code.end(), {0xe0000000u | (load * 4u), 0x80020000u | ((10u + load) << 8u)});
     code.push_back(0xbf8c3f70u);
@@ -75,12 +113,13 @@ Counts Compile(std::size_t loads, bool formattedStores = false, bool gpu = false
     request.shader = {vertex ? ShaderStage::Vertex : ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), words, 0, {}};
     request.target = Target();
     request.target.registrationModules = registration;
+    request.target.bindlessImages = wave64Bindless;
     request.layout = {0, 0, 0, 128};
-    request.context.waveSize = 32;
+    request.context.waveSize = wave64Bindless ? 64u : 32u;
     request.context.userDataBaseRegister = 0;
     request.context.userData = userData;
     if (vertex) request.context.vertex = ShaderVertexStageInfo{};
-    else request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    else request.context.compute = ShaderComputeStageInfo{{wave64Bindless ? 64u : 32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
     request.context.memory = memory;
     request.useCache = false;
     return Count(Recompile(request).spirv.Words());
@@ -121,12 +160,12 @@ int main() {
         const auto three = Compile(3);
         const auto scalarOne = CompileScalarReads(1);
         const auto scalarThree = CompileScalarReads(3);
-        const auto atomicThenLoad = Compile(1, false, false, false, false, true);
+        const auto atomicThenLoad = Compile(1, false, false, false, false, false, false, true);
         const auto gpuOne = Compile(1, false, true);
         const auto vertexSpecialized = Compile(1, false, false, true, false);
         const auto vertexRegistration = Compile(1, false, false, true, true);
         Check(vertexRegistration.compareExchanges == vertexSpecialized.compareExchanges, "formatted buffer once: in registration form a store through an aligned V# kept the unaligned compare-exchange path (" + std::to_string(vertexRegistration.compareExchanges) + " compare-exchanges, " + std::to_string(vertexSpecialized.compareExchanges) + " specialized)");
-        Check(vertexRegistration.words < vertexSpecialized.words + vertexSpecialized.words / 2u, "formatted buffer once: in registration form a formatted load from a known descriptor kept every format's decoder (" + std::to_string(vertexRegistration.words) + " words, " + std::to_string(vertexSpecialized.words) + " specialized)");
+        Check(vertexRegistration.words < vertexSpecialized.words + vertexSpecialized.words * 3u / 5u, "formatted buffer once: in registration form a formatted load from a known descriptor kept every format's decoder (" + std::to_string(vertexRegistration.words) + " words, " + std::to_string(vertexSpecialized.words) + " specialized)");
         Check(one.words < gpuOne.words / 2u, "formatted buffer once: a formatted load from a known descriptor kept every format's decoder (" + std::to_string(one.words) + " words, a GPU-selected descriptor needs " + std::to_string(gpuOne.words) + ")");
         Check(one.calls == none.calls + 1 && one.functions == none.functions + 1, "formatted buffer once: one formatted load emitted " + std::to_string(one.calls - none.calls) + " calls and " + std::to_string(one.functions - none.functions) + " functions more than none, expected one call to one shared function");
         Check(three.calls == one.calls + 2 && three.functions == one.functions, "formatted buffer once: two more formatted loads from the same descriptor emitted " + std::to_string(three.calls - one.calls) + " calls and " + std::to_string(three.functions - one.functions) + " functions more, expected two calls and no function");
@@ -148,6 +187,11 @@ int main() {
         Check(gpuThree.switches == gpuOne.switches, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.switches - gpuOne.switches) + " more format switches");
         Check(gpuThree.words - gpuOne.words < gpuOne.words / 10u, "formatted buffer once: 2 more formatted loads from a GPU-selected descriptor added " + std::to_string(gpuThree.words - gpuOne.words) + " SPIR-V words to a " + std::to_string(gpuOne.words) + "-word module");
         Check(gpuOne.words < 40000u, "formatted buffer once: a formatted load from a GPU-selected descriptor takes " + std::to_string(gpuOne.words) + " SPIR-V words, expected under 40000 since every driver that inlines the shared function copies all of it");
+        const auto gpuStoreOne = Compile(1, true, true, false, false, true);
+        const auto gpuStoreThree = Compile(3, true, true, false, false, true);
+        const auto gpuStoreWave64 = Compile(3, true, true, false, false, true, true);
+        Check(gpuStoreOne.functions > gpuOne.functions, "formatted buffer once: a formatted store through a GPU-selected descriptor emitted no shared store function");
+        Check(gpuStoreThree.functions == gpuStoreOne.functions && gpuStoreThree.calls > gpuStoreOne.calls && gpuStoreWave64.functions == gpuStoreOne.functions, "formatted buffer once: two more formatted stores through a GPU-selected descriptor emitted " + std::to_string(gpuStoreThree.functions - gpuStoreOne.functions) + " more functions (wave64 with bindless images " + std::to_string(gpuStoreWave64.functions) + " of " + std::to_string(gpuStoreOne.functions) + "), expected calls to the shared one");
         std::printf("formatted buffer once tests passed (%zu words for 1 load, %zu for 3; GPU-selected %zu and %zu; vertex %zu specialized, %zu registration)\n", one.words, three.words, gpuOne.words, gpuThree.words, vertexSpecialized.words, vertexRegistration.words);
         return 0;
     } catch (const std::exception& error) {

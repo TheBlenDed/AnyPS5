@@ -30,6 +30,8 @@
 #include <map>
 #include <cstdio>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 extern "C" std::uint64_t GuestImageSegmentBytes_nid_no_patch();
 extern "C" void* APS5_VABI mmap_nid_postfix(void* address, std::size_t length, int protection, int flags, int descriptor, std::int64_t offset) noexcept;
@@ -535,16 +537,24 @@ int APS5_VABI sceKernelBatchMap2(KernelBatchMapEntry* entries, int num_entries, 
  constexpr int OpTypeProtect = 4;
  int processed = 0;
  int result = 0;
+ std::optional<GuestAllocations::Mutation> mapping;
+ std::vector<std::pair<uintptr_t, size_t>> mappedDirect;
+ const auto closeMapping = [&] {
+  mapping.reset();
+  for (const auto& [start, length] : mappedDirect) _releaseFlexible(start, length);
+  mappedDirect.clear();
+ };
  for (; processed < num_entries; ++processed) {
   auto& entry = entries[processed];
   if (entry.length == 0 || entry.operation < OpMapDirect || entry.operation > OpTypeProtect) {
    result = SCE_KERNEL_ERROR_EINVAL;
    break;
   }
+  if (entry.operation != OpMapDirect) closeMapping();
   switch (entry.operation) {
   case OpMapDirect:
-   result = DoMapDirect(&entry.start, entry.length, static_cast<uint8_t>(entry.protection), flags, static_cast<int64_t>(entry.offset), 0);
-   if (result == 0) _releaseFlexible(reinterpret_cast<uintptr_t>(entry.start), entry.length);
+   result = DoMapDirect(mapping, &entry.start, entry.length, static_cast<uint8_t>(entry.protection), flags, static_cast<int64_t>(entry.offset), 0);
+   if (result == 0) mappedDirect.emplace_back(reinterpret_cast<uintptr_t>(entry.start), entry.length);
    break;
   case OpUnmap:
    result = sceKernelMunmap(reinterpret_cast<uint64_t>(entry.start), entry.length);
@@ -561,6 +571,7 @@ int APS5_VABI sceKernelBatchMap2(KernelBatchMapEntry* entries, int num_entries, 
   }
   if (result != 0) break;
  }
+ closeMapping();
  if (num_entries_out) *num_entries_out = processed;
  return result;
 }

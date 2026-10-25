@@ -184,11 +184,11 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     if (imageTables || samplerTables) {
         addBinding(next, DescriptorBindingKind::ImageTableMap);
     }
-    if (imageTables) {
+    if (std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable && image.resourceClass == ImageResourceClass::Sampled; })) {
         addBinding(next, DescriptorBindingKind::ImageTable);
     }
     if (std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable && image.resourceClass == ImageResourceClass::Storage && image.tableOperation == TableOperation::Supported; })) {
-        addBinding(next, DescriptorBindingKind::ImageStorageTable);
+        addBinding(next, DescriptorBindingKind::StorageImageTable);
     }
 
     if (next.ShaderDataDwords() != 0u && !next.UsesPushData()) {

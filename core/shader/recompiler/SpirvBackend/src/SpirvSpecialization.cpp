@@ -631,6 +631,7 @@ public:
             changed |= prune();
             changed |= propagateCopies();
         }
+        removeDeadFunctions();
         shareConstants();
         removeDeadComputations();
         removeUnreachableBlocks();
@@ -666,6 +667,7 @@ private:
         if (instruction.size() < 4u) return std::nullopt;
         const auto* type = types.find(instruction[1]);
         if (type == nullptr || type->width > 32u) return std::nullopt;
+        if (op == spv::OpIMul && instruction.size() == 5u && (value(instruction[3]) == 0u || value(instruction[4]) == 0u)) return 0u;
         if (op == spv::OpLoad && instruction.size() == 4u) {
             const auto* pointer = constPointers.find(instruction[3]);
             if (pointer == nullptr) return std::nullopt;
@@ -804,7 +806,14 @@ private:
             const auto bits = type.width == 32u ? *result : *result & ((1u << type.width) - 1u);
             values[instruction[2]] = bits;
             const auto [existing, created] = canonical.emplace(std::pair{instruction[1], bits}, instruction[2]);
-            if (!created) aliases.emplace(instruction[2], existing->second);
+            if (op == spv::OpCopyObject) {
+                const auto* source = aliases.find(instruction[3]);
+                const auto target = source != nullptr ? *source : instruction[3];
+                aliases.emplace(instruction[2], target);
+                if (created) existing->second = target;
+            } else if (!created) {
+                aliases.emplace(instruction[2], existing->second);
+            }
             constants.push_back(type.boolean ? Make(bits != 0u ? spv::OpConstantTrue : spv::OpConstantFalse, {instruction[1], instruction[2]}) : Make(spv::OpConstant, {instruction[1], instruction[2], bits}));
             instruction.clear();
             changed = true;
@@ -1006,6 +1015,20 @@ private:
             removed.insert(id);
             return true;
         });
+        for (bool changed = true; changed;) {
+            changed = false;
+            const auto live = referencedIds();
+            for (auto& instruction : instructions) {
+                if (instruction.empty()) continue;
+                const auto op = Opcode(instruction);
+                if (op != spv::OpConstant && op != spv::OpConstantTrue && op != spv::OpConstantFalse && op != spv::OpConstantComposite && op != spv::OpConstantNull) continue;
+                const auto id = Result(instruction);
+                if (live.contains(id)) continue;
+                removed.insert(id);
+                instruction.clear();
+                changed = true;
+            }
+        }
     }
 
     void orderPhis() {
@@ -1090,6 +1113,40 @@ private:
             VisitInputs(instruction, [&](std::size_t index) { instruction[index] = resolve(instruction[index]); });
         }
         return true;
+    }
+
+    void removeDeadFunctions() {
+        std::map<std::uint32_t, std::vector<std::uint32_t>> calls;
+        std::vector<std::uint32_t> pending;
+        std::uint32_t function = 0;
+        for (const auto& instruction : instructions) {
+            const auto op = Opcode(instruction);
+            if (op == spv::OpEntryPoint) pending.push_back(instruction.at(2));
+            if (op == spv::OpFunction) function = instruction.at(2);
+            if (op == spv::OpFunctionCall) calls[function].push_back(instruction.at(3));
+            if (op == spv::OpFunctionEnd) function = 0;
+            if (op == spv::OpDecorate && instruction.at(2) == spv::DecorationLinkageAttributes) return;
+            if (op == spv::OpDecorateId || op == spv::OpGroupDecorate || op == spv::OpGroupMemberDecorate) return;
+        }
+        if (pending.empty()) return;
+        std::set<std::uint32_t> live;
+        while (!pending.empty()) {
+            const auto callee = pending.back();
+            pending.pop_back();
+            if (!live.insert(callee).second) continue;
+            if (const auto found = calls.find(callee); found != calls.end()) {
+                pending.insert(pending.end(), found->second.begin(), found->second.end());
+            }
+        }
+        for (auto& instruction : instructions) {
+            const auto op = Opcode(instruction);
+            if (op == spv::OpFunction) function = instruction.at(2);
+            if (function != 0 && !live.contains(function)) {
+                if (const auto result = Result(instruction)) removed.insert(result);
+                instruction.clear();
+            }
+            if (op == spv::OpFunctionEnd) function = 0;
+        }
     }
 
     void removeDeadComputations() {

@@ -35,6 +35,8 @@ class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
 class VertexInputCache;
+class BindlessTable;
+class TextureService;
 
 class PipelineCacheSynchronization {
 public:
@@ -190,10 +192,14 @@ struct Context {
     VkQueue sparseQueue = VK_NULL_HANDLE;
     std::mutex* sparseQueueMutex = nullptr;
     VkQueue settleQueue = VK_NULL_HANDLE;
+    // The async compute lane's queue (Recorder lanes, APS5_ASYNC_LANE): a third queue of `queueFamily`.
+    VkQueue asyncQueue = VK_NULL_HANDLE;
+    VkCommandPool asyncPool = VK_NULL_HANDLE;
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
+    bool integratedGpu = false;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage) = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
@@ -254,6 +260,8 @@ struct Context {
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
+    BindlessTable* bindlessTable = nullptr;
+    TextureService* textureService = nullptr;
     bool viewportIndexLayer = false;
     bool demoteToHelperInvocation = false;
     bool earlyFragmentSampleMaskTestBeforeSampleCounting = false;
@@ -371,8 +379,9 @@ inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
     else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
 }
 
-std::uint32_t ImageTableCapacity(const Context& context);
-std::uint32_t StorageTableCapacity(const Context& context);
+std::uint32_t ImageTableCapacity(const Context& context, std::uint32_t storageTableDescriptors = 0u);
+std::uint32_t StorageImageTableCapacity(const Context& context);
+std::uint32_t StorageImageTableDescriptorCount(const Context& context, std::uint32_t elements, bool hasSampledTable);
 std::uint32_t SamplerTableCapacity(const Context& context);
 bool ImageTableUpdateAfterBind(const Context& context);
 bool SamplerTableUpdateAfterBind(const Context& context);

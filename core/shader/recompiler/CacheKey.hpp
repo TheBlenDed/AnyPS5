@@ -183,6 +183,7 @@ private:
         append(key, value.threadIdComponentCount);
         append(key, value.PartialGroups());
         append(key, value.scratchDwords);
+        append(key, value.singleWorkgroup);
     }
 
     static void append(std::vector<std::uint64_t>& key, const ShaderPixelStageInfo& value) {
@@ -240,6 +241,8 @@ private:
         append(key, value.fetchBufferReg);
         append(key, value.fetchEmbedded);
         append(key, value.paClVsOutCntl);
+        append(key, value.drawBaseVertexSgpr);
+        append(key, value.drawStartInstanceSgpr);
         append(key, value.depthRemapMode);
         append(key, value.pointList);
         append(key, std::bit_cast<std::uint32_t>(value.pointSize));
@@ -321,7 +324,9 @@ private:
         append(key, value.registrationWordLimit);
         append(key, value.vertexSubgroups);
         append(key, value.float16DenormPreserve);
+        append(key, value.bindlessImages);
         append(key, value.spannedWaves);
+        append(key, value.fusedFma);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);
         append(key, value.waveLdsMemoryBarriers);

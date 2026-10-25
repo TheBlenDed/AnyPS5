@@ -56,6 +56,7 @@ void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaUnmapAlias_nid_postfix(void* alias);
 bool GuestArenaResidentSpan_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end);
 void GuestArenaForgetSection_nid_postfix(void* section);
+void GuestArenaSavedMemory_nid_postfix(std::uint64_t* bytes, std::uint64_t* blocks);
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes);
 void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes);
 bool GuestArenaForgetReusableSection_nid_no_patch(void* section);
@@ -67,6 +68,7 @@ bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t byt
 #endif
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
+void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);
 

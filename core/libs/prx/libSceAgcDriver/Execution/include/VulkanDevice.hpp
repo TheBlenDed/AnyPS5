@@ -24,6 +24,8 @@ namespace AgcDriver {
 
 namespace Graphics {
 class StorageTexture;
+class TextureService;
+struct PreparedDraw;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -77,6 +79,10 @@ public:
     std::uint32_t MaxFragmentInputComponents() const;
     const std::uint32_t* WorkGroupCountLimit() const;
     std::uint32_t VendorId() const;
+    bool BindlessImagesEnabled() const;
+    bool TextureServiceRunning() const;
+    const Graphics::TextureService* BindlessService() const;
+    void BindlessPresentWait();
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
     bool ComputeFullSubgroups() const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
@@ -105,6 +111,8 @@ public:
     bool CanWaitUnlocked() const;
     std::uint64_t SubmitAndEpoch();
     void WaitRecorded(std::uint64_t serial);
+    std::uint64_t SubmittedEpoch() const;
+    bool WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();
@@ -131,7 +139,9 @@ public:
     // batches are retired first, and it waits only for stores a batch's completion makes on the
     // CPU (a copied buffer's write-back, a deferred label). Debug aid: APS5_FILL_SYNC=1 waits for
     // every recorded store over the range.
-    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern);
+    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, bool reap = true);
+    // Graphics::NoteHtileMaskOnGpu for a recorded HTILE mask clear kernel (under the GPU lock).
+    void NoteHtileMask(std::uint64_t address, std::size_t bytes, std::uint32_t mask, std::uint32_t value) const;
     bool DumpSamplesOnGpu(std::uint64_t address);
     // Copies `bytes` of guest memory from `source` to `destination` (disjoint ranges) in place of the
     // engine's memcpy kernel (Driver.cpp copyBuffer). `path` 0: copied on the CPU at once, when
@@ -268,6 +278,8 @@ public:
     struct PresentStatistics {
         std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops;
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
+        // The part of gpuBusyMs in batches of the async compute lane (APS5_ASYNC_LANE).
+        double asyncBusyMs;
     };
     static PresentStatistics PresentCounts();
     struct PresyncStatistics {
@@ -281,10 +293,13 @@ public:
     // records. Null when nothing is prepared: the resource cache may serve the dispatch (its
     // Revalidate stays under the mutex), or APS5_LOCKED_BUILD=1 keeps the whole build under it as
     // before. `shader` and `snapshots` must outlive the dispatch.
+    void PrimeBindlessDraw(std::span<const Graphics::CompiledShader> shaders) const;
     std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0);
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);
+    double WarmComputePipeline(const ShaderRecompiler::RecompileResult& shader, std::uint64_t programAddress = 0, bool verifyDispatchLayout = false);
+    std::vector<std::uint32_t> PlannedComputeLayoutKey(const ShaderRecompiler::RecompileResult& shader);
     // `recipe`, when given, receives the Recipe a successful call built for its dispatch-cache
     // variant (design_cpu_final M4): only when the resource cache served or took the object
     // (reusable, cacheable) and recipes are on (APS5_NO_DISPATCH_RECIPE=1 builds none); else null.
@@ -334,7 +349,17 @@ public:
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, Graphics::PreparedDraw* prepared = nullptr, const Graphics::AheadDraw* ahead = nullptr);
+    // S1: the unlocked part of a draw's resource build, made ahead of the draw (Graphics::PrepareDraw).
+    std::shared_ptr<Graphics::PreparedDraw> PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders);
+    // The draw's HTILE pre-sync (APS5_NO_HTILE_PRESYNC=1 off): when the depth target's store-back
+    // read would wait for a pending GPU write (Graphics::HtileStoreBackWaits), the newest such batch
+    // is learned under the mutex (the open batch is submitted when it is that batch) and waited for
+    // without it. Returns the serial waited for (0: none); the draw reaps up to it under its lock,
+    // so the read then finds the writes landed. Only a wait: results are unchanged.
+    std::uint64_t PresyncDrawDepth(const Graphics::State& graphics);
+    // #6188: the draw state a draw-ahead worker prepares for an entry it compiled ahead (Graphics::PrepareAheadDraw).
+    std::shared_ptr<const Graphics::AheadDraw> PrepareAheadDraw(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
@@ -369,8 +394,10 @@ private:
     VulkanDevice(const PresentationWindow* window, bool compileOnly);
     friend struct VulkanDeviceTestAccess;
     VkPipeline splitComputePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, ComputePipelineObjects& objects, const std::array<std::uint32_t, 3>& base);
+    const Graphics::Context& graphicsContext(std::optional<Graphics::Context>& built) const;
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
+    std::vector<VkDescriptorSetLayout> computeSetLayouts(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout) const;
     // Body of Dispatch and DispatchIndirect: `arguments` 0 dispatches x, y, z groups.
     IndirectOutcome dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipe, const std::array<std::uint32_t, 3>& threadGroup = {}, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
     IndirectOutcome recordCompletedDispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, DispatchCompletion& completion);
@@ -391,6 +418,8 @@ private:
     void ensureHdrScaler(VkFormat source);
     void useSurfaceFormat(VkSurfaceFormatKHR format);
     struct State;
+    // The startup probe behind SpirvTarget::fusedFma (VulkanDevice.cpp).
+    static bool fusedFmaProbe(const State& device, std::uint32_t family);
     std::unique_ptr<State> state;
     std::uint64_t serial;
 };

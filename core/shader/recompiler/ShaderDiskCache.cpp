@@ -31,8 +31,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -85,10 +87,10 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 280, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 544, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 656, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(ShaderInvocation) == 240, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 576, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(DescriptorBinding) == 864, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -141,7 +143,7 @@ constexpr std::size_t fieldCount() {
 
 static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
-static_assert(fieldCount<ImageResource>() == 42, "ImageResource changed: update the info encoder");
+static_assert(fieldCount<ImageResource>() == 43, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
@@ -150,7 +152,7 @@ static_assert(fieldCount<IrResourcePlan>() == 24, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<TableColumn>() == 18, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 19, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 5, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
@@ -158,6 +160,7 @@ static_assert(fieldCount<UniformFill>() == 5, "UniformFill changed: update the p
 static_assert(fieldCount<UniformFillPlan>() == 2, "UniformFillPlan changed: update the plan encoder");
 
 constexpr std::uint32_t FileMagic = 0x43535041u;
+constexpr std::uint32_t SubstituteMagic = 0x53425041u;
 
 struct FileHeader {
     std::uint32_t magic;
@@ -172,6 +175,49 @@ struct FileHeader {
 std::size_t PayloadOffset(std::size_t keyBytes) {
     constexpr std::size_t alignment = 8;
     return (sizeof(FileHeader) + keyBytes + alignment - 1) / alignment * alignment;
+}
+
+class SharedPlanTable {
+public:
+    std::shared_ptr<const IrResourcePlan> Get(std::span<const std::byte> payload, std::uint64_t shaderHash) {
+        const Key key{HashBytes(payload), HashBytes(payload, 0x5eed0003ull), payload.size(), shaderHash};
+        {
+            std::lock_guard lock(mutex);
+            if (const auto found = plans.find(key); found != plans.end()) {
+                if (auto plan = found->second.lock()) return plan;
+            }
+        }
+        IrResourcePlan decoded;
+        if (!DecodePlan(payload, decoded)) return nullptr;
+        decoded.shaderHash = shaderHash;
+        auto plan = std::make_shared<const IrResourcePlan>(std::move(decoded));
+        std::lock_guard lock(mutex);
+        auto& slot = plans[key];
+        if (auto existing = slot.lock()) return existing;
+        slot = plan;
+        if (++inserts % 1024u == 0u) std::erase_if(plans, [](const auto& entry) { return entry.second.expired(); });
+        return plan;
+    }
+
+private:
+    struct Key {
+        std::uint64_t low;
+        std::uint64_t high;
+        std::uint64_t bytes;
+        std::uint64_t shaderHash;
+        bool operator==(const Key&) const = default;
+    };
+    struct KeyHash {
+        std::size_t operator()(const Key& key) const { return static_cast<std::size_t>(key.low ^ (key.high * 0x9e3779b97f4a7c15ull) ^ (key.shaderHash * 0xff51afd7ed558ccdull)); }
+    };
+    std::mutex mutex;
+    std::unordered_map<Key, std::weak_ptr<const IrResourcePlan>, KeyHash> plans;
+    std::uint64_t inserts = 0;
+};
+
+SharedPlanTable& sharedPlans() {
+    static SharedPlanTable table;
+    return table;
 }
 
 class MappedFile {
@@ -258,7 +304,7 @@ public:
         out.insert(out.end(), bytes.begin(), bytes.end());
     }
 
-    void Flags(const std::vector<bool>& flags) {
+    void Flags(const ElementFlags& flags) {
         Value<std::uint64_t>(flags.size());
         for (const bool flag : flags) Value(flag);
     }
@@ -359,10 +405,10 @@ public:
         return SharedSpirv(std::move(words));
     }
 
-    void Flags(std::vector<bool>& flags) {
+    void Flags(ElementFlags& flags) {
         const auto count = Count(1);
-        flags.assign(count, false);
-        for (std::size_t i = 0; i < count; ++i) flags[i] = Get<bool>();
+        flags.clear();
+        for (std::size_t i = 0; i < count; ++i) flags.push_back(Get<bool>());
     }
 
     void Text(std::string& text) {
@@ -527,6 +573,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.stencilReplaySafe);
     writer.Value(result.bdaWrites);
     writer.Value(result.stencilReferenceDword);
+    writer.Value(result.bindlessHeap);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -594,6 +641,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.stencilReplaySafe);
     reader.Value(result.bdaWrites);
     reader.Value(result.stencilReferenceDword);
+    reader.Value(result.bindlessHeap);
     result.variantId = 0;
 }
 
@@ -633,6 +681,19 @@ void encodeInvocation(Writer& writer, const ShaderInvocation& invocation) {
     });
     writer.Value(invocation.imageTableShader);
     writer.Value(invocation.imageTableFaults);
+    writer.Value(invocation.hasDeferredDirectImage);
+    writer.Value(invocation.hasGuardedUnnormalizedWrap);
+    writer.List(invocation.bindlessTables, [](Writer& out, const BindlessImageAbi::TableRegistration& table) {
+        out.Value(table.base);
+        out.Value(table.records);
+        out.Value(table.stride);
+        out.List(table.uses, [](Writer& use, const BindlessImageAbi::TableUse& entry) {
+            use.Value(entry.interfaceId);
+            use.Value(entry.samplerClass);
+            for (const auto word : entry.sampler) use.Value(word);
+        });
+        out.Value(table.dwords);
+    });
 }
 
 void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
@@ -674,6 +735,19 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
     });
     reader.Value(invocation.imageTableShader);
     reader.Value(invocation.imageTableFaults);
+    reader.Value(invocation.hasDeferredDirectImage);
+    reader.Value(invocation.hasGuardedUnnormalizedWrap);
+    reader.List(invocation.bindlessTables, 24, [](Reader& in, BindlessImageAbi::TableRegistration& table) {
+        in.Value(table.base);
+        in.Value(table.records);
+        in.Value(table.stride);
+        in.List(table.uses, 28, [](Reader& use, BindlessImageAbi::TableUse& entry) {
+            use.Value(entry.interfaceId);
+            use.Value(entry.samplerClass);
+            for (auto& word : entry.sampler) use.Value(word);
+        });
+        in.Value(table.dwords);
+    });
 }
 
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
@@ -765,6 +839,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.emulatedCompare);
         out.Value(image.table);
         out.Value(image.tableOperation);
+        out.Value(image.levelUses);
         out.Value(image.targetMerge);
     });
     writer.Value(!info.runtimeImageModes.empty());
@@ -830,7 +905,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
-    reader.List(info.images, 77, [](Reader& in, ImageResource& image) {
+    reader.List(info.images, 78, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
         in.Value(image.firstUsePc);
         in.Value(image.resourceClass);
@@ -872,6 +947,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.emulatedCompare);
         in.Value(image.table);
         in.Value(image.tableOperation);
+        in.Value(image.levelUses);
         in.Value(image.targetMerge);
     });
     bool preparedImageModes = false;
@@ -1109,6 +1185,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         });
         out.Value(column.foldedAddend);
         out.Value(column.foldedCarry);
+        out.Value(column.dynamic);
         out.Value(column.selected);
         out.Value(column.selection);
     });
@@ -1271,6 +1348,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         });
         in.Value(column.foldedAddend);
         in.Value(column.foldedCarry);
+        in.Value(column.dynamic);
         in.Value(column.selected);
         in.Value(column.selection);
         source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
@@ -1331,8 +1409,12 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_DISK_PLANS",
     "APS5_NO_PERF_DOM_INTERSECTION",
     "APS5_NO_PERF_ITERATION_SELECTION",
+    "APS5_NO_PERF_LAZY_CAPTURE_PLAN",
     "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_RESULT_MEMO",
+    "APS5_RESULT_MEMO_SOURCE_MIB",
+    "APS5_NO_UNDECLARED_CONSTANT_FILTER",
+    "APS5_TRACE_SPECIALIZATION",
     "APS5_NO_TABLE_RESOLUTION_REUSE",
     "APS5_NO_TABLE_SNAPSHOT_REUSE",
 };
@@ -1416,6 +1498,18 @@ public:
         return load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) { return DecodePlanEntry(file, key, plan); }, planHits, planMisses, planLoadFailures);
     }
 
+    std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash) {
+        std::shared_ptr<const IrResourcePlan> plan;
+        load(key, [&](std::span<const std::byte> file, std::shared_ptr<const void>) {
+            std::span<const std::byte> payload;
+            const auto status = unwrapEntry(file, key, payload);
+            if (status != LoadStatus::Loaded) return status;
+            plan = sharedPlans().Get(payload, shaderHash);
+            return plan != nullptr ? LoadStatus::Loaded : LoadStatus::Rejected;
+        }, planHits, planMisses, planLoadFailures);
+        return plan;
+    }
+
     void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
         enqueue({std::move(key), std::move(variant), nullptr});
     }
@@ -1437,6 +1531,7 @@ public:
         if (DecodeEntry(bytes, key, *persisted, std::move(mapped)) != LoadStatus::Loaded) return nullptr;
         persisted->layout = variant.layout;
         persisted->artifact.variantId = variant.artifact.variantId;
+        persisted->substitutes = variant.substitutes;
         return persisted;
     }
 
@@ -1667,14 +1762,31 @@ private:
         runningWriters.fetch_sub(1, std::memory_order_acq_rel);
     }
 
-    void write(const Job& job) {
-        const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
-        if (!file.empty() && WriteFileAtomically(directory / EntryName(job.key), file)) {
-            (job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
-            bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+    void writeFailure(const Job& job, const char* reason) noexcept {
+        const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
+        if (failures >= 4) return;
+        if (job.plan != nullptr) {
+            std::fprintf(stderr, "[shader-disk-cache] cannot write resource plan (%zu key bytes): %.200s\n", job.key.size(), reason);
         } else {
-            const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
-            if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
+            std::fprintf(stderr, "[shader-disk-cache] cannot write artifact %llu (%zu key bytes): %.200s\n", static_cast<unsigned long long>(job.variant->artifact.variantId), job.key.size(), reason);
+        }
+    }
+
+    void write(const Job& job) noexcept {
+        try {
+            const auto file = job.plan != nullptr ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
+            if (file.empty()) {
+                writeFailure(job, "the resource plan does not own its values");
+            } else if (WriteFileAtomically(directory / EntryName(job.key), file)) {
+                (job.plan != nullptr ? planWrites : writes).fetch_add(1, std::memory_order_relaxed);
+                bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
+            } else {
+                writeFailure(job, "file operation failed");
+            }
+        } catch (const std::exception& error) {
+            writeFailure(job, error.what());
+        } catch (...) {
+            writeFailure(job, "unknown exception during cache serialization or write");
         }
     }
 
@@ -1925,6 +2037,11 @@ bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
     return instance.Enabled() && instance.LoadPlan(key, plan);
 }
 
+std::shared_ptr<const IrResourcePlan> LoadSharedPlan(std::span<const std::byte> key, std::uint64_t shaderHash) {
+    auto& instance = store();
+    return instance.Enabled() ? instance.LoadSharedPlan(key, shaderHash) : nullptr;
+}
+
 void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
     auto& instance = store();
     if (instance.Enabled() && plan != nullptr) instance.StorePlan(std::move(key), std::move(plan));
@@ -1938,6 +2055,69 @@ std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, c
 void Flush() {
     auto& instance = store();
     if (instance.Enabled()) instance.Flush();
+}
+
+std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::uint32_t> genericSpirv, std::size_t slots) {
+    std::vector<std::byte> key(std::as_bytes(genericSpirv).begin(), std::as_bytes(genericSpirv).end());
+    const auto count = static_cast<std::uint64_t>(slots);
+    const auto countBytes = std::as_bytes(std::span(&count, 1));
+    key.insert(key.end(), countBytes.begin(), countBytes.end());
+    auto name = EntryName(key);
+    name.replace(name.size() - 4u, 4u, ".slots");
+    static std::mutex tablesMutex;
+    static std::map<std::string, std::shared_ptr<BufferSubstituteTable>> tables;
+    std::lock_guard tablesLock(tablesMutex);
+    if (const auto found = tables.find(name); found != tables.end()) return found->second;
+    auto& instance = store();
+    if (!instance.Enabled()) return tables.emplace(name, std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(slots), BufferSubstituteTable::Persist{})).first->second;
+    const auto path = instance.Directory() / name;
+    const auto keyHash = HashBytes(key);
+    const auto read = [path, keyHash, slots] {
+        std::vector<BufferSubstitute> table(slots);
+        std::vector<std::byte> file;
+        if (!ReadWholeFile(path, file)) return table;
+        Reader reader(file);
+        std::uint32_t magic = 0, format = 0;
+        std::uint64_t source = 0, hash = 0, count = 0;
+        reader.Value(magic);
+        reader.Value(format);
+        reader.Value(source);
+        reader.Value(hash);
+        reader.Value(count);
+        if (!reader.Ok() || magic != SubstituteMagic || format != FormatVersion || source != SourceVersion() || hash != keyHash || count != slots) return table;
+        std::vector<BufferSubstitute> decoded(slots);
+        for (auto& slot : decoded) {
+            reader.Value(slot.known);
+            reader.Value(slot.word1);
+            reader.Value(slot.word3);
+            reader.Value(slot.misalignment);
+        }
+        if (!reader.Done()) return table;
+        return decoded;
+    };
+    auto persist = [path, keyHash, read](const std::vector<BufferSubstitute>& learned) {
+        static std::mutex mutex;
+        std::lock_guard lock(mutex);
+        auto merged = read();
+        for (std::size_t slot = 0; slot < merged.size() && slot < learned.size(); ++slot) {
+            if (!merged[slot].known) merged[slot] = learned[slot];
+        }
+        std::vector<std::byte> bytes;
+        Writer writer(bytes);
+        writer.Value(SubstituteMagic);
+        writer.Value(FormatVersion);
+        writer.Value(SourceVersion());
+        writer.Value(keyHash);
+        writer.Value<std::uint64_t>(merged.size());
+        for (const auto& slot : merged) {
+            writer.Value(slot.known);
+            writer.Value(slot.word1);
+            writer.Value(slot.word3);
+            writer.Value(slot.misalignment);
+        }
+        if (!WriteFileAtomically(path, bytes)) std::fprintf(stderr, "[shader-disk-cache] cannot write buffer substitutes %s\n", path.string().c_str());
+    };
+    return tables.emplace(name, std::make_shared<BufferSubstituteTable>(read(), std::move(persist))).first->second;
 }
 
 void Shutdown() {

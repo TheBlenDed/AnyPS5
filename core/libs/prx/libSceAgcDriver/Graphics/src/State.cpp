@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <cmath>
@@ -455,10 +456,11 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     depth.format = zFormat == 1 ? (stencil ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D16_UNORM) : (stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT);
     depth.clearDepth = readFloat(cx, 0x00b);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
+    depth.stencilSwizzle = stencil ? (read(cx, 0x011) >> 4u) & 0x1fu : 0u;
     depth.htileDepthOnly = (read(cx, 0x011) & (1u << 29u)) != 0u;
+    depth.htileStencil = stencil && (read(cx, 0x010) & 0x20000000u) != 0 && !depth.htileDepthOnly;
     if (const auto htile = find(cx, 0x005); zFormat != 0 && htile != cx.end() && htile->second != 0 && (read(cx, 0x010) & (1u << 29u)) != 0) {
         depth.htileAddress = base(0x005, 0x01e) + static_cast<std::uint64_t>(view & 0x1fffu) * HtileMetadataBytes(depth.extent);
-        depth.htileStencil = stencil && !depth.htileDepthOnly;
     }
     result.depth = depth;
     result.depthTest = (depthControl & 2u) != 0;
@@ -780,6 +782,35 @@ VkBlendOp blendOp(std::uint32_t value) {
         case 4: return VK_BLEND_OP_REVERSE_SUBTRACT;
         default: throw std::runtime_error("AGC graphics: unsupported blend operation " + std::to_string(value));
     }
+}
+
+std::uint32_t optionalRegister(const Registers& cx, std::uint32_t offset) {
+    const auto found = find(cx, offset);
+    return found == cx.end() ? 0u : found->second;
+}
+
+ShaderRecompiler::ColorTargetBlend decodeTargetBlend(const Registers& cx, const ColorTarget& color, std::uint32_t control, const VkPipelineColorBlendAttachmentState& state) {
+    for (const auto index : {color.exportIndex, color.slot}) {
+        Require(((optionalRegister(cx, 0x1d5) >> (4u * index)) & 0xfu) == 0, "SX export conversion into a blended or partially written 10_11_11 unorm color target is unsupported");
+    }
+    ShaderRecompiler::ColorTargetBlend blend{true, 1u, 0u, 0u, static_cast<std::uint8_t>(state.colorWriteMask & 7u)};
+    if (!state.blendEnable) return blend;
+    blend.sourceFactor = static_cast<std::uint8_t>(control & 0x1fu);
+    blend.destinationFactor = static_cast<std::uint8_t>((control >> 8u) & 0x1fu);
+    blend.function = static_cast<std::uint8_t>((control >> 5u) & 7u);
+    for (const auto factor : {blend.sourceFactor, blend.destinationFactor}) {
+        if (factor > 5u && factor != 8u && factor != 9u) throw std::runtime_error("AGC graphics: blend factor " + std::to_string(factor) + " into a 10_11_11 unorm color target is unsupported");
+    }
+    if (blend.function != 0u && blend.function != 1u && blend.function != 4u) throw std::runtime_error("AGC graphics: blend function " + std::to_string(blend.function) + " into a 10_11_11 unorm color target is unsupported");
+    for (const auto index : {color.exportIndex, color.slot}) {
+        const auto shift = 4u * index;
+        Require(((optionalRegister(cx, 0x1d6) >> shift) & 0xfu) == 0 || ((optionalRegister(cx, 0x1d7) >> shift) & 1u) != 0, "SX blend optimizations with a nonzero epsilon on a 10_11_11 unorm color target are unsupported");
+    }
+    return blend;
+}
+
+bool writesStencil(const VkStencilOpState& face) {
+    return face.writeMask != 0 && (face.failOp != VK_STENCIL_OP_KEEP || face.passOp != VK_STENCIL_OP_KEEP || face.depthFailOp != VK_STENCIL_OP_KEEP);
 }
 
 constexpr std::uint8_t TermComplement = 0x80u;
@@ -1295,9 +1326,8 @@ void ApplyDepthRemap(const Context& context, State& state) {
     const float clampMax = std::clamp(state.depthClampMax, 0.0f, 1.0f);
     const bool floatDepth = state.depth.has_value() && (state.depth->format == VK_FORMAT_D32_SFLOAT || state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT);
     if ((clampMin != state.depthClampMin || clampMax != state.depthClampMax) && floatDepth && (state.depthWrite || state.depthTest)) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
             std::fprintf(stderr, "[gpu] viewport depth clamp bounds [%g, %g] on a float depth target are clipped to [0, 1]: the device has no VK_EXT_depth_range_unrestricted\n", state.depthClampMin, state.depthClampMax);
         }
     }
@@ -1364,15 +1394,13 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         if ((clear || tests != 0) && depthSurfaceBound(cx)) {
             decodeDepth(cx, depthControl, (read(cx, 0x203) & 2u) != 0 && !PixelProgramSkipped(queue), (read(cx, 0x203) & 4u) != 0 && !PixelProgramSkipped(queue), result);
         } else if (depthPassThrough(depthControl) || ((depthControl & 0xbu) != 0 && (tests == 0 || depthPlanesAbsent(cx)))) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
                 std::fprintf(stderr, "[gpu] always-pass depth/stencil state is rendered without a depth target (DB_DEPTH_CONTROL=0x%08x)\n", depthControl);
             }
         } else if (IgnoreDepthTest()) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
                 std::fprintf(stderr, "[gpu] depth/stencil tests are ignored (APS5_IGNORE_DEPTH_TEST; DB_DEPTH_CONTROL=0x%08x)\n", depthControl);
             }
         } else {
@@ -1538,9 +1566,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     result.pixelEarlyZ = !PixelProgramSkipped(queue) && PixelEarlyZ(read(cx, 0x203));
     result.pixelKill = !PixelProgramSkipped(queue) && (read(cx, 0x203) & 0x40u) != 0;
     if ((read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u)) != 0) {
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
             std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
         }
     }
@@ -1649,6 +1676,10 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             const std::string packed = std::string(color.packing == ShaderRecompiler::ColorExportPacking::Float11_11_10 ? "an " : "a ") + PackedColorTargetName(color.packing);
             const auto slotExport = (exportFormat >> (4u * color.exportIndex)) & 0xfu;
             if (slotExport == 5 || slotExport == 6) throw std::runtime_error("AGC graphics: color export format " + std::to_string(slotExport) + " into " + packed + " target is unsupported");
+            if (color.packing == ShaderRecompiler::ColorExportPacking::Unorm10_11_11 && (state.blendEnable || (exportedMask & 7u) != 7u)) {
+                result.targetBlends[color.exportIndex] = decodeTargetBlend(cx, color, blend, state);
+                continue;
+            }
             Require(!state.blendEnable, "blending into " + packed + " color target is unsupported");
             const bool nibbles = color.packing == ShaderRecompiler::ColorExportPacking::Unorm4_4_4_4;
             const std::uint32_t packedMask = nibbles ? 0xfu : 7u;
@@ -1686,6 +1717,21 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         if ((requiredBlendMask & (1u << i)) != 0) result.blendConstants[i] = requiredBlendConstants[i];
     }
     Require((!result.mergedCoverage && !result.truncatedCoverage) || std::ranges::none_of(result.colors, [](const ColorTarget& color) { return color.partialWriteMask != 0; }), "partial writes of a 4_4_4_4 unorm color target under merged or truncated coverage (a one-sample target under a multisampled rasterizer) are not implemented");
+    if (std::any_of(result.targetBlends.begin(), result.targetBlends.end(), [](const ShaderRecompiler::ColorTargetBlend& blend) { return blend.enable; })) {
+        const auto shaderControl = read(cx, 0x203);
+        Require((shaderControl & 0x107u) == 0, "a pixel shader that exports depth, stencil or a sample mask cannot blend into a 10_11_11 unorm color target");
+        Require(!result.alphaToCoverage, "alpha-to-coverage beside a blended 10_11_11 unorm color target is unsupported");
+        const auto countsSamples = (optionalRegister(cx, 0x001) & 0xf00u) != 0;
+        Require((shaderControl & 0x40u) == 0 || !countsSamples, "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while DB_COUNT_CONTROL counts passing samples");
+        if (result.depth && (result.depthTest || result.stencilTest || result.depthBoundsTest)) {
+            Require(((shaderControl >> 4u) & 3u) == 1u && (shaderControl & 0x200u) == 0, "blending into a 10_11_11 unorm color target under depth or stencil tests needs Z_ORDER EARLY_Z_THEN_LATE_Z without EXEC_ON_HIER_FAIL");
+            Require((shaderControl & 0x40u) == 0 || (!result.depthWrite && !(result.stencilTest && (writesStencil(result.stencilFront) || writesStencil(result.stencilBack)))), "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while it writes depth or stencil");
+        }
+        std::vector<ColorTarget> attached;
+        for (const auto& color : result.colors) (result.targetBlends[color.exportIndex].enable ? result.blendedColors : attached).push_back(color);
+        result.colors = std::move(attached);
+        result.blends.resize(result.colors.empty() ? 0u : result.colors.back().exportIndex + 1u);
+    }
     if (!result.colors.empty()) {
         result.color = result.colors.front();
         result.blend = result.blends[result.colors.front().exportIndex];
@@ -1710,8 +1756,10 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
 
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state) {
     std::array<ShaderRecompiler::ColorExportPacking, 8> packings{};
-    for (const auto& color : state.colors) {
-        if (color.exportIndex < packings.size()) packings[color.exportIndex] = color.packing;
+    for (const auto* colors : {&state.colors, &state.blendedColors}) {
+        for (const auto& color : *colors) {
+            if (color.exportIndex < packings.size()) packings[color.exportIndex] = color.packing;
+        }
     }
     return packings;
 }
@@ -1844,7 +1892,7 @@ std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
 }
 
 GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
-    static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+    static const bool residentLinear = std::getenv("APS5_RESIDENT_LINEAR") != nullptr;
     Require(residentLinear || color.tileMode != ColorTileMode::Linear, "linear color targets are not resident");
     const bool chain = color.mipCount > 1;
     GuestTextureResource surface{};
@@ -2037,9 +2085,8 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot, bool allo
                 if (!allowMultisampleDcc) Require((color.dccControl & 0x3ff80u) == 0, "multisampled DCC color transforms or lossy modes are not implemented");
             }
         } else {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
                 std::fprintf(stderr, "[gpu] DCC keys of mipmapped color targets are ignored\n");
             }
         }

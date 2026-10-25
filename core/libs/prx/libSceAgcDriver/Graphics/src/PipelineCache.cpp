@@ -179,39 +179,43 @@ void PipelineCache::load(std::vector<std::byte>& initialData) {
     std::fprintf(stderr, "[pipeline-cache] loaded %.1f KiB from %s\n", static_cast<double>(initialData.size()) / 1024.0, path.string().c_str());
 }
 
-void PipelineCache::save(bool final, bool waitForPipelines) {
+bool PipelineCache::save(bool final, bool waitForPipelines) {
     std::lock_guard pathLock(pathMutex(path));
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     const auto snapshot = [&] { return waitForPipelines ? synchronization.LockForSnapshot() : synchronization.TryLockForSnapshot(); };
     std::size_t liveBytes = 0;
     {
         auto synchronizationLock = snapshot();
-        if (!synchronizationLock.owns_lock()) return;
-        if (getData(context.device, cache, &liveBytes, nullptr) != VK_SUCCESS || liveBytes == 0) return;
+        if (!synchronizationLock.owns_lock()) return false;
+        if (getData(context.device, cache, &liveBytes, nullptr) != VK_SUCCESS || liveBytes == 0) return true;
     }
     const auto onDisk = readHeader();
-    if (liveBytes == settledBytes && onDisk == settledFile) return;
+    if (liveBytes == settledBytes && onDisk == settledFile) return true;
     const bool fileUnchanged = holdsFile && settledFile.has_value() && onDisk == settledFile;
     const auto started = std::chrono::steady_clock::now();
     const auto settle = [&](const std::optional<FileHeader>& file) {
         settledBytes = liveBytes;
         settledFile = file;
     };
-    const auto disk = fileUnchanged ? File{} : readFile();
+    auto disk = fileUnchanged ? File{} : readFile();
     if (disk.state == FileState::Unreadable) {
         std::fprintf(stderr, "[pipeline-cache] cannot read %s; not saving over it\n", path.string().c_str());
         settle(readHeader());
-        return;
+        return true;
     }
     if (disk.state == FileState::Invalid) std::fprintf(stderr, "[pipeline-cache] replacing %s: %s\n", path.string().c_str(), disk.invalidReason);
     std::size_t floor = fileUnchanged ? std::max<std::size_t>(loadedBytes, settledFile->dataBytes) : 0;
     VkPipelineCache merged = VK_NULL_HANDLE;
+    bool mergedWithFile = false;
     struct DestroyMerged {
         const Context& context;
-        const VkPipelineCache& cache;
-        ~DestroyMerged() {
-            if (cache != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
+        VkPipelineCache& cache;
+        void Reset() {
+            if (cache == VK_NULL_HANDLE) return;
+            context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, cache, nullptr);
+            cache = VK_NULL_HANDLE;
         }
+        ~DestroyMerged() { Reset(); }
     } destroyMerged{context, merged};
     if (disk.state == FileState::Valid) {
         const auto data = disk.Payload();
@@ -221,18 +225,20 @@ void PipelineCache::save(bool final, bool waitForPipelines) {
         const auto result = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(context.device, &info, nullptr, &merged);
         if (result == VK_SUCCESS) {
             floor = std::max(loadedBytes, data.size());
+            mergedWithFile = true;
         } else {
             merged = VK_NULL_HANDLE;
             std::fprintf(stderr, "[pipeline-cache] replacing %s: the driver refused it (Vulkan result %d)\n", path.string().c_str(), static_cast<int>(result));
         }
     }
+    std::vector<std::byte>().swap(disk.contents);
     if (merged != VK_NULL_HANDLE) {
         auto synchronizationLock = snapshot();
-        if (!synchronizationLock.owns_lock()) return;
+        if (!synchronizationLock.owns_lock()) return false;
         const auto result = context.Function<PFN_vkMergePipelineCaches>("vkMergePipelineCaches")(context.device, merged, 1, &cache);
         if (result != VK_SUCCESS) {
             std::fprintf(stderr, "[pipeline-cache] cannot merge into %s (Vulkan result %d); not saving over it\n", path.string().c_str(), static_cast<int>(result));
-            return;
+            return true;
         }
     }
     const auto source = merged != VK_NULL_HANDLE ? merged : cache;
@@ -240,30 +246,32 @@ void PipelineCache::save(bool final, bool waitForPipelines) {
     std::vector<std::byte> file;
     {
         auto synchronizationLock = source == cache ? snapshot() : PipelineCacheSynchronization::SnapshotLock{};
-        if (source == cache && !synchronizationLock.owns_lock()) return;
-        if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return;
+        if (source == cache && !synchronizationLock.owns_lock()) return false;
+        if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return true;
         if (merged != VK_NULL_HANDLE && size == disk.header.dataBytes) {
             settle(disk.header);
-            return;
+            return true;
         }
         file.resize(sizeof(FileHeader) + size);
         const auto result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
-        if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
+        if (result != VK_SUCCESS && result != VK_INCOMPLETE) return true;
         file.resize(sizeof(FileHeader) + size);
     }
+    destroyMerged.Reset();
     if (size < floor) {
         std::fprintf(stderr, "[pipeline-cache] keeping %s: the merged cache has %.1f KiB, less than the %.1f KiB on disk or loaded at start\n", path.string().c_str(), static_cast<double>(size) / 1024.0, static_cast<double>(floor) / 1024.0);
         settle(fileUnchanged ? *settledFile : disk.header);
-        return;
+        return true;
     }
     const FileHeader header{FileMagic, FileFormat, size, ShaderRecompiler::HashBytes(std::span(file).subspan(sizeof(FileHeader)))};
     std::memcpy(file.data(), &header, sizeof(header));
     if (!ShaderRecompiler::WriteFileAtomically(path, file)) {
         std::fprintf(stderr, "[pipeline-cache] cannot write %s\n", path.string().c_str());
-        return;
+        return true;
     }
     settle(header);
-    if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), merged != VK_NULL_HANDLE ? " (merged with the file)" : "", final ? " (teardown)" : "");
+    if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), mergedWithFile ? " (merged with the file)" : "", final ? " (teardown)" : "");
+    return true;
 }
 
 void PipelineCache::SaveNow() {
@@ -276,9 +284,10 @@ void PipelineCache::SaveUnlessBusy() {
 
 void PipelineCache::run() {
     std::unique_lock lock(mutex);
-    while (!wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
+    bool saved = true;
+    while (!wake.wait_for(lock, std::chrono::seconds(saved ? SaveIntervalSeconds : 1), [&] { return stopping; })) {
         lock.unlock();
-        save(false, false);
+        saved = SaveUnlessCreating();
         lock.lock();
     }
 }

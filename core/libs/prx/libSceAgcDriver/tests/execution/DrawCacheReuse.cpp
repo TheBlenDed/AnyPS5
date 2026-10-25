@@ -245,6 +245,7 @@ void SightingsKeepCollidingKeys() {
 
 int main() {
     try {
+        AgcDriver::DriverDetail::DrawAhead::SetCompileAhead(false);
         SightingsKeepCollidingKeys();
         bool libraries = false;
         {

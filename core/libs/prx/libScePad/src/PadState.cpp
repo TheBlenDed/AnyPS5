@@ -1,6 +1,8 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/PadAudioHapticQueue.hpp"
 #include "prx/libScePad/include/Pad.hpp"
+#include "prx/libScePad/include/PadScript.hpp"
+#include "prx/libc/include/General.hpp"
 #include "prx/libScePad/include/InputCommandFile.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
@@ -35,6 +37,8 @@ namespace {
     std::deque<QueuedInput> queue;
     std::exception_ptr failure;
     bool initialized = false;
+    Pad::PadScript script;
+    std::uint32_t scriptButtons = 0;
 
     struct Quat { float w = 1.0f, x = 0.0f, y = 0.0f, z = 0.0f; };
     Quat orientation;
@@ -125,6 +129,8 @@ void Pad::Initialize() {
     std::lock_guard lock(stateMutex);
     if (failure) std::rethrow_exception(failure);
     if (!initialized) {
+        script = Pad::PadScript::FromEnvironment();
+        if (!script.Empty()) APS5_LOG_OUT("[pad-script] t=%.3fs %s", Pad::ProcessSeconds(), script.Describe().c_str());
         timestamp = sceKernelGetProcessTime();
         lastFuseTime = timestamp;
         queue.clear();
@@ -221,7 +227,15 @@ Pad::InputCommandFile::Input InjectedInput(std::uint64_t now) {
         return path ? std::filesystem::path(path) : std::filesystem::path{};
     }());
     static Pad::InputCommandFile::Input lastInjected;
-    const auto injected = commands.Poll(now);
+    const std::uint64_t scriptNow = script.Empty() ? 0 : Pad::MicrosSinceProcessStart();
+    const std::uint32_t scripted = script.Empty() ? 0 : script.Sample(scriptNow);
+    if (scripted != scriptButtons) {
+        APS5_LOG_OUT("[pad-script] t=%.3fs scripted buttons %s -> %s", static_cast<double>(scriptNow) * 1e-6,
+            Pad::ScriptButtonNames(scriptButtons).c_str(), Pad::ScriptButtonNames(scripted).c_str());
+        scriptButtons = scripted;
+    }
+    auto injected = commands.Poll(now);
+    injected.buttons |= scripted;
     if (injected != lastInjected) {
         lastInjected = injected;
         timestamp = now;

@@ -3,7 +3,7 @@ if(CMAKE_HOST_APPLE AND NOT ANYPS5_RELINKER_ONLY)
     set(CMAKE_APPLE_SILICON_PROCESSOR x86_64 CACHE STRING "Host processor CMake reports on Apple silicon")
     set(CMAKE_OSX_ARCHITECTURES x86_64 CACHE STRING "Architectures built on macOS")
 endif()
-project(Relinker CXX)
+project(Relinker C CXX)
 
 set(ANYPS5_TEST_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 

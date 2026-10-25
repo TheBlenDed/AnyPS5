@@ -12,11 +12,14 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#include <algorithm>
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <span>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -172,6 +175,44 @@ void CheckSharedBlock() {
     std::array<std::uint8_t, 64> unwatched{};
     const auto outside = reinterpret_cast<std::uint64_t>(unwatched.data());
     if (!Watched(outside, unwatched.size())) Require(StoredOver(outside, unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
+}
+
+void CheckRepeatedNeighbourStores() {
+    void* memory = AllocateWatched(3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto boundary = base + 2 * Block - 0x9000;
+    const auto sharedFirst = boundary - (base + Block);
+    const auto neighbourBytes = static_cast<std::size_t>(base + 3 * Block - boundary);
+    std::memset(memory, 0x11, 3 * Block);
+
+    const auto synced = CollectWrites(base, 3 * Block);
+    Require(synced != 0, "the test block is not collected");
+    for (int store = 0; store < 6; ++store) MarkWritten(boundary, neighbourBytes);
+    Require(!StoredOver(base + Block, static_cast<std::size_t>(sharedFirst), synced), "repeated stores of the neighbour's bytes count for the first surface's part of the shared block");
+    Require(StoredAllSince_nid_no_patch(boundary, neighbourBytes, synced), "repeated stores of the neighbour's bytes forget that they covered them");
+
+    const auto pieces = TrackerGeneration();
+    for (int store = 0; store < 3; ++store) MarkWritten(boundary + static_cast<std::uint64_t>(store) * 0x100, 4);
+    MarkWritten(boundary, 0x400);
+    Require(StoredOver(boundary + 0x200, 4, pieces) && !StoredOver(boundary + 0x400, 4, pieces), "a store over earlier pieces of the block answers for other bytes than its own");
+    Require(!StoredOver(base + Block, static_cast<std::size_t>(sharedFirst), pieces), "a store over earlier pieces counts for the first surface's part of the shared block");
+
+    void* fresh = AllocateWatched(2 * Block);
+    const auto freshBase = reinterpret_cast<std::uint64_t>(fresh);
+    std::memset(fresh, 0x11, 2 * Block);
+    const auto freshSynced = CollectWrites(freshBase, 2 * Block);
+    const auto neighbour = freshBase + Block - 0x9000;
+    for (std::uint64_t store = 0; store < 4; ++store) MarkWritten(neighbour + store * 0x1000, 0x100);
+    const auto settled = TrackerGeneration();
+    MarkWritten(neighbour, 0x100);
+    MarkWritten(neighbour + 0x5000, 0x100);
+    Require(!StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), settled), "a full block forgets a store newer than its oldest");
+    Require(StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), freshSynced), "a forgotten store is not taken as a store over the rest of the block");
+
+    const auto partial = TrackerGeneration();
+    MarkWritten(neighbour + 0x5080, 0x100);
+    Require(StoredOver(neighbour + 0x5000, 0x10, settled) && StoredOver(neighbour + 0x5100, 0x10, partial), "a store that overlaps an earlier piece without containing it replaces it");
+    Require(!StoredOver(freshBase, static_cast<std::size_t>(neighbour - freshBase), settled), "a full block forgets a store newer than its oldest");
 }
 
 void CheckStoredOverUsesPageEvidence() {
@@ -1074,6 +1115,74 @@ void CheckVersionRanges() {
     Require(UnchangedSince(base, bytes, checkpoints.back()), "the latest checkpoint was rejected");
 }
 
+// Block hashes stand in for texture byte copies: every changed byte (anywhere in a block, at either
+// end of a clipped block, a swap of two words) changes exactly its block's hash, a host copy hashes
+// like the guest bytes, and uncommitted pages hash as zeros.
+void CheckContentHashes() {
+    using AgcDriver::ContentHash::Hash128;
+    std::vector<std::byte> storage(6 * Block);
+    for (std::size_t i = 0; i < storage.size(); ++i) storage[i] = static_cast<std::byte>((i * 167u + 13u) ^ (i >> 9));
+    const auto blockBase = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) / Block * Block;
+    const auto address = blockBase + 0x1234;
+    const std::size_t bytes = 3 * Block + 100;
+    Require(HashBlockCount(address, bytes) == 4 && HashBlockCount(blockBase, Block) == 1 && HashBlockCount(blockBase, Block + 1) == 2 && HashBlockCount(address, 0) == 0, "hash block counts are wrong");
+    std::vector<Hash128> hashes(HashBlockCount(address, bytes));
+    HashCommittedBlocks(address, bytes, hashes);
+    std::vector<std::byte> copy(bytes);
+    std::memcpy(copy.data(), reinterpret_cast<const void*>(address), bytes);
+    std::vector<Hash128> fromCopy(hashes.size());
+    HashBlocksOf(address, copy, fromCopy);
+    Require(fromCopy == hashes, "a host copy hashes unlike the guest bytes it copies");
+    Require(CommittedBlocksMatch(address, bytes, hashes), "unchanged bytes do not match their hashes");
+    Require(CommittedBlocksMatch(blockBase + Block, Block, std::span<const Hash128>(hashes).subspan(1, 1)), "a whole block inside the range does not match its own hash");
+    Require(!CommittedBlocksMatch(address, bytes, std::span<const Hash128>(hashes).first(3)), "a hash list of the wrong length matched");
+    auto* bytesAt = reinterpret_cast<std::uint8_t*>(address);
+    const auto blockOf = [&](std::size_t offset) { return static_cast<std::size_t>((address + offset) / Block - address / Block); };
+    const std::size_t firstBoundary = static_cast<std::size_t>(blockBase + Block - address);
+    for (const std::size_t offset : {std::size_t{0}, firstBoundary - 1, firstBoundary, firstBoundary + 4097, firstBoundary + Block - 1, bytes / 2, bytes - 1}) {
+        for (const std::uint8_t flip : {std::uint8_t{0x01}, std::uint8_t{0x80}}) {
+            bytesAt[offset] ^= flip;
+            std::vector<Hash128> changed(hashes.size());
+            HashCommittedBlocks(address, bytes, changed);
+            for (std::size_t block = 0; block < hashes.size(); ++block) Require((changed[block] == hashes[block]) == (block != blockOf(offset)), "a changed byte at +" + std::to_string(offset) + " did not change exactly its block's hash");
+            Require(!CommittedBlocksMatch(address, bytes, hashes), "a changed byte at +" + std::to_string(offset) + " still matches");
+            bytesAt[offset] ^= flip;
+            Require(CommittedBlocksMatch(address, bytes, hashes), "restored bytes do not match again");
+        }
+    }
+    std::uint64_t first = 0, second = 0;
+    std::memcpy(&first, bytesAt + firstBoundary + 64, 8);
+    std::memcpy(&second, bytesAt + firstBoundary + 1024, 8);
+    Require(first != second, "the swap test words are equal");
+    std::memcpy(bytesAt + firstBoundary + 64, &second, 8);
+    std::memcpy(bytesAt + firstBoundary + 1024, &first, 8);
+    Require(!CommittedBlocksMatch(address, bytes, hashes), "two swapped words still match");
+    std::memcpy(bytesAt + firstBoundary + 64, &first, 8);
+    std::memcpy(bytesAt + firstBoundary + 1024, &second, 8);
+    const std::array<std::byte, 128> zeros{};
+    Require(!(AgcDriver::ContentHash::Of(zeros.data(), 10) == AgcDriver::ContentHash::Of(zeros.data(), 11)), "zero runs of different lengths hash alike");
+    std::array<std::byte, 40> small{};
+    const auto smallHash = AgcDriver::ContentHash::Of(small.data(), small.size());
+    small[39] = std::byte{1};
+    Require(!(AgcDriver::ContentHash::Of(small.data(), small.size()) == smallHash), "a changed byte of a short run keeps its hash");
+#ifdef _WIN32
+    auto* reserved = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * Block, MEM_RESERVE, PAGE_NOACCESS));
+    Require(reserved != nullptr && VirtualAlloc(reserved + 4096, 4096, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot reserve the partly committed block");
+    std::memset(reserved + 4096, 0x77, 4096);
+    const auto sparse = reinterpret_cast<std::uint64_t>(reserved) + 256;
+    const std::size_t sparseBytes = 2 * Block - 512;
+    std::vector<std::byte> read(sparseBytes);
+    ReadCommitted(sparse, read);
+    std::vector<Hash128> sparseHashes(HashBlockCount(sparse, sparseBytes)), readHashes(sparseHashes.size());
+    HashCommittedBlocks(sparse, sparseBytes, sparseHashes);
+    HashBlocksOf(sparse, read, readHashes);
+    Require(sparseHashes == readHashes && CommittedBlocksMatch(sparse, sparseBytes, readHashes), "uncommitted pages do not hash as the zeros ReadCommitted reads");
+    reserved[4096 + 5] = std::byte{0};
+    Require(!CommittedBlocksMatch(sparse, sparseBytes, readHashes), "a changed committed byte next to uncommitted pages still matches");
+    VirtualFree(reserved, 0, MEM_RELEASE);
+#endif
+}
+
 void CheckCollectBoundaries() {
     constexpr std::size_t bytes = 3 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes));
@@ -1129,6 +1238,32 @@ void CheckCollectBoundaries() {
 }
 }
 
+#ifdef _WIN32
+void CheckWidenedCollectBesideUncommittedPages() {
+    constexpr std::size_t reserved = std::size_t{1} << 30;
+    constexpr std::size_t committed = Block - 4 * 4096;
+    void* range = GuestArena::GuestArenaAllocate_nid_postfix(reserved, Block);
+    struct Cleanup {
+        void* range;
+        ~Cleanup() { GuestArena::GuestArenaRelease_nid_postfix(range, reserved); }
+    } cleanup{range};
+    void* memory = static_cast<std::uint8_t*>(range) + reserved - Block;
+    MEMORY_BASIC_INFORMATION tail{};
+    Require(VirtualQuery(static_cast<std::uint8_t*>(memory) + committed, &tail, sizeof(tail)) == sizeof(tail) && tail.State == MEM_RESERVE, "the test block's tail is not a placeholder");
+    GuestArena::GuestArenaCommit_nid_postfix(memory, committed, PAGE_READWRITE, committed);
+    Require(VirtualQuery(static_cast<std::uint8_t*>(memory) + committed, &tail, sizeof(tail)) == sizeof(tail) && tail.State == MEM_RESERVE, "committing the test block's head committed its tail");
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 17, committed);
+    BumpCollectEpoch();
+    const auto before = CollectWrites(base + 4096, 64);
+    Require(before != 0, "a collect beside uncommitted pages of its block failed");
+    bytes[4096 + 8] = 19;
+    BumpCollectEpoch();
+    Require(CollectWrites(base + 4096, 64) > before && !UnchangedSince(base + 4096, 64, before), "a collect beside uncommitted pages missed a CPU write");
+}
+#endif
+
 void CheckImportWindow() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -1154,6 +1289,26 @@ void CheckImportWindow() {
     bytes[0x100] = 0x33;
     static_cast<void>(CollectWritesUncached(base, 3 * Block));
     Require(!UnchangedSince(base, Block, after), "a store after the import window was missed");
+}
+
+std::uint64_t hookedBegin = 0;
+std::uint64_t hookedEnd = 0;
+
+void CheckImportWindowOverUnwatchedPart() {
+    void* memory = AllocateWatched(3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 3 * Block);
+    static_cast<void>(CollectWritesUncached(base, 3 * Block));
+    Unwatch(base + Block, Block);
+    SetUnwatchHook([](std::uint64_t address, std::size_t bytes) {
+        hookedBegin = address;
+        hookedEnd = address + bytes;
+    });
+    const bool imported = ImportWatched(base, 3 * Block, [] { return true; });
+    SetUnwatchHook(nullptr);
+    Require(imported, "an import over a partly unwatched range failed");
+    Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "an import over a partly unwatched range took its watched blocks out of the watch");
+    Require(hookedBegin <= base + Block && hookedEnd >= base + 2 * Block, "an import that left the write watch did not run the unwatch hook over the part that left");
 }
 
 void CheckImportWindowOtherThread() {
@@ -1587,6 +1742,299 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+void StoreSame(std::uint8_t* at) {
+    auto* place = reinterpret_cast<volatile std::uint8_t*>(at);
+    *place = *place;
+}
+
+std::uint64_t CollectNow(std::uint64_t address, std::size_t bytes) {
+    BumpCollectEpoch();
+    return CollectWrites(address, bytes);
+}
+
+void CheckBlocksMatchSince() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Blocks = 4;
+    constexpr std::size_t Bytes = Blocks * Block;
+    void* memory = AllocateWatched(Bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<std::uint8_t*>(memory);
+    for (std::size_t i = 0; i < Bytes; ++i) bytes[i] = static_cast<std::uint8_t>((i * 131u + 7u) ^ (i >> 11));
+    auto since = CollectNow(base, Bytes);
+    Require(since != 0, "the block-match surface is not collected");
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    const std::vector<std::uint8_t> none;
+    BlockMatch match;
+    const auto matches = [&](std::uint64_t generation, std::span<const std::uint8_t> pending = {}) { return CommittedBlocksMatchSince(base, Bytes, hashes, generation, nullptr, pending, &match); };
+
+    Require(matches(since) && match.hashed == 0 && match.skipped == Blocks && match.skippedBytes == Bytes, "an untouched surface was hashed");
+    Require(matches(0) && match.hashed == Blocks, "an unknown generation did not hash every block");
+
+    StoreSame(bytes + 2 * Block + 9);
+    Require(CollectNow(base, Bytes) > since, "a CPU store was not stamped");
+    Require(matches(since) && match.hashed == 1 && match.skipped == Blocks - 1 && match.hashedBytes == Block, "a CPU store of the same bytes did not re-hash exactly its block");
+
+    bytes[Block + 5] ^= 0x5a;
+    Require(CollectNow(base, Bytes) > since, "a CPU write was not stamped");
+    Require(!matches(since) && match.hashed == 1, "a CPU write that changed a byte still matches");
+    bytes[Block + 5] ^= 0x5a;
+    Require(matches(since) && match.hashed == 2, "restored bytes do not match after the CPU write");
+    Require(CommittedBlocksMatch(base, Bytes, hashes), "the full compare disagrees with the block compare");
+
+    since = CollectNow(base, Bytes);
+    Require(matches(since) && match.hashed == 0, "a collect after the writes leaves blocks stale");
+    Require(MarkWritten(base + 3 * Block + 16, 4) != 0 && matches(since) && match.hashed == 1, "a reported GPU store did not re-hash its block");
+    since = CollectNow(base, Bytes);
+    bytes[64] ^= 0x01;
+    Require(MarkWritten(base + 64, 1) != 0 && !matches(since) && match.hashed == 1, "a reported GPU write that changed a byte still matches");
+    bytes[64] ^= 0x01;
+    since = CollectNow(base, Bytes);
+
+    std::vector<std::uint8_t> pending(Blocks, 0);
+    pending[1] = 1;
+    Require(matches(since, pending) && match.hashed == 1 && match.skipped == Blocks - 1, "a block with a pending GPU write was not hashed");
+    pending[1] = 0;
+    Require(matches(since, pending) && match.hashed == 0, "pending flags of nothing hashed a block");
+
+    const auto offset = base + 0x1234;
+    const std::size_t offsetBytes = 2 * Block;
+    std::vector<Hash128> offsetHashes(HashBlockCount(offset, offsetBytes));
+    HashCommittedBlocks(offset, offsetBytes, offsetHashes);
+    since = CollectNow(base, Bytes);
+    Require(CommittedBlocksMatchSince(offset, offsetBytes, offsetHashes, since, nullptr, none, &match) && match.hashed == 0 && match.skipped == 3, "an unaligned range was hashed although untouched");
+    StoreSame(bytes + 0x1234 + Block + 3);
+    CollectNow(base, Bytes);
+    Require(CommittedBlocksMatchSince(offset, offsetBytes, offsetHashes, since, nullptr, none, &match) && match.hashed == 1 && match.hashedBytes == Block, "an unaligned range did not re-hash exactly the written block");
+
+    since = CollectNow(base, Bytes);
+    Unwatch(base + 2 * Block, Block);
+    Require(matches(since) && match.hashed == 1, "an unwatched block was trusted");
+    Require(!Watched(base + 2 * Block, Block), "the unwatched block is still watched");
+}
+
+void CheckBlocksMatchSinceCommitted() {
+    using AgcDriver::ContentHash::Hash128;
+    PartlyCommitted range;
+    const auto base = range.Address();
+    range.Commit(0);
+    range.Commit(2);
+    std::memset(range.Data(), 0x31, Block);
+    std::memset(range.Data() + 2 * Block, 0x42, Block);
+    Runs runs;
+    const auto synced = CollectCommitted(range, runs);
+    const Runs layout{{range.Address(0), range.Address(1)}, {range.Address(2), range.Address(3)}};
+    Require(synced != 0 && runs == layout, "the partly committed surface was not collected");
+    std::vector<Hash128> hashes(HashBlockCount(base, PartlyCommitted::Bytes));
+    HashCommittedBlocks(base, PartlyCommitted::Bytes, hashes);
+    BlockMatch match;
+    const std::vector<std::uint8_t> none;
+    const auto matches = [&](std::uint64_t generation) { return CommittedBlocksMatchSince(base, PartlyCommitted::Bytes, hashes, generation, &layout, none, &match); };
+    Require(matches(synced) && match.hashed == 0 && match.skipped == 4, "an untouched partly committed surface was hashed");
+
+    StoreSame(range.Data() + 2 * Block + 100);
+    Require(CollectCommitted(range, runs) > synced && matches(synced) && match.hashed == 1, "a store into a committed block did not re-hash exactly that block");
+
+    range.Commit(3);
+    Require(CollectCommitted(range, runs) != 0 && runs != layout, "the newly committed block is not described");
+    Require(matches(synced) && match.hashed == 2, "a newly committed block was not hashed");
+    range.Data()[3 * Block + 8] = 0x01;
+    CollectCommitted(range, runs);
+    Require(!matches(synced), "a write into a newly committed block still matches");
+    range.Decommit(3);
+
+    range.Decommit(2);
+    CollectCommitted(range, runs);
+    Require(!matches(synced) && match.hashed >= 1, "a decommitted block still matches its old bytes");
+}
+
+void CheckUntrackedBlocks() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Blocks = 3;
+    void* watched = AllocateWatched(Blocks * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(watched);
+    auto* bytes = static_cast<std::uint8_t*>(watched);
+    std::vector<std::uint8_t> stale(Blocks);
+    const std::vector<std::uint8_t> none(Blocks, 0);
+    UntrackedBlocks kinds;
+    const auto staleCount = [&] { return static_cast<std::size_t>(std::count(stale.begin(), stale.end(), std::uint8_t{1})); };
+    auto since = WalkUntrackedBlocks(base, Blocks * Block, 0, stale, &kinds);
+    Require(since != 0 && staleCount() == Blocks && kinds.covered == Blocks, "a first untracked walk trusted a block");
+    auto next = WalkUntrackedBlocks(base, Blocks * Block, since, stale, &kinds);
+    Require(next >= since && staleCount() == 0, "an untouched watched block read as stale");
+    StoreSame(bytes + Block + 77);
+    const auto stored = WalkUntrackedBlocks(base, Blocks * Block, next, stale, &kinds);
+    Require(stale[0] == 0 && stale[1] == 1 && stale[2] == 0 && stored > next, "a CPU store did not make exactly its block stale");
+    std::vector<Hash128> hashes(HashBlockCount(base, Blocks * Block));
+    HashCommittedBlocks(base, Blocks * Block, hashes);
+    BlockMatch match;
+    Require(CommittedBlocksMatchMarked(base, Blocks * Block, hashes, stale, &match) && match.hashed == 1 && match.skipped == Blocks - 1, "a marked compare hashed other blocks");
+    bytes[2 * Block + 3] ^= 0x10;
+    Require(CommittedBlocksMatchMarked(base, Blocks * Block, hashes, none, &match) && match.hashed == 0, "an unmarked compare hashed a block");
+    std::vector<std::uint8_t> last(Blocks, 0);
+    last[2] = 1;
+    Require(!CommittedBlocksMatchMarked(base, Blocks * Block, hashes, last, &match), "a marked changed block still matches");
+    bytes[2 * Block + 3] ^= 0x10;
+    std::array<std::uint8_t, 64> host{};
+    std::vector<std::uint8_t> hostStale(1);
+    WalkUntrackedBlocks(reinterpret_cast<std::uint64_t>(host.data()), host.size(), stored, hostStale, &kinds);
+    Require(hostStale[0] == 1 && kinds.covered == 0 && kinds.hinted == 0, "memory outside the watch was trusted");
+#ifdef _WIN32
+    constexpr std::size_t mixedBytes = 4 * Block;
+    auto* memory = static_cast<volatile std::uint8_t*>(AllocateWatched(mixedBytes));
+    const auto mixed = reinterpret_cast<std::uint64_t>(memory);
+    for (std::size_t offset = 0; offset < mixedBytes; offset += 4096) memory[offset] = 0x21;
+    CollectNow(mixed, mixedBytes);
+    Unwatch(mixed + Block, 2 * Block);
+    Require(UntrackedHint(mixed, mixedBytes) == 0 && CollectWrites(mixed, mixedBytes) == 0, "the mixed range is tracked as a whole");
+    std::vector<std::uint8_t> mixedStale(4);
+    since = WalkUntrackedBlocks(mixed, mixedBytes, 0, mixedStale, &kinds);
+    Require(since != 0 && kinds.covered == 2 && kinds.hinted == 2, "the mixed range's blocks were not classified");
+    next = WalkUntrackedBlocks(mixed, mixedBytes, since, mixedStale, &kinds);
+    Require(std::count(mixedStale.begin(), mixedStale.end(), std::uint8_t{1}) == 0, "an untouched mixed range read as stale");
+    memory[2 * Block + 4096 + 9] = memory[2 * Block + 4096 + 9];
+    auto after = WalkUntrackedBlocks(mixed, mixedBytes, next, mixedStale, &kinds);
+    Require(mixedStale[0] == 0 && mixedStale[1] == 0 && mixedStale[2] == 1 && mixedStale[3] == 0, "a CPU store into a hinted block did not make exactly it stale");
+    memory[3 * Block + 5] = memory[3 * Block + 5];
+    after = WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[0] == 0 && mixedStale[1] == 0 && mixedStale[2] == 0 && mixedStale[3] == 1, "a CPU store into a watched block of the mixed range did not make exactly it stale");
+    Require(MarkWritten(mixed + Block + 64, 8) == 0, "a driver store into an unwatched block was stamped");
+    WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[1] == 1, "a driver store into an unwatched block did not make it stale");
+    after = WalkUntrackedBlocks(mixed, mixedBytes, 0, mixedStale, &kinds);
+    Unwatch(mixed, Block);
+    WalkUntrackedBlocks(mixed, mixedBytes, after, mixedStale, &kinds);
+    Require(mixedStale[0] == 1 && kinds.hinted == 3, "a block leaving the watch was trusted");
+#endif
+}
+
+void BenchBlocksMatchSince() {
+    using AgcDriver::ContentHash::Hash128;
+    constexpr std::size_t Bytes = 4u << 20u;
+    constexpr int Rounds = 400;
+    void* memory = AllocateWatched(Bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<std::uint8_t*>(memory);
+    for (std::size_t i = 0; i < Bytes; ++i) bytes[i] = static_cast<std::uint8_t>(i * 7u);
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    const std::vector<std::uint8_t> none;
+    const auto time = [&](const char* name, auto&& touch) {
+        double fullUs = 0.0;
+        double sinceUs = 0.0;
+        std::size_t hashed = 0;
+        for (int round = 0; round < Rounds; ++round) {
+            const auto since = CollectNow(base, Bytes);
+            touch(round);
+            CollectNow(base, Bytes);
+            const auto first = std::chrono::steady_clock::now();
+            const bool full = CommittedBlocksMatch(base, Bytes, hashes);
+            const auto second = std::chrono::steady_clock::now();
+            BlockMatch match;
+            const bool narrowed = CommittedBlocksMatchSince(base, Bytes, hashes, since, nullptr, none, &match);
+            const auto third = std::chrono::steady_clock::now();
+            Require(full && narrowed, "the benchmark surface changed");
+            fullUs += std::chrono::duration<double, std::micro>(second - first).count();
+            sinceUs += std::chrono::duration<double, std::micro>(third - second).count();
+            hashed += match.hashed;
+        }
+        std::cout << "[bench] " << name << ": 4 MiB snapshot check, full hash " << fullUs / Rounds << " us, written blocks only " << sinceUs / Rounds << " us (" << static_cast<double>(hashed) / Rounds << " of " << hashes.size() << " blocks hashed)\n";
+    };
+    time("nothing written", [](int) {});
+    time("one CPU store", [&](int round) {
+        const auto at = static_cast<std::size_t>(round) * 9973u % Bytes;
+        StoreSame(bytes + at);
+    });
+    time("one reported GPU store", [&](int round) { MarkWritten(base + static_cast<std::size_t>(round) * 65599u % (Bytes - 8), 8); });
+    time("every block written", [&](int) {
+        for (std::size_t at = 0; at < Bytes; at += Block) StoreSame(bytes + at);
+    });
+#ifdef _WIN32
+    Unwatch(base, Bytes / 2);
+    double fullUs = 0.0;
+    double walkUs = 0.0;
+    std::size_t hashed = 0;
+    std::vector<std::uint8_t> stale(hashes.size());
+    auto since = WalkUntrackedBlocks(base, Bytes, 0, stale);
+    for (int round = 0; round < Rounds; ++round) {
+        StoreSame(bytes + static_cast<std::size_t>(round) * 9973u % Bytes);
+        const auto first = std::chrono::steady_clock::now();
+        const bool full = CommittedBlocksMatch(base, Bytes, hashes);
+        const auto second = std::chrono::steady_clock::now();
+        const auto next = WalkUntrackedBlocks(base, Bytes, since, stale);
+        BlockMatch match;
+        const bool marked = CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match);
+        const auto third = std::chrono::steady_clock::now();
+        Require(full && marked && next != 0, "the untracked benchmark surface changed");
+        since = next;
+        fullUs += std::chrono::duration<double, std::micro>(second - first).count();
+        walkUs += std::chrono::duration<double, std::micro>(third - second).count();
+        hashed += match.hashed;
+    }
+    std::cout << "[bench] half unwatched (hinted), one CPU store: 4 MiB snapshot check, full hash " << fullUs / Rounds << " us, block walk + written blocks " << walkUs / Rounds << " us (" << static_cast<double>(hashed) / Rounds << " of " << hashes.size() << " blocks hashed)\n";
+#endif
+}
+
+#ifdef _WIN32
+void CheckUntrackedLayout() {
+    using AgcDriver::ContentHash::Hash128;
+    PartlyCommitted range;
+    const auto base = range.Address();
+    constexpr auto Bytes = PartlyCommitted::Bytes;
+    range.Commit(0);
+    range.Commit(1);
+    range.Commit(3);
+    std::memset(range.Data(), 0x51, Block);
+    std::memset(range.Data() + Block, 0x62, Block);
+    std::memset(range.Data() + 3 * Block, 0x73, Block);
+    CollectNow(range.Address(0), 2 * Block);
+    CollectNow(range.Address(3), Block);
+    Unwatch(range.Address(1), Block);
+    Require(CollectWrites(base, Bytes) == 0 && UntrackedHint(base, Bytes) == 0, "the partly committed mixed range is tracked as a whole");
+    std::vector<std::uint8_t> stale(4);
+    UntrackedBlocks kinds;
+    const auto staleCount = [&] { return static_cast<std::size_t>(std::count(stale.begin(), stale.end(), std::uint8_t{1})); };
+    auto plain = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds);
+    plain = WalkUntrackedBlocks(base, Bytes, plain, stale, &kinds);
+    Require(kinds.refused == 2 && stale[2] == 1 && stale[3] == 1, "a walk over the uncommitted block was not refused without the layout");
+    Commitment layout;
+    Commitment now;
+    auto since = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds, nullptr, &layout);
+    Require(since != 0 && staleCount() == 4 && !layout.whole && layout.ranges.size() == 2, "the baseline walk did not describe the layout");
+    auto next = WalkUntrackedBlocks(base, Bytes, since, stale, &kinds, &layout, &now);
+    Require(staleCount() == 0 && kinds.refused == 0 && kinds.partial == 1 && kinds.layoutChanged == 0 && kinds.covered == 3 && kinds.hinted == 1, "an untouched partly committed mixed range read as stale");
+    std::vector<Hash128> hashes(HashBlockCount(base, Bytes));
+    HashCommittedBlocks(base, Bytes, hashes);
+    BlockMatch match;
+    Require(CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now) && match.hashed == 0 && match.skipped == 4, "a clean partly committed range was hashed");
+    StoreSame(range.Data() + 3 * Block + 40);
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[0] == 0 && stale[1] == 0 && stale[2] == 0 && stale[3] == 1, "a CPU store beside the uncommitted block did not make exactly its block stale");
+    StoreSame(range.Data() + Block + 9);
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[0] == 0 && stale[1] == 1 && stale[2] == 0 && stale[3] == 0, "a CPU store into the hinted block did not make exactly it stale");
+    const Commitment other{{{range.Address(0), range.Address(2)}}, false};
+    WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &other, &now);
+    Require(stale[3] == 1 && stale[0] == 0 && stale[1] == 0 && stale[2] == 0 && kinds.layoutChanged == 1, "a block whose committed runs differ from the baseline's was trusted");
+    WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, nullptr, &now);
+    Require(staleCount() == 4, "a walk without a baseline layout trusted a block");
+    next = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    range.Commit(2);
+    auto committed = WalkUntrackedBlocks(base, Bytes, next, stale, &kinds, &layout, &now);
+    Require(stale[2] == 1 && now.whole, "a newly committed block was trusted");
+    Require(CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "the zeros of a newly committed block differ from its uncommitted hash");
+    range.Data()[2 * Block + 8] = 0x01;
+    std::swap(layout, now);
+    WalkUntrackedBlocks(base, Bytes, committed, stale, &kinds, &layout, &now);
+    Require(stale[2] == 1 && !CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "a write into a newly committed block still matches");
+    range.Data()[2 * Block + 8] = 0;
+    committed = WalkUntrackedBlocks(base, Bytes, 0, stale, &kinds, nullptr, &layout);
+    range.Decommit(3);
+    WalkUntrackedBlocks(base, Bytes, committed, stale, &kinds, &layout, &now);
+    Require(stale[3] == 1 && kinds.layoutChanged >= 1 && !CommittedBlocksMatchMarked(base, Bytes, hashes, stale, &match, &now), "a decommitted block still matches its old bytes");
+}
+#endif
+
 void CheckAdoptLatestEpoch() {
     std::uint64_t bumped = 0;
     std::thread([&] {
@@ -1611,13 +2059,19 @@ void CheckAdoptLatestEpoch() {
     Require(keptOwn, "adopting the newest collect epoch moved a thread off its own");
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         if (std::wstring_view(GetCommandLineW()).ends_with(L"--metadata-commit")) {
             return CheckMetadataCommit() ? 0 : 77;
         }
 #endif
+        if (argc > 1 && std::string_view(argv[1]) == "--bench") {
+            if (!WriteWatched()) return 77;
+            BenchBlocksMatchSince();
+            return 0;
+        }
+        CheckContentHashes();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
@@ -1633,6 +2087,7 @@ int main() {
         }
 #endif
         CheckSharedBlock();
+        CheckRepeatedNeighbourStores();
         CheckStoredOverUsesPageEvidence();
         CheckStoredAllSince();
         CheckSharedBlockProofs();
@@ -1657,9 +2112,13 @@ int main() {
 #endif
         CheckVersionRanges();
         CheckCollectBoundaries();
+#ifdef _WIN32
+        CheckWidenedCollectBesideUncommittedPages();
+#endif
         CheckImportWindow();
         CheckImportWindowZeroPages();
         CheckImportWindowOtherThread();
+        CheckImportWindowOverUnwatchedPart();
         CheckImportWindowOverUnwatchedBlock();
         CheckStoreAcrossImports();
         CheckImportWindowFootprint();
@@ -1667,6 +2126,12 @@ int main() {
         CheckUnwatchHooks();
         CheckCommittedRanges();
         CheckAdoptLatestEpoch();
+        CheckBlocksMatchSince();
+        CheckBlocksMatchSinceCommitted();
+        CheckUntrackedBlocks();
+#ifdef _WIN32
+        CheckUntrackedLayout();
+#endif
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

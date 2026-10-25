@@ -103,6 +103,32 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcStagingDiffShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/StagingDiffCopyBack.comp)
+set(agcStagingDiffShaderSpv ${agcTextureDetileGeneratedDir}/StagingDiffCopyBack.spv)
+set(agcStagingDiffShaderHeader ${agcTextureDetileGeneratedDir}/StagingDiffCopyBack_spv.h)
+add_custom_command(
+        OUTPUT "${agcStagingDiffShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcStagingDiffShaderSpv}" "${agcStagingDiffShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcStagingDiffShaderSpv} -DOUTPUT=${agcStagingDiffShaderHeader}
+        -DSYMBOL=STAGING_DIFF_COPY_BACK_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcStagingDiffShaderSource}" glslang-standalone
+        VERBATIM
+)
+
+set(agcFmaProbeShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/FmaProbe.comp)
+set(agcFmaProbeShaderSpv ${agcTextureDetileGeneratedDir}/FmaProbe.spv)
+set(agcFmaProbeShaderHeader ${agcTextureDetileGeneratedDir}/FmaProbe_spv.h)
+add_custom_command(
+        OUTPUT "${agcFmaProbeShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcFmaProbeShaderSpv}" "${agcFmaProbeShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcFmaProbeShaderSpv} -DOUTPUT=${agcFmaProbeShaderHeader}
+        -DSYMBOL=FMA_PROBE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcFmaProbeShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcCmaskClearShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/CmaskClear.comp)
 set(agcCmaskClearShaderSpv ${agcTextureDetileGeneratedDir}/CmaskClear.spv)
 set(agcCmaskClearShaderHeader ${agcTextureDetileGeneratedDir}/CmaskClear_spv.h)
@@ -275,9 +301,11 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchInsert.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchTiming.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/SlowMaterializations.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/IndirectDispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/VariantValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/Draw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawAhead.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawProgramTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCacheStatistics.cpp
@@ -324,6 +352,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderDeviceProfile.cpp
@@ -347,7 +376,9 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineLibrary.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCreationGate.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
@@ -376,6 +407,11 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceImageKeys.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DescriptorHeap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessTable.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BindlessResolvers.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureService.cpp
         ${agcSampleOrderShaderHeaders}
         ${agcTextureDetileShaderHeader}
         ${agcReadbackHeaders}
@@ -383,6 +419,8 @@ set(agcDriverSources
         ${agcCmaskClearShaderHeader}
         ${agcDepthSampleShaderHeaders}
         ${agcMeshArgumentsShaderHeader}
+        ${agcStagingDiffShaderHeader}
+        ${agcFmaProbeShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcTextureRepackShaderHeader}
         ${agcDispatchArgumentsShaderHeader}
@@ -544,6 +582,28 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_pipeline_creation_gate_tests tests/PipelineCreationGate.cpp Graphics/src/PipelineCreationGate.cpp)
+    target_include_directories(agc_pipeline_creation_gate_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_pipeline_creation_gate_tests PRIVATE libc)
+    configure_windows_unwind(agc_pipeline_creation_gate_tests)
+    add_test(NAME agc_pipeline_creation_gate COMMAND agc_pipeline_creation_gate_tests)
+    set_tests_properties(agc_pipeline_creation_gate PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_pipeline_creation_gate PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_runtime_switches_tests tests/RuntimeSwitches.cpp Graphics/src/RuntimeSwitches.cpp)
+    target_include_directories(agc_runtime_switches_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_runtime_switches_tests PRIVATE libc)
+    configure_windows_unwind(agc_runtime_switches_tests)
+    add_test(NAME agc_runtime_switches COMMAND agc_runtime_switches_tests)
+    set_tests_properties(agc_runtime_switches PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_runtime_switches PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_async_log_tests tests/AsyncLog.cpp)
     target_include_directories(agc_async_log_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_async_log_tests PRIVATE libc)
@@ -586,6 +646,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_handoff_spin PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_handoff_spin PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_range_index_tests tests/RangeIndex.cpp)
+    target_include_directories(agc_range_index_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_range_index_tests PRIVATE libc)
+    configure_windows_unwind(agc_range_index_tests)
+    add_test(NAME agc_range_index COMMAND agc_range_index_tests)
+    set_tests_properties(agc_range_index PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_range_index PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -695,6 +766,7 @@ endif()
 add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
+        Graphics/src/RuntimeSwitches.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -702,6 +774,18 @@ target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_shader_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_memory_tests)
+
+add_executable(agc_miss_bench EXCLUDE_FROM_ALL
+        tools/MissBench.cpp
+        Execution/src/ShaderMemory.cpp
+        Graphics/src/RuntimeSwitches.cpp
+        Execution/src/GuestMemory.cpp
+        Execution/src/PerformanceTraceThread.cpp
+)
+target_include_directories(agc_miss_bench PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_miss_bench PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_miss_bench PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_miss_bench)
 
 add_test_executable(agc_vertex_input_tests EXCLUDE_FROM_ALL tests/VertexInput.cpp)
 target_include_directories(agc_vertex_input_tests PRIVATE
@@ -857,6 +941,15 @@ configure_windows_unwind(agc_pipeline_link_optimization_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_pipeline_link_optimization_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_pipeline_link_optimization COMMAND agc_pipeline_link_optimization_tests)
+endif()
+
+add_test_executable(agc_image_slabs_tests EXCLUDE_FROM_ALL tests/ImageSlabs.cpp)
+target_include_directories(agc_image_slabs_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+set_target_properties(agc_image_slabs_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_image_slabs_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_image_slabs_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_image_slabs COMMAND agc_image_slabs_tests)
 endif()
 
 add_test_executable(agc_draw_inputs_in_place_driver_tests EXCLUDE_FROM_ALL tests/DrawInputsInPlace.cpp)
@@ -1197,6 +1290,12 @@ target_link_libraries(agc_pass_hazards_tests PRIVATE libc)
 set_target_properties(agc_pass_hazards_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_pass_hazards_tests)
 
+add_test_executable(agc_device_image_keys_tests EXCLUDE_FROM_ALL tests/DeviceImageKeys.cpp Graphics/src/DeviceImageKeys.cpp)
+target_include_directories(agc_device_image_keys_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+target_link_libraries(agc_device_image_keys_tests PRIVATE libc)
+set_target_properties(agc_device_image_keys_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_device_image_keys_tests)
+
 add_test_executable(agc_barrier_batch_tests EXCLUDE_FROM_ALL tests/BarrierBatch.cpp Graphics/src/BarrierBatch.cpp)
 target_include_directories(agc_barrier_batch_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
 target_link_libraries(agc_barrier_batch_tests PRIVATE libc)
@@ -1237,14 +1336,35 @@ configure_windows_unwind(agc_buffer_pool_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_buffer_pool_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_buffer_pool COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_buffer_pool PROPERTIES ENVIRONMENT "APS5_IMAGE_POOL=1")
     add_test(NAME agc_buffer_pool_small_device_shared COMMAND agc_buffer_pool_tests --small-device-retention)
     set_tests_properties(agc_buffer_pool_small_device_shared PROPERTIES ENVIRONMENT
         "APS5_STAGING_POOL_MIB=256;APS5_BUFFER_POOL_SHARED=1")
     add_test(NAME agc_buffer_pool_small_device_no_staging COMMAND agc_buffer_pool_tests --small-device-retention)
     set_tests_properties(agc_buffer_pool_small_device_no_staging PROPERTIES ENVIRONMENT
         "APS5_STAGING_POOL_MIB=0")
+    add_test(NAME agc_buffer_pool_no_small_device_tier COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_buffer_pool_no_small_device_tier PROPERTIES ENVIRONMENT
+        "APS5_NO_SMALL_DEVICE_TIER=1;APS5_NO_LARGER_SMALL_POOLS=1;APS5_IMAGE_POOL=1")
+    add_test(NAME agc_buffer_pool_no_exact_size_reuse COMMAND agc_buffer_pool_tests)
+    set_tests_properties(agc_buffer_pool_no_exact_size_reuse PROPERTIES ENVIRONMENT
+        "APS5_NO_EXACT_SIZE_REUSE=1;APS5_IMAGE_POOL=1")
     if(WIN32)
-        set_tests_properties(agc_buffer_pool agc_buffer_pool_small_device_shared agc_buffer_pool_small_device_no_staging PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_buffer_pool agc_buffer_pool_small_device_shared agc_buffer_pool_small_device_no_staging agc_buffer_pool_no_small_device_tier agc_buffer_pool_no_exact_size_reuse PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_pipeline_request_precheck_tests EXCLUDE_FROM_ALL tests/PipelineRequestPrecheck.cpp)
+target_include_directories(agc_pipeline_request_precheck_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_pipeline_request_precheck_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_pipeline_request_precheck_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_pipeline_request_precheck_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_pipeline_request_precheck_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_pipeline_request_precheck COMMAND agc_pipeline_request_precheck_tests)
+    if(WIN32)
+        set_tests_properties(agc_pipeline_request_precheck PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -1563,13 +1683,14 @@ if(BUILD_TESTING)
         add_test(NAME agc_import_settle_wait_failure COMMAND agc_driver_recorder_tests --settle-wait-failure-only)
         set_tests_properties(agc_import_settle_write_order agc_import_settle_write_order_other_family agc_import_settle_wait_failure PROPERTIES
             SKIP_RETURN_CODE 77 TIMEOUT 30
+            ENVIRONMENT "APS5_DEFERRED_SETTLES=1"
             FAIL_REGULAR_EXPRESSION "SYNC-HAZARD-|VUID-"
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_import_settle_first_use COMMAND agc_driver_recorder_tests --settle-first-use-only)
         add_test(NAME agc_import_settle_earlier_import COMMAND agc_driver_recorder_tests --settle-earlier-import-only)
         add_test(NAME agc_import_settle_retire COMMAND agc_driver_recorder_tests --settle-retire-only)
         add_test(NAME agc_import_settle_storage_image COMMAND agc_driver_recorder_tests --settle-storage-image-only)
-        set_tests_properties(agc_import_settle_deferred agc_import_settle_deferred_other_family agc_import_settle_first_use agc_import_settle_earlier_import agc_import_settle_retire agc_import_settle_storage_image PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        set_tests_properties(agc_import_settle_deferred agc_import_settle_deferred_other_family agc_import_settle_first_use agc_import_settle_earlier_import agc_import_settle_retire agc_import_settle_storage_image PROPERTIES ENVIRONMENT "APS5_NO_PIPELINE_JOURNAL=1;APS5_DEFERRED_SETTLES=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
         set_tests_properties(agc_import_watch agc_import_watch_other_family agc_import_settle_deferred agc_import_settle_deferred_other_family agc_import_settle_first_use agc_import_settle_earlier_import agc_import_settle_retire agc_import_settle_storage_image PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
@@ -1584,6 +1705,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_unchanged_cpu_stamps PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_unchanged_cpu_stamps PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_repeated_neighbour_stores COMMAND agc_driver_recorder_tests --repeated-neighbour-stores-only)
+    set_tests_properties(agc_repeated_neighbour_stores PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_repeated_neighbour_stores PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     foreach(mode IN ITEMS map ring shared uncached)
@@ -1618,7 +1745,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_storage_baseline_settled COMMAND agc_driver_recorder_tests --settled-baseline-only)
     add_test(NAME agc_storage_clear_hand_over COMMAND agc_driver_recorder_tests --clear-hand-over-only)
-    set_tests_properties(agc_storage_clear_hand_over PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_storage_clear_hand_over PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_CLEAR_HAND_OVER=1")
     if(WIN32)
         set_tests_properties(agc_storage_clear_hand_over PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
@@ -1645,6 +1772,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_storage_baseline_settled PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_storage_baseline_settled PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_storage_hashed_snapshot COMMAND agc_driver_recorder_tests --hashed-snapshot-only)
+    set_tests_properties(agc_storage_hashed_snapshot PROPERTIES SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_storage_hashed_snapshot PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_bda_staging COMMAND agc_driver_recorder_tests --bda-staging-only)
@@ -1683,18 +1816,23 @@ if(BUILD_TESTING)
         set_tests_properties(agc_copied_direct_ordering PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_staging_copy_back COMMAND agc_driver_recorder_tests --staging-diff-only)
+    set_tests_properties(agc_staging_copy_back PROPERTIES TIMEOUT 60)
+    add_test(NAME agc_staging_copy_back_diff COMMAND agc_driver_recorder_tests --staging-diff-only)
+    set_tests_properties(agc_staging_copy_back_diff PROPERTIES TIMEOUT 60 ENVIRONMENT "APS5_STAGING_DIFF=1")
     add_test(NAME agc_storage_writeback_blocks COMMAND agc_driver_recorder_tests --writeback-blocks-only)
     set_tests_properties(agc_storage_writeback_blocks PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     if(WIN32)
         set_tests_properties(agc_storage_writeback_blocks PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    add_test(NAME agc_recorder_read_list COMMAND agc_driver_recorder_tests --read-list-only)
     add_test(NAME agc_storage_flush_wait_mip_chain COMMAND agc_driver_recorder_tests --flush-wait-mip-chain-only)
     set_tests_properties(agc_storage_flush_wait_mip_chain PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     if(WIN32)
-        set_tests_properties(agc_storage_flush_wait_mip_chain PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_storage_flush_wait_mip_chain PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_recorder_read_list COMMAND agc_driver_recorder_tests --read-list-only)
     set_tests_properties(agc_recorder_read_list PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_recorder_deferred_failure_report COMMAND agc_driver_recorder_tests --deferred-failure-report-only)
     set_tests_properties(agc_recorder_deferred_failure_report PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
@@ -1714,6 +1852,8 @@ if(BUILD_TESTING)
     set_tests_properties(agc_parked_import_unmap PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PIN_WAIT_MS=3000")
     add_test(NAME agc_host_import_retirement COMMAND agc_driver_recorder_tests --host-import-retirement-only)
     set_tests_properties(agc_host_import_retirement PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_test(NAME agc_host_import_retirement_stress COMMAND agc_driver_recorder_tests --host-import-retirement-stress-only)
+    set_tests_properties(agc_host_import_retirement_stress PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     add_test(NAME agc_sparse_run_import COMMAND agc_driver_recorder_tests --sparse-run-import-only)
     set_tests_properties(agc_sparse_run_import PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_sparse_run_import_copied COMMAND agc_driver_recorder_tests --sparse-run-copied-only)
@@ -1745,6 +1885,10 @@ if(BUILD_TESTING)
     set_tests_properties(agc_descriptor_pool_recycling PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_draw_snapshot_cap COMMAND agc_driver_recorder_tests --draw-snapshot-cap-only)
     set_tests_properties(agc_draw_snapshot_cap PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME agc_untracked_forget COMMAND agc_driver_recorder_tests --untracked-forget-only)
+    set_tests_properties(agc_untracked_forget PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME agc_untracked_revalidate COMMAND agc_driver_recorder_tests --untracked-revalidate-only)
+    set_tests_properties(agc_untracked_revalidate PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_draw_snapshot_epoch COMMAND agc_driver_recorder_tests --draw-snapshot-epoch-only)
     set_tests_properties(agc_draw_snapshot_epoch PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_multisample_guest_access COMMAND agc_driver_recorder_tests --multisample-only)
@@ -1769,7 +1913,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_metadata_pass COMMAND agc_driver_recorder_tests --metadata-pass-only)
     set_tests_properties(agc_metadata_pass PROPERTIES SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_recorder_read_list agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_sparse_run_import agc_sparse_run_import_copied agc_unit_shadow agc_idle_publish_wait agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_draw_inputs_copied agc_resident_present agc_slice_dirty agc_queued_write_groups agc_metadata_pass agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_read_list agc_staging_copy_back agc_staging_copy_back_diff agc_host_import_unmap agc_parked_import_unmap agc_host_import_retirement agc_host_import_retirement_stress agc_sparse_run_import agc_sparse_run_import_copied agc_unit_shadow agc_idle_publish_wait agc_descriptor_pool_recycling agc_draw_snapshot_cap agc_untracked_forget agc_untracked_revalidate agc_draw_snapshot_epoch agc_multisample_guest_access agc_draw_inputs_in_place agc_draw_inputs_copied agc_resident_present agc_slice_dirty agc_queued_write_groups agc_metadata_pass agc_tiled_resolve PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         add_test(NAME agc_host_import_second_mapping COMMAND agc_driver_recorder_tests --host-import-second-mapping-only)
         set_tests_properties(agc_host_import_second_mapping PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT_MODIFICATION
@@ -1833,6 +1977,64 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_recorder_kept_bytes PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+set(agcBindlessLookupSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/BindlessLookup.comp)
+set(agcBindlessLookupSpv ${agcTestShaderGeneratedRoot}/BindlessLookup.spv)
+set(agcBindlessLookupHeader ${agcTestShaderGeneratedRoot}/BindlessLookup_spv.h)
+add_custom_command(
+        OUTPUT "${agcBindlessLookupHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.2 -o "${agcBindlessLookupSpv}" "${agcBindlessLookupSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcBindlessLookupSpv} -DOUTPUT=${agcBindlessLookupHeader}
+        -DSYMBOL=BINDLESS_LOOKUP_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcBindlessLookupSource}" glslang-standalone
+        VERBATIM
+)
+
+add_test_executable(agc_driver_bindless_table_tests EXCLUDE_FROM_ALL tests/BindlessTable.cpp ${agcBindlessLookupHeader})
+target_include_directories(agc_driver_bindless_table_tests PRIVATE ${LIBS_INCLUDE_DIR} ${agcTestShaderGeneratedRoot} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_driver_bindless_table_tests PRIVATE libSceAgcDriver SDL2-static libc)
+set_target_properties(agc_driver_bindless_table_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_bindless_table_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_bindless_table_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_bindless_table COMMAND agc_driver_bindless_table_tests)
+    add_test(NAME agc_driver_bindless_flag_off COMMAND agc_driver_bindless_table_tests --flag-off)
+    add_test(NAME agc_driver_bindless_flag_on COMMAND agc_driver_bindless_table_tests --flag-on)
+    set_tests_properties(agc_driver_bindless_table agc_driver_bindless_flag_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_bindless_flag_on PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_bindless_table agc_driver_bindless_flag_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_BINDLESS_IMAGES=unset:")
+        set_tests_properties(agc_driver_bindless_flag_on PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    else()
+        set_tests_properties(agc_driver_bindless_table agc_driver_bindless_flag_off PROPERTIES ENVIRONMENT_MODIFICATION "APS5_BINDLESS_IMAGES=unset:")
+    endif()
+endif()
+
+add_test_executable(agc_driver_texture_service_tests EXCLUDE_FROM_ALL tests/TextureService.cpp ${agcBindlessLookupHeader})
+target_include_directories(agc_driver_texture_service_tests PRIVATE ${LIBS_INCLUDE_DIR} ${agcTestShaderGeneratedRoot} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/core/shader/recompiler/ControlFlow/include ${CMAKE_SOURCE_DIR}/core/shader/recompiler/IntermediateRepresentation/include ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Optimization/include ${CMAKE_SOURCE_DIR}/core/shader/recompiler/RdnaDecoder/include ${CMAKE_SOURCE_DIR}/core/shader/recompiler/SpirvBackend/include ${CMAKE_SOURCE_DIR}/core/shader/recompiler/Translation/include ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_driver_texture_service_tests PRIVATE libSceAgcDriver SDL2-static libc)
+set_target_properties(agc_driver_texture_service_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_texture_service_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_texture_service_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_texture_service COMMAND agc_driver_texture_service_tests)
+    add_test(NAME agc_driver_texture_service_driver COMMAND agc_driver_texture_service_tests --driver)
+    add_test(NAME agc_driver_texture_service_flag_off COMMAND agc_driver_texture_service_tests --flag-off)
+    add_test(NAME agc_driver_texture_service_flag_on COMMAND agc_driver_texture_service_tests --flag-on)
+    set_tests_properties(agc_driver_texture_service agc_driver_texture_service_driver agc_driver_texture_service_flag_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_texture_service_flag_on PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1;APS5_BINDLESS_STATS=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_texture_service agc_driver_texture_service_driver agc_driver_texture_service_flag_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;APS5_BINDLESS_IMAGES=unset:")
+        set_tests_properties(agc_driver_texture_service_flag_on PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    else()
+        set_tests_properties(agc_driver_texture_service agc_driver_texture_service_driver agc_driver_texture_service_flag_off PROPERTIES ENVIRONMENT_MODIFICATION "APS5_BINDLESS_IMAGES=unset:")
     endif()
 endif()
 
@@ -1986,6 +2188,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/GuestSamplerResource.cpp
         tests/TextureDetiler.cpp
         tests/DepthSurfaceReuse.cpp
+        tests/TextureMipChain.cpp
         tests/LastRecordIndices.cpp
 )
 
@@ -2166,6 +2369,9 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     configure_windows_unwind(${agcExecutionTest})
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
+if(TARGET agc_driver_request_bench2_tests)
+    target_link_libraries(agc_driver_request_bench2_tests PRIVATE shader_recompiler_agc_driver)
+endif()
 if(BUILD_TESTING)
     add_test(NAME agc_driver_address_passes_targets_split COMMAND agc_driver_address_passes_tests --targets)
     set_tests_properties(agc_driver_address_passes_targets_split PROPERTIES ENVIRONMENT "APS5_NO_ADDRESS_READ_PASSES=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
@@ -2197,6 +2403,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_indirect_thread_dimensions_cpu PROPERTIES ENVIRONMENT "APS5_NO_GPU_THREAD_DIMENSIONS=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
     if(WIN32)
         set_tests_properties(agc_driver_indirect_thread_dimensions_cpu PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_dispatch_overlap_off COMMAND agc_driver_dispatch_overlap_tests --off)
+    set_tests_properties(agc_driver_dispatch_overlap_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DISPATCH_OVERLAP=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_dispatch_overlap_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -2235,6 +2447,24 @@ target_include_directories(agc_driver_sample_multisample_target_tests PRIVATE $<
 target_include_directories(agc_driver_image_table_cache_bounds_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_draw_cache_relocation_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+
+if(BUILD_TESTING)
+    add_test(NAME agc_submit_progress COMMAND agc_driver_submit_progress_tests)
+    set_tests_properties(agc_submit_progress PROPERTIES
+            ENVIRONMENT "APS5_SUBMIT_PROGRESS=1;ANYPS5_REQUIRE_VULKAN=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_submit_progress PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_submit_progress_no_timeline COMMAND agc_driver_submit_progress_tests --fallback-only)
+    set_tests_properties(agc_submit_progress_no_timeline PROPERTIES
+            ENVIRONMENT "APS5_SUBMIT_PROGRESS=1;APS5_NO_TIMELINE=1;ANYPS5_REQUIRE_VULKAN=1"
+            TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_submit_progress_no_timeline PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 if(BUILD_TESTING)
     add_test(NAME agc_driver_store_pending_identity COMMAND agc_driver_store_over_untracked_tests --pending-identity)
@@ -2328,6 +2558,8 @@ target_include_directories(agc_driver_reversed_order_blend_tests PRIVATE $<TARGE
 
 target_include_directories(agc_driver_swap_alt_blend_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
+target_include_directories(agc_driver_packed_unorm_blending_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+
 target_include_directories(agc_driver_packed_float_color_target_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_link_libraries(agc_driver_job_manager_compute_tests PRIVATE libSceJobManager libSceAgc libkernel)
@@ -2408,6 +2640,14 @@ target_link_libraries(agc_driver_guest_memory_lifetime_tests PRIVATE libkernel)
 target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
+target_include_directories(agc_driver_capture_bind_publication_tests PRIVATE
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
+)
+target_include_directories(agc_driver_image_table_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_include_directories(agc_driver_direct_image_refusal_tests PRIVATE
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
+)
 
 if(BUILD_TESTING)
     set_target_properties(agc_shader_mode_register_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
@@ -2453,6 +2693,45 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_shader_mode_register PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_descriptor_waterfall COMMAND agc_driver_image_table_tests --descriptor-waterfall)
+    add_test(NAME agc_driver_pipeline_only COMMAND agc_driver_image_table_tests --pipeline-only)
+    set_tests_properties(agc_driver_pipeline_only PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    if(WIN32)
+        set_tests_properties(agc_driver_pipeline_only PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_descriptor_waterfall_guard COMMAND agc_driver_image_table_tests --descriptor-waterfall-guard)
+    set_tests_properties(agc_driver_descriptor_waterfall agc_driver_descriptor_waterfall_guard PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(agc_driver_descriptor_waterfall_guard PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_UNNORM_WRAP_GUARD=1")
+    if(WIN32)
+        set_tests_properties(agc_driver_descriptor_waterfall agc_driver_descriptor_waterfall_guard PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_image_table_heap COMMAND agc_driver_image_table_tests)
+    add_test(NAME agc_driver_descriptor_waterfall_heap COMMAND agc_driver_image_table_tests --descriptor-waterfall)
+    add_test(NAME agc_driver_pipeline_only_heap COMMAND agc_driver_image_table_tests --pipeline-only)
+    add_test(NAME agc_driver_bindless_miss COMMAND agc_driver_image_table_tests --bindless-miss)
+    add_test(NAME agc_driver_bindless_serve_submit COMMAND agc_driver_image_table_tests --bindless-serve-submit)
+    set_tests_properties(agc_driver_image_table_heap agc_driver_descriptor_waterfall_heap agc_driver_pipeline_only_heap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(agc_driver_bindless_miss PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1;APS5_BINDLESS_LAZY=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(agc_driver_bindless_serve_submit PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1;APS5_ADDRESS_COPY_MAX_MIB=2048" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 300)
+    if(WIN32)
+        set_tests_properties(agc_driver_image_table_heap agc_driver_descriptor_waterfall_heap agc_driver_pipeline_only_heap agc_driver_bindless_miss agc_driver_bindless_serve_submit PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_image_table_runtime_address COMMAND agc_driver_image_table_tests --runtime-address)
+    add_test(NAME agc_driver_image_table_runtime_address_heap COMMAND agc_driver_image_table_tests --runtime-address)
+    add_test(NAME agc_driver_image_table_runtime_address_lazy COMMAND agc_driver_image_table_tests --runtime-address)
+    set_tests_properties(agc_driver_image_table_runtime_address PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(agc_driver_image_table_runtime_address_heap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(agc_driver_image_table_runtime_address_lazy PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1;APS5_BINDLESS_LAZY=1;APS5_SPANNED_WAVE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    if(WIN32)
+        set_tests_properties(agc_driver_image_table_runtime_address agc_driver_image_table_runtime_address_heap agc_driver_image_table_runtime_address_lazy PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_image_table_graphics COMMAND agc_driver_image_table_tests --graphics)
+    add_test(NAME agc_driver_image_table_graphics_heap COMMAND agc_driver_image_table_tests --graphics)
+    set_tests_properties(agc_driver_image_table_graphics PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    set_tests_properties(agc_driver_image_table_graphics_heap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BINDLESS_IMAGES=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" SKIP_RETURN_CODE 77 TIMEOUT 120)
+    if(WIN32)
+        set_tests_properties(agc_driver_image_table_graphics agc_driver_image_table_graphics_heap PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_shader_bindless COMMAND agc_shader_memory_tests --bindless)
     set_tests_properties(agc_shader_bindless PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_shader_selected_records_image_limit COMMAND agc_shader_memory_tests --selected-records-image-limit)
@@ -2491,7 +2770,7 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_shader_bindless agc_shader_selected_records_image_limit agc_shader_selected_records_pair_limit agc_shader_selected_records_direct_image_limit agc_shader_selected_records_direct_pair_limit agc_shader_srt_read_patching agc_shader_type_zero_image_materialization agc_shader_frontend_pair agc_shader_frontend_pair_off agc_shader_layout_pair agc_shader_layout_pair_off agc_shader_entry_lane_proof_budget PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    foreach(agcTest IN ITEMS agc_vertex_input_tests agc_mesh_output_budget_tests agc_shared_write_tests agc_locks_tests agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_spirv_module_tests agc_dpp_write_tests agc_masked_select_tests agc_ir_reclaim_tests agc_vector_window_tests agc_constant_bit_test_tests agc_integer_narrowing_tests agc_scalar_select_mask_tests agc_vertex_input_validation_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_pass_hazards_tests agc_barrier_batch_tests agc_shader_disk_cache_tests agc_screenshot_tests agc_shader_device_profile_tests agc_placeholder_images_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_bda_device_tests agc_driver_mesh_tests agc_driver_cmask_fast_clear_tests agc_formatted_buffer_once_tests agc_formatted_buffer_byte_stores_tests ${agcExecutionTests} agc_fma_mix_once_tests agc_f16_single_convert_tests)
+    foreach(agcTest IN ITEMS agc_vertex_input_tests agc_mesh_output_budget_tests agc_shared_write_tests agc_locks_tests agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_spirv_module_tests agc_dpp_write_tests agc_masked_select_tests agc_ir_reclaim_tests agc_vector_window_tests agc_constant_bit_test_tests agc_integer_narrowing_tests agc_scalar_select_mask_tests agc_device_image_keys_tests agc_vertex_input_validation_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_pass_hazards_tests agc_barrier_batch_tests agc_shader_disk_cache_tests agc_screenshot_tests agc_shader_device_profile_tests agc_placeholder_images_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_bda_device_tests agc_driver_mesh_tests agc_driver_cmask_fast_clear_tests agc_formatted_buffer_once_tests agc_formatted_buffer_byte_stores_tests ${agcExecutionTests} agc_fma_mix_once_tests agc_f16_single_convert_tests)
         if(agcTest STREQUAL "agc_driver_constant_store_tests" OR agcTest STREQUAL "agc_driver_flat_apertures_tests" OR agcTest STREQUAL "agc_driver_pipeline_optimized_readback_tests" OR agcTest STREQUAL "agc_driver_rcp_hardware_tests")
             continue()
         endif()
@@ -2504,6 +2783,25 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    add_test(NAME agc_driver_gpu_buffer_format_store_spanned COMMAND agc_driver_gpu_buffer_format_store_tests --wave64)
+    set_tests_properties(agc_driver_gpu_buffer_format_store_spanned PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SPANNED_WAVE=1;APS5_BINDLESS_IMAGES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    add_test(NAME agc_driver_gpu_skinning_loop_spanned COMMAND agc_driver_gpu_skinning_loop_tests)
+    set_tests_properties(agc_driver_gpu_skinning_loop_spanned PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SPANNED_WAVE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    add_test(NAME agc_formatted_buffer_once_spanned COMMAND agc_formatted_buffer_once_tests)
+    set_tests_properties(agc_formatted_buffer_once_spanned PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SPANNED_WAVE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_gpu_buffer_format_store_spanned agc_driver_gpu_skinning_loop_spanned agc_formatted_buffer_once_spanned PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    set_tests_properties(agc_driver_queued_raw_shader PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=8" TIMEOUT 30)
+    set_tests_properties(agc_driver_pass_input_hazard PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_INPUTS_IN_PLACE=1")
+    set_tests_properties(agc_driver_linear_target_resident PROPERTIES ENVIRONMENT "APS5_NO_PIPELINE_JOURNAL=1;APS5_RESIDENT_LINEAR=1")
+    # Main's 4_4_4_4 target-merge state test describes a linear target's resident surface.
+    set_tests_properties(agc_driver_graphics PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RESIDENT_LINEAR=1")
+    add_test(NAME agc_driver_pipelined_dma_legacy COMMAND agc_driver_pipelined_dma_tests --legacy)
+    set_tests_properties(agc_driver_pipelined_dma_legacy PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_pipelined_dma_legacy PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_guarded_direct_root COMMAND agc_driver_guarded_null_pointer_tests --direct-root-only)
     set_tests_properties(agc_driver_storage_presync_writer PROPERTIES TIMEOUT 30)
     set_tests_properties(agc_driver_guarded_direct_root PROPERTIES
@@ -2742,6 +3040,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_emulated_color_compare_srgb_decode PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_pipelined_sample_dump_drained COMMAND agc_driver_pipelined_sample_dump_tests)
+    set_tests_properties(agc_driver_pipelined_sample_dump_drained PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_DRAIN_SAMPLE_DUMPS=1"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_pipelined_sample_dump_drained PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_image_srgb_sample_copy_forced COMMAND agc_driver_image_srgb_sample_copy_tests)
     set_tests_properties(agc_driver_image_srgb_sample_copy_forced PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SRGB_SHADER_DECODE=copy"
@@ -2816,6 +3122,7 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_structurizer_intersection_off agc_structurizer_iteration_selection_off agc_shader_control_flow_iteration_selection_off agc_structurizer_forced_fallback agc_shader_control_flow_forced_fallback PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_tests_properties(agc_shader_disk_cache PROPERTIES TIMEOUT 120)
     add_test(NAME agc_driver_gated_dispatch_capture_short_timeout COMMAND agc_driver_gated_dispatch_capture_tests)
     set_tests_properties(agc_driver_gated_dispatch_capture_short_timeout PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_GPU_WAIT_TIMEOUT_MS=1;APS5_NO_PIPELINE_LTO=1"
@@ -2825,6 +3132,12 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_driver_provoking_vertex PROPERTIES TIMEOUT 30)
+    set_tests_properties(agc_driver_direct_image_refusal PROPERTIES TIMEOUT 60)
+    add_test(NAME agc_driver_image_sample_unnormalized_wrap COMMAND agc_driver_image_sample_unnormalized_tests)
+    set_tests_properties(agc_driver_image_sample_unnormalized_wrap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_UNNORM_WRAP_GUARD=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_image_sample_unnormalized_wrap PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_dword_pattern_fill_translated COMMAND agc_driver_dword_pattern_fill_tests)
     set_tests_properties(agc_driver_dword_pattern_fill_translated PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_FILL_HLE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     if(WIN32)
@@ -2898,8 +3211,18 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_driver_sampled_cache_budget_memory COMMAND agc_driver_sampled_cache_budget_tests memory)
     set_tests_properties(agc_driver_sampled_cache_budget_memory PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+    add_test(NAME agc_driver_sampled_cache_burst_overflow COMMAND agc_driver_sampled_cache_budget_tests burst-overflow)
+    set_tests_properties(agc_driver_sampled_cache_burst_overflow PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEXTURE_CACHE_MIB=1;APS5_TEXTURE_OVERFLOW_MIB=4" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME agc_driver_sampled_cache_overflow_lifetime COMMAND agc_driver_sampled_cache_budget_tests overflow-lifetime)
+    set_tests_properties(agc_driver_sampled_cache_overflow_lifetime PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_TEXTURE_CACHE_MIB=1;APS5_TEXTURE_OVERFLOW_MIB=4" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_sampled_cache_budget_memory agc_driver_sampled_cache_burst_overflow agc_driver_sampled_cache_overflow_lifetime PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_sampled_cache_budget_without_storage_image_multisample COMMAND agc_driver_sampled_cache_budget_tests without-storage-image-multisample)
     set_tests_properties(agc_driver_sampled_cache_budget_without_storage_image_multisample PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_test(NAME agc_driver_sampled_cache_later_use_refusal COMMAND agc_driver_sampled_cache_budget_tests)
+    set_tests_properties(agc_driver_sampled_cache_later_use_refusal PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SAMPLED_LATER_USE_REFUSAL=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_sampled_cache_device_selection COMMAND agc_driver_sampled_cache_budget_tests device-selection-cpu)
     set_tests_properties(agc_sampled_cache_device_selection PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     add_test(NAME agc_driver_sampled_cache_device_selection COMMAND agc_driver_sampled_cache_budget_tests device-selection)
@@ -2917,6 +3240,7 @@ if(BUILD_TESTING)
         endif()
     endforeach()
     set_property(TEST agc_driver_recover_srgb_allocation APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_SRGB_SHADER_DECODE=set:copy")
+    set_property(TEST agc_driver_recover_sampled_allocation APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_NO_IMAGE_SLABS=set:1")
     add_test(NAME agc_driver_resource_cache_storage_admission COMMAND agc_driver_sampled_cache_budget_tests resource-admission)
     add_test(NAME agc_driver_resource_cache_oversized_storage_admission COMMAND agc_driver_sampled_cache_budget_tests resource-oversized)
     add_test(NAME agc_driver_resource_cache_storage_clear COMMAND agc_driver_sampled_cache_budget_tests resource-clear)
@@ -2924,7 +3248,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_resource_cache_lookup_changed COMMAND agc_driver_sampled_cache_budget_tests resource-lookup-changed)
     set_tests_properties(agc_driver_resource_cache_storage_admission agc_driver_resource_cache_oversized_storage_admission agc_driver_resource_cache_storage_clear agc_driver_resource_cache_replaced_texture agc_driver_resource_cache_lookup_changed PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30)
     if(WIN32)
-        set_tests_properties(agc_driver_sampled_cache_budget_memory agc_driver_sampled_cache_budget_without_storage_image_multisample agc_driver_resource_cache_storage_admission agc_driver_resource_cache_oversized_storage_admission agc_driver_resource_cache_storage_clear agc_driver_resource_cache_replaced_texture agc_driver_resource_cache_lookup_changed PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_sampled_cache_budget_memory agc_driver_sampled_cache_budget_without_storage_image_multisample agc_driver_sampled_cache_later_use_refusal agc_driver_resource_cache_storage_admission agc_driver_resource_cache_oversized_storage_admission agc_driver_resource_cache_storage_clear agc_driver_resource_cache_replaced_texture agc_driver_resource_cache_lookup_changed PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     # The driver draw test again with the draw key off: the draw cache then keys on the decoded vertex
@@ -3021,13 +3345,33 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_stencil_replay_no_gpl PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_tests_properties(agc_driver_queued_index_read_order PROPERTIES TIMEOUT 60)
+    add_test(NAME agc_driver_queued_index_read_order_no_held_read_skip COMMAND agc_driver_queued_index_read_order_tests)
+    set_tests_properties(agc_driver_queued_index_read_order_no_held_read_skip PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HELD_READ_SKIP=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_queued_index_read_order_no_held_read_skip PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_pipelined_dispatch_item COMMAND agc_driver_pipelined_dispatch_tests)
+    add_test(NAME agc_driver_pipelined_dispatch_misses COMMAND agc_driver_pipelined_dispatch_tests)
+    set_tests_properties(agc_driver_pipelined_dispatch_misses PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_DISPATCH=1;APS5_PIPELINE_DISPATCH_MISSES=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_pipelined_dispatch_misses PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_tests_properties(agc_driver_pipelined_dispatch_item PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINE_DISPATCH=1" SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_driver_pipelined_dispatch_item PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    set_tests_properties(agc_driver_queued_index_read_order PROPERTIES TIMEOUT 60)
+    add_test(NAME agc_driver_draw_ahead_verify COMMAND agc_driver_draw_ahead_tests)
+    set_tests_properties(agc_driver_draw_ahead_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_ENTRIES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_ahead_small_cache COMMAND agc_driver_draw_ahead_tests small-cache)
+    set_tests_properties(agc_driver_draw_ahead_small_cache PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_CACHE_ENTRIES=2" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_draw_ahead_verify agc_driver_draw_ahead_small_cache PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 
     foreach(agcTest IN ITEMS agc_spirv_narrow_constant_store_tests agc_spirv13_image_tests agc_spirv_optimizer_tests agc_driver_constant_store_tests)
         if(NOT TARGET ${agcTest})
@@ -3059,14 +3403,15 @@ if(BUILD_TESTING)
             endif()
         endforeach()
     endforeach()
+    set_tests_properties(agc_driver_array_layer_target PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LAYER_REFRESH=1")
     add_test(NAME agc_driver_array_layer_target_cpu COMMAND agc_driver_array_layer_target_tests)
     set_tests_properties(agc_driver_array_layer_target_cpu PROPERTIES
-            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1" TIMEOUT 30 SKIP_RETURN_CODE 77)
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1;APS5_LAYER_REFRESH=1;APS5_SELECTED_CPU_UPLOAD=1" TIMEOUT 30 SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_driver_array_layer_target_cpu PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    foreach(preparedMode IN ITEMS indirect uncached debug debug_failure deferred deferred_undecodable registered_workgroup registered_workgroup_sync abi_deferred_compute abi_deferred_pixel abi_deferred_stages abi_deferred_rectangle abi_deferred_undecodable_state abi_deferred_registration_failure abi_deferred_vertex_inputs abi_deferred_rectangle_pairs lazy lazy_sync)
+    foreach(preparedMode IN ITEMS indirect uncached debug debug_failure deferred deferred_undecodable deferred_aperture skip_refused inline preparation_failure inline_preparation_failure registered_workgroup registered_workgroup_sync abi_deferred_compute abi_deferred_pixel abi_deferred_stages abi_deferred_rectangle abi_deferred_undecodable_state abi_deferred_registration_failure abi_deferred_vertex_inputs abi_deferred_rectangle_pairs lazy lazy_sync)
         set(preparedTest "agc_driver_prepared_shaders_${preparedMode}")
         if(preparedMode MATCHES "^abi_deferred_")
             string(REPLACE "_" "-" preparedArgument ${preparedMode})
@@ -3075,8 +3420,14 @@ if(BUILD_TESTING)
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --indirect)
         elseif(preparedMode STREQUAL "deferred")
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --deferred)
+        elseif(preparedMode STREQUAL "preparation_failure" OR preparedMode STREQUAL "inline_preparation_failure")
+            add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --preparation-failure)
         elseif(preparedMode STREQUAL "deferred_undecodable")
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --deferred-undecodable)
+        elseif(preparedMode STREQUAL "deferred_aperture")
+            add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --deferred-aperture)
+        elseif(preparedMode STREQUAL "skip_refused")
+            add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --skip-refused)
         elseif(preparedMode STREQUAL "lazy" OR preparedMode STREQUAL "lazy_sync")
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests --lazy)
         elseif(preparedMode STREQUAL "registered_workgroup" OR preparedMode STREQUAL "registered_workgroup_sync")
@@ -3088,10 +3439,14 @@ if(BUILD_TESTING)
             add_test(NAME ${preparedTest} COMMAND agc_driver_prepared_shaders_tests)
         endif()
         set_tests_properties(${preparedTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-        if(preparedMode MATCHES "^abi_deferred_")
-            set_property(TEST ${preparedTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_FAILURE_MEMO=1")
+        if(preparedMode STREQUAL "inline" OR preparedMode STREQUAL "inline_preparation_failure")
+            set_property(TEST ${preparedTest} APPEND PROPERTY ENVIRONMENT "APS5_INLINE_SHADER_PREPARE=0")
+        elseif(preparedMode MATCHES "^abi_deferred_")
+            set_property(TEST ${preparedTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_FAILURE_MEMO=1" "APS5_STRICT_SHADER_REFUSALS=1")
         elseif(preparedMode STREQUAL "uncached")
             set_property(TEST ${preparedTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_DISPATCH_CACHE=1")
+        elseif(preparedMode STREQUAL "skip_refused")
+            set_property(TEST ${preparedTest} APPEND PROPERTY ENVIRONMENT "APS5_SKIP_REFUSED_SHADERS=1")
         elseif(preparedMode STREQUAL "registered_workgroup_sync")
             set_property(TEST ${preparedTest} APPEND PROPERTY ENVIRONMENT "APS5_SYNC_SHADER_PREPARE=1")
         elseif(preparedMode STREQUAL "lazy" OR preparedMode STREQUAL "lazy_sync")
@@ -3106,6 +3461,14 @@ if(BUILD_TESTING)
             set_tests_properties(${preparedTest} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    foreach(tessellationTest IN ITEMS agc_driver_tessellation_registered_refusal agc_driver_tessellation_skip_refused)
+        add_test(NAME ${tessellationTest} COMMAND agc_driver_tessellation_tests --registered-refusal)
+        set_tests_properties(${tessellationTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${tessellationTest} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_property(TEST agc_driver_tessellation_skip_refused APPEND PROPERTY ENVIRONMENT "APS5_SKIP_REFUSED_SHADERS=1")
     add_test(NAME agc_driver_shutdown_threads_joined COMMAND agc_driver_shutdown_threads_tests --joined)
     add_test(NAME agc_driver_shutdown_threads_queued_prebuilds COMMAND agc_driver_shutdown_threads_tests --queued-prebuilds)
     add_test(NAME agc_driver_shutdown_threads_compare_helpers COMMAND agc_driver_shutdown_threads_tests --compare-helpers)
@@ -3136,6 +3499,8 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_prepared_shaders
         agc_driver_prepared_shaders_indirect agc_driver_prepared_shaders_uncached
         agc_driver_prepared_shaders_debug agc_driver_prepared_shaders_debug_failure
+        agc_driver_prepared_shaders_inline agc_driver_prepared_shaders_preparation_failure
+        agc_driver_prepared_shaders_inline_preparation_failure
         PROPERTIES RESOURCE_LOCK shader_failure_capture)
 endif()
 
@@ -3235,8 +3600,8 @@ include(PostCompile.cmake)
 add_executable(agc_shader_replay EXCLUDE_FROM_ALL
         tools/ShaderReplay.cpp
 )
-target_include_directories(agc_shader_replay PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_shader_replay PRIVATE shader_recompiler_agc_driver libc)
+target_include_directories(agc_shader_replay PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_shader_replay PRIVATE shader_recompiler_agc_driver libSceAgcDriver libc)
 if(ANYPS5_ENABLE_SPIRV_TOOLS)
     target_link_libraries(agc_shader_replay PRIVATE SPIRV-Tools-static)
 endif()

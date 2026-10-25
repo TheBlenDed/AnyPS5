@@ -106,6 +106,11 @@ if(BUILD_TESTING)
     target_link_libraries(relinker_game_patch_tests PRIVATE relinker_core)
     add_test(NAME relinker_game_patch COMMAND relinker_game_patch_tests)
     set_tests_properties(relinker_game_patch PROPERTIES TIMEOUT 30)
+
+    add_test_executable(call_registry_writer_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/CallRegistryWriterTests.cpp)
+    target_link_libraries(call_registry_writer_tests PRIVATE relinker_core)
+    add_test(NAME call_registry_writer COMMAND call_registry_writer_tests)
+    set_tests_properties(call_registry_writer PROPERTIES TIMEOUT 20)
 endif()
 
 if(ANYPS5_BUILD_WASM)
@@ -693,6 +698,8 @@ if(BUILD_TESTING)
         add_test(NAME windows_import_modules COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_import_modules.py
             $<TARGET_FILE:relinker> ${windows_stdio_host_arguments})
+        add_test(NAME import_library_identity COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_import_library_identity.py $<TARGET_FILE:relinker>)
         if(WIN32)
             foreach(kernelVariant IN ITEMS sys web)
                 add_test(NAME windows_kernel_variant_${kernelVariant} COMMAND ${Python3_EXECUTABLE}

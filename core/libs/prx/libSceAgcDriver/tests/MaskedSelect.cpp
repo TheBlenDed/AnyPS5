@@ -154,6 +154,50 @@ bool run(const char* name, const std::function<bool()>& test) {
 int main() {
     bool passed = true;
 
+    passed &= run("long use chains with repeated operands respect the instruction-scaled walk budget", [] {
+        for (const auto count : {4095u, 4096u}) {
+            for (const bool duplicateUse : {false, true}) {
+                Builder b;
+                auto& exec = b.mask(16u);
+                auto& old = b.lane();
+                auto& written = b.select(exec, b.add(old, 1u), old);
+                auto& one = b.constant(1u);
+                auto* tail = &written;
+                for (unsigned index = 0; index < count; ++index) tail = &b.emit(IrOpcode::IAdd32, IrType::U32, {tail, duplicateUse ? tail : &one});
+                b.keep(b.select(exec, *tail, old));
+                if (b.eliminate() != 1u || !removed(written)) return false;
+                const auto fixed = ProgramToString(b.program);
+                if (b.eliminate() != 0u || ProgramToString(b.program) != fixed) return false;
+            }
+        }
+        return true;
+    });
+
+    passed &= run("shared DAGs and distinct masks reach a fixed point before and after program growth", [] {
+        Builder b;
+        auto& firstExec = b.mask(16u);
+        auto& secondExec = b.mask(32u);
+        auto& old = b.lane();
+        auto& first = b.select(firstExec, b.add(old, 1u), old);
+        auto& shared = b.emit(IrOpcode::IAdd32, IrType::U32, {&first, &first});
+        auto& left = b.add(shared, 2u);
+        auto& right = b.add(shared, 3u);
+        b.keep(b.select(firstExec, b.emit(IrOpcode::IAdd32, IrType::U32, {&left, &right}), old));
+        auto& second = b.select(secondExec, b.add(old, 4u), old);
+        b.keep(b.select(secondExec, b.add(second, 5u), old));
+        b.emit(IrOpcode::ReadFirstLane, IrType::U32, {&second, &secondExec});
+        if (b.eliminate() != 2u || !removed(first) || !removed(second)) return false;
+        const auto fixed = ProgramToString(b.program);
+        if (b.eliminate() != 0u || ProgramToString(b.program) != fixed) return false;
+        auto& laterExec = b.mask(8u);
+        auto& laterOld = b.lane();
+        auto& written = b.select(laterExec, b.add(laterOld, 6u), laterOld);
+        b.keep(b.select(laterExec, b.add(written, 7u), laterOld));
+        if (b.eliminate() != 1u || !removed(written)) return false;
+        const auto grown = ProgramToString(b.program);
+        return b.eliminate() == 0u && ProgramToString(b.program) == grown;
+    });
+
     passed &= run("a write read only under its own exec must lose its select", [] {
         Builder b;
         auto& exec = b.mask(16u);

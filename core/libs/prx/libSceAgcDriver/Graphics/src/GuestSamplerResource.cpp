@@ -54,7 +54,7 @@ float toSignedLodBias(std::uint32_t raw) {
 
 }
 
-GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words, bool unnormalizedProven, bool forceDegammaPaired, bool integerBorder) {
+GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words, bool unnormalizedProven, bool forceDegammaPaired, bool integerBorder, bool) {
     Require(words.size() == 4, "guest sampler descriptor must contain 4 dwords");
 
     const auto clampX = (words[0] >> 0u) & 0x7u;

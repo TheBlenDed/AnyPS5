@@ -1,8 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
-#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include <algorithm>
@@ -185,9 +185,13 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
     AgcDriver::ReportFailure(error);
 }
 
+// ABI resolution prepares programs on the title's thread. A refusal there (APS5_SKIP_REFUSED_SHADERS only)
+// is reported and skipped; the draws and dispatches that use the program are skipped as they come.
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveShaderAbi(shader, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -195,12 +199,17 @@ extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std:
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsAbi(vertex, pixel, primitiveType);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
+
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsStagesAbi(stages, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+} catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
+    AgcDriver::DriverDetail::Driver::SkipRefusedPreparation(refusal);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }

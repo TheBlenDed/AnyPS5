@@ -4,6 +4,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -14,10 +15,31 @@ namespace AgcDriver::Graphics {
 
 struct HostImport;
 
+// #6188 (draw-ahead): the draw state a draw-ahead worker prepares for an entry it compiled ahead.
+struct AheadDraw {
+    std::shared_ptr<const VertexInputLayout> vertexInput;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    std::vector<std::uint32_t> contentKey;
+    VkDevice device = VK_NULL_HANDLE;
+};
+std::uint64_t AheadDrawUses();
+const AheadDraw* AheadDrawFor(const AheadDraw* ahead, const Context& context);
+std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const State& state, std::span<const CompiledShader> shaders);
+
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): what a draw's resource build can do before the draw without
+// the device lock, made from the draw's own inputs by the draw pipeline's preparer: the resource
+// key, whether the resource cache held an entry for it then, and stage A of a fresh build (see
+// ShaderResources' DeferredDrawBuild). Draw uses it only when its own lookup misses and the
+// stamps taken before the preparation (ForgetSerial, the registry generation, the device) are
+// unchanged; otherwise it builds under the lock as before.
+struct PreparedDraw;
+bool SplitDrawBuild();
+std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr);
 
 struct PixelFunctionLdsLayouts {
     VkDescriptorSetLayout empty = VK_NULL_HANDLE;

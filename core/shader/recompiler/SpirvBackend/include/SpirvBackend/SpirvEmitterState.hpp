@@ -83,11 +83,25 @@ struct SpirvTableAccess {
     std::uint32_t dword3 = 0;
     std::uint32_t samplerElement = 0;
     bool active = false;
+    bool bindless = false;
     bool uniform = false;
+};
+
+struct SpirvBindlessProbe {
+    std::uint32_t image = 0;
+    std::uint32_t sampler = 0;
+    std::uint32_t samplerWords = 0;
+    std::uint32_t extra = 0;
+    std::uint32_t result = 0;
+    std::uint32_t uniform = 0;
+    std::uint32_t invalid = 0;
+    std::uint32_t base = 0;
 };
 
 struct SpirvEmitterState {
     const ImageResource* runtimeImage = nullptr;
+    std::map<std::uint32_t, bool> directImageRefusals;
+    std::map<std::uint32_t, bool> unnormalizedWrapGuards;
     SpirvTableAccess tableAccess;
     SpirvEmitterState(const IrProgram& program, const ShaderStageInputInfo& inputInfo);
 
@@ -110,6 +124,10 @@ struct SpirvEmitterState {
     bool registrationModules = false;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
+    // See SpirvTarget::fusedFma (EmitFPInterpolateF16's exact f32 path).
+    bool fusedFma = false;
+    // See ShaderComputeStageInfo::singleWorkgroup: glc reads through the plain binding, buffer-ordering s_barrier.
+    bool singleWorkgroup = false;
     bool robustBufferAccess2 = false;
     bool float32FlushToZero = false;
     bool float32DenormPreserve = false;
@@ -139,11 +157,14 @@ struct SpirvEmitterState {
     bool tableIndexNonUniform = true;
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
-    std::uint32_t storageBufferCoherentVariable = 0;
     std::uint32_t storageBufferU8Variable = 0;
+    std::uint32_t storageBufferCoherentVariable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
+    std::map<std::array<std::uint32_t, 3>, std::uint32_t> rawGpuBufferFunctions;
+    std::map<std::vector<std::uint32_t>, std::vector<std::uint32_t>> runtimeBufferValues;
+    std::uint32_t runtimeBufferLabel = 0;
     struct BufferLengthCacheEntry {
         std::array<const IrValue*, 4> descriptor{};
         std::uint32_t variable = 0;
@@ -152,7 +173,6 @@ struct SpirvEmitterState {
         std::uint32_t length = 0;
     };
     std::vector<BufferLengthCacheEntry> bufferLengths;
-    std::uint32_t bufferFormatTable = 0;
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
@@ -220,6 +240,20 @@ struct SpirvEmitterState {
     std::vector<SpirvTableImageVariable> tableImageVariables;
     std::uint32_t tableSamplerVariable = 0;
     std::uint32_t tableMapVariable = 0;
+    bool bindlessImages = false;
+    std::vector<SpirvTableImageVariable> bindlessImageVariables;
+    std::uint32_t bindlessSamplerVariable = 0;
+    std::uint32_t bindlessHeaderVariable = 0;
+    std::array<std::uint32_t, 2> bindlessProbeFunctions {};
+    std::array<std::uint32_t, 2> bindlessLookupFunctions {};
+    bool bindlessWaveUniform = false;
+    bool bindlessQuadUniform = false;
+    bool bindlessHoistPlanned = false;
+    std::unordered_map<const IrBlock*, const IrBlock*> bindlessDominators;
+    std::unordered_map<const IrBlock*, std::vector<const IrValue*>> bindlessHoistAt;
+    std::map<std::vector<std::uint32_t>, std::vector<std::pair<const IrBlock*, SpirvBindlessProbe>>> bindlessHoisted;
+    std::map<std::vector<std::uint32_t>, SpirvBindlessProbe> bindlessBlockProbes;
+    const IrBlock* bindlessProbeBlock = nullptr;
     std::uint32_t mainFunc = 0;
     std::uint32_t meshGuestFunc = 0;
     std::uint32_t pixelGuestFunc = 0;
@@ -233,6 +267,9 @@ struct SpirvEmitterState {
     std::uint32_t currentLabel = 0;
     const IrBlock* currentBlock = nullptr;
     std::uint32_t pixelValidMaskVariable = 0;
+    std::array<std::uint32_t, 8> blendTargetImages {};
+    std::array<std::uint32_t, 8> blendTargetWritten {};
+    std::uint32_t blendFragCoordVariable = 0;
     std::uint32_t mergeWordVariable = 0;
     std::uint32_t mergePendingVariable = 0;
     std::uint32_t quadPixelUncovered = 0;
@@ -284,6 +321,9 @@ struct SpirvValueEmitContext {
     std::uint32_t scratchU32Variable = 0;
     SpirvValueEmitContext* otherHalf = nullptr;
     std::uint32_t half = 0;
+    // The later dwords of a scalar buffer load whose first dword read them all (see
+    // EmitRuntimeScalarBufferLoad): their value and the label it was defined in.
+    std::unordered_map<const IrValue*, std::pair<std::uint32_t, std::uint32_t>> scalarRunValues;
 };
 
 struct SpirvDeferredPhiPatch {

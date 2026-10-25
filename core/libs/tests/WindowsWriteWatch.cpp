@@ -345,6 +345,30 @@ void CheckForgottenSectionKeepsNoPages() {
     CloseHandle(section);
 }
 
+void CheckRemappedDirectMemoryDropsSavedCopy() {
+    auto& mappings = Mappings::Get();
+    constexpr std::size_t Page = 0x4000;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, Bytes, nullptr);
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
+    Require(section && memory, "cannot allocate saved copy test memory");
+    mappings.Map(memory, Bytes, section, 0, PAGE_READWRITE, true, true);
+    for (std::size_t page = 0; page < Bytes / Page; ++page) memory[page * Page] = static_cast<unsigned char>(page + 1);
+    mappings.Reset(memory, Bytes);
+    const auto [bytes, blocks] = mappings.SavedMemory();
+    Require(bytes >= Bytes && blocks >= 1, "unmapping resident direct memory did not save its pages");
+    mappings.Map(memory, 2 * Page, section, 0, PAGE_READWRITE, true, true);
+    Require(memory[0] == 1 && memory[Page] == 2, "remapped direct memory lost its saved bytes");
+    Require(mappings.SavedMemory() == std::pair<std::uint64_t, std::uint64_t>(bytes - 2 * Page, blocks), "remapped pages kept their saved copies");
+    mappings.Map(memory + 2 * Page, Bytes - 2 * Page, section, 2 * Page, PAGE_READWRITE, true, true);
+    Require(memory[2 * Page] == 3 && memory[3 * Page] == 4, "the rest of the remapped direct memory lost its saved bytes");
+    Require(mappings.SavedMemory() == std::pair<std::uint64_t, std::uint64_t>(bytes - Bytes, blocks), "a fully remapped run kept its saved pages");
+    mappings.Reset(memory, Bytes);
+    mappings.ForgetSection(section);
+    Require(mappings.SavedMemory().first <= bytes, "a forgotten section added saved copies");
+    VirtualFree(memory, 0, MEM_RELEASE);
+    CloseHandle(section);
+}
+
 void CheckConcurrentWrites() {
     Region region;
     std::atomic<bool> start{false};
@@ -373,6 +397,7 @@ int main() {
         CheckPrivate();
         CheckConcurrentWrites();
         CheckForgottenSectionKeepsNoPages();
+        CheckRemappedDirectMemoryDropsSavedCopy();
         CheckPrivateCommitCarvesPlaceholders();
         CheckPrivateCommitEdgeLayouts();
         CheckPrivateCommitTails();

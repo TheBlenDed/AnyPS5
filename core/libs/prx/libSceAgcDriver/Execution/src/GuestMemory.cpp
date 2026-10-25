@@ -27,6 +27,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -45,10 +46,38 @@
 #include <sys/uio.h>
 #include <unistd.h>
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 #endif
 
 namespace AgcDriver::GuestMemory {
 namespace {
+thread_local ISpeculativeReadGate* speculativeGate = nullptr;
+thread_local std::size_t speculativePins = 0;
+
+class SpeculativePin {
+public:
+    SpeculativePin() : gate(speculativeGate) {
+        if (gate == nullptr) return;
+        if (speculativePins == 0) gate->Enter();
+        ++speculativePins;
+    }
+    ~SpeculativePin() {
+        if (gate != nullptr && --speculativePins == 0) gate->Leave();
+    }
+    SpeculativePin(const SpeculativePin&) = delete;
+    SpeculativePin& operator=(const SpeculativePin&) = delete;
+
+private:
+    ISpeculativeReadGate* gate;
+};
+
+void requireNotSpeculative(const char* operation) {
+    if (speculativeGate != nullptr) throw SpeculativeReadRefused(std::string("guest memory ") + operation + " is not available to a speculative reader");
+}
+
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("AGC driver: ") + reason);
 }
@@ -89,6 +118,15 @@ namespace {
 std::atomic<std::uint64_t> forgetCalls{0};
 // See ForgetSerial: odd while a ForgetPages call stores its page states.
 std::atomic<std::uint64_t> forgetSerial{0};
+constexpr std::size_t ForgetSlotCount = 65536;
+constexpr std::uint64_t ForgetBlockBytes = 65536;
+std::array<std::atomic<std::uint64_t>, ForgetSlotCount> forgetSlots{};
+std::atomic<std::uint64_t> wideForget{0};
+
+void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
+    auto current = slot.load(std::memory_order_relaxed);
+    while (current < serial && !slot.compare_exchange_weak(current, serial, std::memory_order_release, std::memory_order_relaxed)) {}
+}
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
@@ -396,6 +434,11 @@ struct PageSpan {
         if (size == 0) return false;
         const auto count = (size / PageBytes + 8) & ~static_cast<std::size_t>(7);
 #ifdef _WIN32
+        if (std::getenv("APS5_NO_SPARSE_PAGE_STATES") != nullptr) {
+            pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (pages == nullptr) size = 0;
+            return pages != nullptr;
+        }
         const auto chunkCount = (count + ChunkEntries - 1) / ChunkEntries;
         chunks = new (std::nothrow) std::atomic<Chunk*>[chunkCount]{};
         if (chunks == nullptr) size = 0;
@@ -528,8 +571,15 @@ std::size_t ImagePagesSize() {
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
-    forgetSerial.fetch_add(1, std::memory_order_release);
+    const auto started = forgetSerial.fetch_add(1, std::memory_order_release) + 1;
     Pages().forget(address, bytes);
+    const auto done = started + 1;
+    if (bytes != 0) {
+        const auto first = address / ForgetBlockBytes;
+        const auto last = (address + bytes - 1) / ForgetBlockBytes;
+        if (last - first >= ForgetSlotCount) raiseForgetSlot(wideForget, done);
+        else for (auto block = first; block <= last; ++block) raiseForgetSlot(forgetSlots[block % ForgetSlotCount], done);
+    }
     forgetSerial.fetch_add(1, std::memory_order_release);
 }
 
@@ -810,6 +860,7 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && address % alignment == 0, "null or misaligned address");
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
+    const SpeculativePin pin;
     const auto reason = verify(address, bytes, writable);
     if (!reason.empty()) {
         // Debug aid: APS5_TRACE_UNREADABLE names the code that checked an inaccessible range.
@@ -821,11 +872,25 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
 
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    return address != 0 && bytes <= std::numeric_limits<std::uintptr_t>::max() - address && verify(address, bytes, writable).empty();
+    if (address == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return false;
+    const SpeculativePin pin;
+    return verify(address, bytes, writable).empty();
 }
 
 std::uint64_t ForgetSerial() {
     return forgetSerial.load(std::memory_order_acquire);
+}
+
+std::uint64_t ForgetStamp(std::uint64_t address, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_FORGET_STAMPS") != nullptr;
+    if (disabled) return forgetSerial.load(std::memory_order_acquire);
+    if (bytes == 0) return 0;
+    const auto first = address / ForgetBlockBytes;
+    const auto last = (address + bytes - 1) / ForgetBlockBytes;
+    if (last - first >= ForgetSlotCount) return forgetSerial.load(std::memory_order_acquire);
+    auto newest = wideForget.load(std::memory_order_acquire);
+    for (auto block = first; block <= last; ++block) newest = std::max(newest, forgetSlots[block % ForgetSlotCount].load(std::memory_order_acquire));
+    return newest;
 }
 
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
@@ -1512,7 +1577,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     const TimedAccess timed(CounterCollect, bytes);
-#ifndef _WIN32
+    const auto requestedFirst = first;
+    const auto requestedStop = stop;
     if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
         const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
@@ -1521,8 +1587,18 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             stop = end;
         }
     }
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+#ifdef _WIN32
+        // Windows coverage does not know which pages of a block are committed or inaccessible, and a
+        // walk refuses such a range before it collects anything: walk the requested pages instead.
+        if (first == requestedFirst && stop == requestedStop) return 0;
+        first = requestedFirst;
+        stop = requestedStop;
+        if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+#else
+        return 0;
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1622,6 +1698,10 @@ void BumpCollectEpoch() {
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
+void EndCollectEpoch() {
+    HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(0);
+}
+
 std::uint64_t ThreadCollectEpoch() {
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
 }
@@ -1692,6 +1772,19 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 #endif
 }
 
+thread_local bool ownHostWrite = false;
+
+class OwnHostWrite {
+public:
+    OwnHostWrite() : outer(std::exchange(ownHostWrite, true)) {}
+    ~OwnHostWrite() { ownHostWrite = outer; }
+    OwnHostWrite(const OwnHostWrite&) = delete;
+    OwnHostWrite& operator=(const OwnHostWrite&) = delete;
+
+private:
+    bool outer;
+};
+
 }
 
 void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
@@ -1758,6 +1851,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
     const auto runImport = [&] {
 #ifdef __APPLE__
+        const OwnHostWrite own;
         const GuestArena::HostWrite open(reinterpret_cast<void*>(first), static_cast<std::size_t>(stop - first));
 #endif
         return import();
@@ -1802,16 +1896,20 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     for (const auto& [begin, end] : leaving) saveBytes(begin, end);
     if (!runImport()) return false;
     const WindowCopy window{first, hashes};
+    leaving.clear();
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
-        if (!walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) {
-            saveBytes(begin, end);
-            continue;
-        }
-        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom));
+        if (!walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) continue;
+        if (unwatchedFrom < begin) leaving.emplace_back(unwatchedFrom, begin);
         unwatchedFrom = end;
     }
-    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom));
+    if (unwatchedFrom < stop) leaving.emplace_back(unwatchedFrom, stop);
+    if (!leaving.empty()) {
+        lock.Unlock();
+        for (const auto& [begin, end] : leaving) beforeUnwatch(begin, static_cast<std::size_t>(end - begin));
+        lock.Resume();
+        for (const auto& [begin, end] : leaving) unwatchLocked(tracker, begin, static_cast<std::size_t>(end - begin));
+    }
     return true;
 }
 
@@ -1906,6 +2004,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store) {
+    requireNotSpeculative("store");
     return storeOwn(address, bytes, [&] {
         store();
         return std::pair<std::uint64_t, std::uint64_t>{address, address + bytes};
@@ -2075,6 +2174,114 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     static_cast<void>(bytes);
     return 0;
 #endif
+}
+
+namespace {
+
+bool sameClippedRuns(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* now, std::uint64_t address, std::size_t bytes, std::uint64_t begin, std::uint64_t end);
+
+}
+
+bool UntrackedLayoutWalks() {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_LAYOUT") != nullptr;
+    return !disabled;
+}
+
+std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds, const Commitment* before, Commitment* now) {
+    std::fill(stale.begin(), stale.end(), std::uint8_t{1});
+    if (kinds != nullptr) *kinds = {};
+    if (now != nullptr) *now = {};
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || stale.size() != HashBlockCount(address, bytes)) return 0;
+    enum class Kind : std::uint8_t { Covered, Hinted, Outside, HostRegion, Unhinted, Refused };
+    thread_local std::vector<Kind>* kindSlot = nullptr;
+    auto& blockKinds = ShaderRecompiler::ThreadOwned(kindSlot);
+    blockKinds.assign(stale.size(), Kind::Unhinted);
+    constexpr std::uint64_t page = 4096;
+    const auto end = address + bytes;
+    const auto blockRange = [&](std::size_t index) {
+        const auto begin = index == 0 ? address : (address / HashBlockBytes + index) * HashBlockBytes;
+        return std::pair<std::uint64_t, std::uint64_t>{begin, std::min<std::uint64_t>(end, (address / HashBlockBytes + index + 1) * HashBlockBytes)};
+    };
+    const bool layoutWalk = now != nullptr && UntrackedLayoutWalks();
+    if (layoutWalk) *now = DescribeCommitted(address, bytes);
+    const auto* nowRuns = layoutWalk && !now->whole ? &now->ranges : nullptr;
+    const auto* beforeRuns = before != nullptr && !before->whole ? &before->ranges : nullptr;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return 0;
+    for (std::size_t index = 0; index < stale.size(); ++index) {
+        const auto [begin, stop] = blockRange(index);
+        const auto first = begin & ~(page - 1);
+        const auto last = (stop + page - 1) & ~(page - 1);
+        auto& kind = blockKinds[index];
+        if (tracker.covers(first, static_cast<std::size_t>(last - first))) kind = Kind::Covered;
+#ifdef _WIN32
+        else if (first < tracker.base || last > tracker.base + tracker.size) kind = Kind::Outside;
+        else if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) kind = Kind::HostRegion;
+        else if (tracker.hinted(first, last)) kind = Kind::Hinted;
+#endif
+    }
+    const auto walkRun = [&](Kind kind, std::uint64_t first, std::uint64_t last) {
+        if (kind == Kind::Covered) return walkWrites(tracker, first, last, StampKind::Cpu);
+#ifdef _WIN32
+        return walkHints(tracker, first, last);
+#else
+        return false;
+#endif
+    };
+    for (std::size_t index = 0; index < stale.size();) {
+        const auto kind = blockKinds[index];
+        auto next = index + 1;
+        while (next < stale.size() && blockKinds[next] == kind) ++next;
+        if (kind == Kind::Covered || kind == Kind::Hinted) {
+            const auto first = blockRange(index).first & ~(page - 1);
+            const auto last = (blockRange(next - 1).second + page - 1) & ~(page - 1);
+            bool walked = true;
+            if (nowRuns == nullptr) {
+                walked = walkRun(kind, first, last);
+            } else {
+                for (const auto& [from, to] : *nowRuns) {
+                    const auto low = std::max<std::uint64_t>(from & ~(page - 1), first);
+                    const auto high = std::min<std::uint64_t>((to + page - 1) & ~(page - 1), last);
+                    if (low < high && !walkRun(kind, low, high)) {
+                        walked = false;
+                        break;
+                    }
+                }
+            }
+            if (!walked) {
+                for (auto k = index; k < next; ++k) blockKinds[k] = Kind::Refused;
+            }
+        }
+        index = next;
+    }
+    for (std::size_t index = 0; index < stale.size(); ++index) {
+        const auto kind = blockKinds[index];
+        const auto [begin, stop] = blockRange(index);
+        const bool partial = nowRuns != nullptr && !sameClippedRuns(nullptr, nowRuns, address, bytes, begin, stop);
+        const bool layoutChanged = layoutWalk && previous != 0 && (before == nullptr || !sameClippedRuns(beforeRuns, nowRuns, address, bytes, begin, stop));
+        if (kinds != nullptr) {
+            switch (kind) {
+                case Kind::Covered: ++kinds->covered; break;
+                case Kind::Hinted: ++kinds->hinted; break;
+                case Kind::Outside: ++kinds->outside; break;
+                case Kind::HostRegion: ++kinds->hostRegion; break;
+                case Kind::Unhinted: ++kinds->unhinted; break;
+                case Kind::Refused: ++kinds->refused; break;
+            }
+            if (partial) ++kinds->partial;
+            if (layoutChanged) ++kinds->layoutChanged;
+        }
+        if (previous == 0 || (kind != Kind::Covered && kind != Kind::Hinted)) continue;
+        if (layoutChanged) continue;
+        if (tracker.newestStamp(begin, stop) > previous) continue;
+#ifdef _WIN32
+        if (kind == Kind::Hinted && tracker.newestHint(begin & ~(page - 1), (stop + page - 1) & ~(page - 1)) > previous) continue;
+#endif
+        stale[index] = 0;
+    }
+    return tracker.generation.load(std::memory_order_relaxed);
 }
 
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
@@ -2522,14 +2729,75 @@ void GuardRead(std::uint64_t address, std::size_t bytes) {
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, bytes);
 }
 
-void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
+namespace {
+bool copyThroughKernel(std::uint64_t address, std::span<std::byte> destination) {
+#ifdef _WIN32
+    SIZE_T copied = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(static_cast<std::uintptr_t>(address)), destination.data(), destination.size(), &copied) != 0 && copied == destination.size();
+#elif defined(__APPLE__)
+    mach_vm_size_t copied = 0;
+    return mach_vm_read_overwrite(mach_task_self(), address, destination.size(), reinterpret_cast<mach_vm_address_t>(destination.data()), &copied) == KERN_SUCCESS && copied == destination.size();
+#else
+    iovec local{destination.data(), destination.size()};
+    iovec remote{reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), destination.size()};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(destination.size());
+#endif
+}
+
+void flushBeforeAccess(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
+}
+
+}
+
+SpeculativeReadScope::SpeculativeReadScope(ISpeculativeReadGate& gate) : previous(speculativeGate) {
+    speculativeGate = &gate;
+}
+
+SpeculativeReadScope::~SpeculativeReadScope() {
+    speculativeGate = previous;
+}
+
+bool SpeculativeReadsSupported() {
+    static const bool supported = [] {
+        const std::uint64_t probe = 0x5a5a5a5aa5a5a5a5ull;
+        std::uint64_t copied = 0;
+        return copyThroughKernel(reinterpret_cast<std::uintptr_t>(&probe), std::as_writable_bytes(std::span(&copied, 1))) && copied == probe;
+    }();
+    return supported;
+}
+
+bool SpeculativeReader() {
+    return speculativeGate != nullptr;
+}
+
+void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
+    requireNotSpeculative("access with a flush");
+    flushBeforeAccess(address, bytes);
+}
+
+void PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
+    if (ownHostWrite || bytes == 0) return;
+    const ReadSiteScope site(ReadSite::Store);
+    FlushGpuWrites(address, bytes);
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
     GuardRead(address, destination.size());
-    FlushGpuWrites(address, destination.size());
+    if (speculativeGate != nullptr) {
+        const SpeculativePin pin;
+        try {
+            CheckRange(reinterpret_cast<const void*>(address), destination.size(), alignment);
+        } catch (const SpeculativeReadRefused&) {
+            throw;
+        } catch (const std::runtime_error& error) {
+            throw SpeculativeReadRefused(error.what());
+        }
+        if (!copyThroughKernel(address, destination)) throw SpeculativeReadRefused("AGC driver: a speculative guest read found the range unmapped");
+        return;
+    }
+    flushBeforeAccess(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     const auto* source = reinterpret_cast<const void*>(address);
@@ -2574,6 +2842,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
 }
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
+    requireNotSpeculative("read of committed pages");
     if (destination.empty()) return;
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
@@ -2583,6 +2852,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
 }
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
+    requireNotSpeculative("read of committed pages");
     if (destination.empty()) return;
     GuardRead(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -2597,6 +2867,7 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 }
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
+    requireNotSpeculative("compare");
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
@@ -2607,6 +2878,7 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
 }
 
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
+    requireNotSpeculative("compare");
     if (bytes.empty()) return Compare::Equal;
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
@@ -2620,6 +2892,7 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
 }
 
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
+    requireNotSpeculative("copy");
     if (out.empty()) return Compare::Equal;
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
     auto outcome = Compare::Equal;
@@ -2645,6 +2918,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 }
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    requireNotSpeculative("store");
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     BreakProofs();
     if (current.empty()) return;
@@ -2683,7 +2957,201 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     });
 }
 
+namespace {
+
+// Visits the hash blocks of [address, address + bytes) in order: (index, begin, length).
+template <class Visit>
+bool forEachHashBlock(std::uint64_t address, std::size_t bytes, Visit&& visit) {
+    const auto end = address + bytes;
+    std::size_t index = 0;
+    for (auto at = address; at < end; ++index) {
+        const auto stop = std::min<std::uint64_t>(end, (at / HashBlockBytes + 1) * HashBlockBytes);
+        if (!visit(index, at, static_cast<std::size_t>(stop - at))) return false;
+        at = stop;
+    }
+    return true;
+}
+
+// Hashes guest blocks in place while every page is readable; otherwise each block is assembled as
+// ReadCommitted would read it (zeros where nothing is committed).
+class CommittedHasher {
+public:
+    CommittedHasher(std::uint64_t address, std::size_t bytes) : whole(Accessible(reinterpret_cast<const void*>(address), bytes)) {
+        if (!whole) ranges = CommittedRanges(address, bytes);
+    }
+    explicit CommittedHasher(Commitment commitment) : whole(commitment.whole), ranges(std::move(commitment.ranges)) {}
+    ContentHash::Hash128 operator()(std::uint64_t begin, std::size_t length) {
+        if (whole) return ContentHash::Of(reinterpret_cast<const void*>(begin), length);
+        thread_local std::vector<std::byte>* scratchSlot = nullptr;
+        auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+        scratch.assign(length, std::byte{0});
+        const auto end = begin + length;
+        for (const auto& [from, to] : ranges) {
+            const auto low = std::max<std::uint64_t>(from, begin);
+            const auto high = std::min<std::uint64_t>(to, end);
+            if (low < high) std::memcpy(scratch.data() + (low - begin), reinterpret_cast<const void*>(low), static_cast<std::size_t>(high - low));
+        }
+        return ContentHash::Of(scratch.data(), length);
+    }
+
+private:
+    bool whole;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+}
+
+std::size_t HashBlockCount(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return 0;
+    return static_cast<std::size_t>((address + bytes - 1) / HashBlockBytes - address / HashBlockBytes + 1);
+}
+
+void HashCommittedBlocks(std::uint64_t address, std::size_t bytes, std::span<ContentHash::Hash128> out) {
+    require(out.size() == HashBlockCount(address, bytes), "hash block count differs");
+    if (bytes == 0) return;
+    const TimedAccess timed(CounterRead, bytes);
+    CommittedHasher hash(address, bytes);
+    forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        out[index] = hash(begin, length);
+        return true;
+    });
+}
+
+void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::span<ContentHash::Hash128> out) {
+    require(out.size() == HashBlockCount(address, bytes.size()), "hash block count differs");
+    forEachHashBlock(address, bytes.size(), [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        out[index] = ContentHash::Of(bytes.data() + (begin - address), length);
+        return true;
+    });
+}
+
+bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected) {
+    if (expected.size() != HashBlockCount(address, bytes)) return false;
+    if (bytes == 0) return true;
+    const TimedAccess timed(CounterCompare, bytes);
+    CommittedHasher hash(address, bytes);
+    return forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) { return hash(begin, length) == expected[index]; });
+}
+
+namespace {
+
+template <class Visit>
+void forEachClippedRun(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* runs, std::uint64_t address, std::size_t bytes, std::uint64_t begin, std::uint64_t end, Visit&& visit) {
+    if (runs == nullptr) {
+        const auto low = std::max<std::uint64_t>(address, begin);
+        const auto high = std::min<std::uint64_t>(address + bytes, end);
+        if (low < high) visit(low, high);
+        return;
+    }
+    for (const auto& [from, to] : *runs) {
+        const auto low = std::max<std::uint64_t>(from, begin);
+        const auto high = std::min<std::uint64_t>(to, end);
+        if (low < high) visit(low, high);
+    }
+}
+
+bool sameClippedRuns(const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* now, std::uint64_t address, std::size_t bytes, std::uint64_t begin, std::uint64_t end) {
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 16> left{};
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 16> right{};
+    std::size_t leftCount = 0;
+    std::size_t rightCount = 0;
+    bool fits = true;
+    const auto collect = [&](auto& out, std::size_t& count) {
+        return [&](std::uint64_t low, std::uint64_t high) {
+            if (count != 0 && out[count - 1].second == low) {
+                out[count - 1].second = high;
+                return;
+            }
+            if (count == out.size()) {
+                fits = false;
+                return;
+            }
+            out[count++] = {low, high};
+        };
+    };
+    forEachClippedRun(before, address, bytes, begin, end, collect(left, leftCount));
+    forEachClippedRun(now, address, bytes, begin, end, collect(right, rightCount));
+    return fits && leftCount == rightCount && std::equal(left.begin(), left.begin() + static_cast<std::ptrdiff_t>(leftCount), right.begin());
+}
+
+}
+
+bool CommittedBlocksMatchMarked(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::span<const std::uint8_t> marked, BlockMatch* match, const Commitment* layout) {
+    if (match != nullptr) *match = {};
+    if (expected.size() != HashBlockCount(address, bytes) || marked.size() != expected.size()) return false;
+    if (bytes == 0) return true;
+    std::uint64_t markedBytes = 0;
+    forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t, std::size_t length) {
+        if (marked[index] != 0) markedBytes += length;
+        return true;
+    });
+    const TimedAccess timed(CounterCompare, markedBytes);
+    CommittedHasher hash = layout != nullptr ? CommittedHasher(*layout) : CommittedHasher(address, bytes);
+    BlockMatch counted;
+    const bool equal = forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        if (marked[index] == 0) {
+            ++counted.skipped;
+            counted.skippedBytes += length;
+            return true;
+        }
+        ++counted.hashed;
+        counted.hashedBytes += length;
+        return hash(begin, length) == expected[index];
+    });
+    if (match != nullptr) *match = counted;
+    return equal;
+}
+
+bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match) {
+    if (match != nullptr) *match = {};
+    if (expected.size() != HashBlockCount(address, bytes)) return false;
+    if (bytes == 0) return true;
+    auto now = DescribeCommitted(address, bytes);
+    thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
+    auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
+    stale.assign(expected.size(), 1);
+    if (generation != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address) {
+        const auto* nowRuns = now.whole ? nullptr : &now.ranges;
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        if (tracker.watched) {
+            forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+                const auto end = begin + length;
+                if (index < pending.size() && pending[index] != 0) return true;
+                if (!sameClippedRuns(before, nowRuns, address, bytes, begin, end)) return true;
+                bool covered = true;
+                forEachClippedRun(nowRuns, address, bytes, begin, end, [&](std::uint64_t low, std::uint64_t high) { covered = covered && tracker.covers(low, static_cast<std::size_t>(high - low)); });
+                if (!covered || tracker.newestStamp(begin, end) > generation) return true;
+                stale[index] = 0;
+                return true;
+            });
+        }
+    }
+    std::uint64_t staleBytes = 0;
+    forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t, std::size_t length) {
+        if (stale[index] != 0) staleBytes += length;
+        return true;
+    });
+    const TimedAccess timed(CounterCompare, staleBytes);
+    CommittedHasher hash(std::move(now));
+    BlockMatch counted;
+    const bool equal = forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        if (stale[index] == 0) {
+            ++counted.skipped;
+            counted.skippedBytes += length;
+            return true;
+        }
+        ++counted.hashed;
+        counted.hashedBytes += length;
+        return hash(begin, length) == expected[index];
+    });
+    if (match != nullptr) *match = counted;
+    return equal;
+}
+
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
+    requireNotSpeculative("store");
     if (source.empty()) return;
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);

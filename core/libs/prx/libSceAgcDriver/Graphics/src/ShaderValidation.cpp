@@ -1,3 +1,4 @@
+#include "BindlessImageAbi.hpp"
 #include "BdaAbi.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -153,7 +154,7 @@ struct Module {
         }
         const auto signature = Signature(type);
         if (vertex && storage == spv::StorageClassInput) {
-            Require((value == spv::BuiltInVertexIndex || value == spv::BuiltInInstanceIndex || value == spv::BuiltInBaseInstance) && signature == "i32", "unsupported vertex built-in input");
+            Require((value == spv::BuiltInVertexIndex || value == spv::BuiltInInstanceIndex || value == spv::BuiltInBaseInstance || value == spv::BuiltInBaseVertex) && signature == "i32", "unsupported vertex built-in input");
         } else if (vertex && storage == spv::StorageClassOutput) {
             if (value == spv::BuiltInLayer && layerOutput && (signature == "u32" || signature == "i32")) return;
             if (value == spv::BuiltInPointSize && pointSizeOutput && signature == "f32" && !pointSize) {
@@ -231,6 +232,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     case spv::CapabilityGroupNonUniformBallot: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT; break;
                     case spv::CapabilityGroupNonUniformShuffle: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_BIT; break;
                     case spv::CapabilityGroupNonUniformArithmetic: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT; break;
+                    case spv::CapabilityGroupNonUniformQuad: subgroupOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT; break;
                     default: break;
                 }
                 const bool isSubgroupCapability = subgroupOperations != 0;
@@ -441,6 +443,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             case spv::OpTypeRuntimeArray:
             case spv::OpTypeStruct:
             case spv::OpTypePointer:
+            case spv::OpTypeImage:
                 Require(count >= 2 && module.types.emplace(instruction[1], std::vector<std::uint32_t>(instruction.begin(), instruction.end())).second, "invalid or duplicate SPIR-V type");
                 break;
             case spv::OpVariable:
@@ -502,6 +505,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
     } else Require(module.modes.empty(), "unsupported vertex execution mode");
     std::set<std::pair<std::uint32_t, std::uint32_t>> descriptors;
     std::map<std::pair<std::uint32_t, std::uint32_t>, bool> bufferViews;
+    std::set<std::uint32_t> blendedTargets;
     bool push = false;
     for (const auto& [id, variable] : module.variables) {
         if (variable.storage == spv::StorageClassFunction || variable.storage == spv::StorageClassPrivate) continue;
@@ -578,12 +582,24 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(mesh, "workgroup memory outside a mesh shader");
         } else if (variable.storage == spv::StorageClassUniformConstant) {
             Require(decoration.set && decoration.binding, "unbound shader resource");
+            if (shader.bindlessHeap && *decoration.set == ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet) {
+                Require(*decoration.binding == ShaderRecompiler::BindlessImageAbi::SamplerBinding || *decoration.binding == ShaderRecompiler::BindlessImageAbi::SampledImageBinding, "a bindless heap resource uses a binding other than the heap's samplers or sampled images");
+                Require((type[0] & 0xffffu) == spv::OpTypeRuntimeArray, "a bindless heap resource must be declared as a runtime descriptor array");
+                continue;
+            }
+            if (fragment && *decoration.set == ShaderRecompiler::RuntimeAbi::BlendedTargetDescriptorSet) {
+                const auto exportIndex = *decoration.binding;
+                Require(std::any_of(state.blendedColors.begin(), state.blendedColors.end(), [&](const ColorTarget& color) { return color.exportIndex == exportIndex; }), "fragment shader blends into an export that has no blended 10_11_11 unorm target");
+                Require(blendedTargets.insert(exportIndex).second, "duplicate blended 10_11_11 unorm target binding");
+                Require(type.size() == 9 && (type[0] & 0xffffu) == spv::OpTypeImage && module.Signature(type[2]) == "u32" && type[3] == spv::Dim2D && type[4] == 0 && type[5] == 0 && type[6] == 0 && type[7] == 2 && type[8] == spv::ImageFormatR32ui, "a blended 10_11_11 unorm target must be an R32ui 2D storage image");
+                continue;
+            }
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
             const auto binding = std::find_if(shader.bindings.begin(), shader.bindings.end(), [&](const auto& item) { return item.descriptorSet == key.first && item.binding == key.second; });
-            Require(descriptors.insert(key).second || (binding != shader.bindings.end() && (binding->role == ShaderRecompiler::DescriptorRole::ImageTable || binding->role == ShaderRecompiler::DescriptorRole::ImageStorageTable)), "duplicate SPIR-V resource binding");
+            Require(descriptors.insert(key).second || (binding != shader.bindings.end() && binding->role == ShaderRecompiler::DescriptorRole::ImageTable), "duplicate SPIR-V resource binding");
             Require(binding != shader.bindings.end(), "SPIR-V resource is absent from recompiler binding metadata");
             Require(binding->kind == ShaderRecompiler::DescriptorKind::Sampler || binding->kind == ShaderRecompiler::DescriptorKind::SampledImage || binding->kind == ShaderRecompiler::DescriptorKind::StorageImage, "SPIR-V descriptor type disagrees with recompiler binding metadata");
-            if (binding->role == ShaderRecompiler::DescriptorRole::ImageTable || binding->role == ShaderRecompiler::DescriptorRole::ImageStorageTable || binding->role == ShaderRecompiler::DescriptorRole::SamplerTable) {
+            if (binding->role == ShaderRecompiler::DescriptorRole::ImageTable || binding->role == ShaderRecompiler::DescriptorRole::SamplerTable) {
                 Require(type.size() == 3 && (type[0] & 0xffffu) == spv::OpTypeRuntimeArray, "image table must be declared as a runtime descriptor array");
                 continue;
             }
@@ -594,6 +610,10 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(binding->count != 0u && binding->count <= capacity && count != module.constants.end() && count->second == binding->count, "typed heap array length disagrees with compact binding");
         } else {
             Require(variable.storage == spv::StorageClassStorageBuffer && decoration.set && decoration.binding, "unsupported or unbound shader resource");
+            if (shader.bindlessHeap && *decoration.set == ShaderRecompiler::BindlessImageAbi::HeapDescriptorSet) {
+                Require(*decoration.binding == ShaderRecompiler::BindlessImageAbi::HeaderBinding, "a bindless heap buffer uses a binding other than the heap's header");
+                continue;
+            }
             const auto key = std::make_pair(*decoration.set, *decoration.binding);
             if (*decoration.set == ShaderRecompiler::PixelFunctionLdsDescriptorSet) {
                 Require(fragment && *decoration.binding == 0u, "pixel function LDS buffer binding is wrong");

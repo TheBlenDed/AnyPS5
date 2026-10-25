@@ -1,6 +1,10 @@
 #include "BdaTests.hpp"
+#include "EnvironmentGuards.hpp"
+#include "ImageTableAbi.hpp"
+#include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
@@ -15,7 +19,10 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <thread>
+#include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <initializer_list>
@@ -155,6 +162,67 @@ void snapshotTableTests(const Context& context, const BdaTestAccess& access) {
     }
     ClearSnapshotCopies(importing.device);
     change(false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
+void spaceReuseTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    auto* block = static_cast<std::byte*>(::operator new(2 * piece, std::align_val_t{piece}));
+    std::memset(block, 0x5a, 2 * piece);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::byte* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(block, true);
+    alignas(256) static std::array<std::byte, 64> captured{};
+    captured.fill(std::byte{0x21});
+    std::array<std::byte, 16> liveBytes{};
+    std::memcpy(liveBytes.data(), block + 128, liveBytes.size());
+    const std::array<GuestMemorySnapshot, 2> snapshots{{{reinterpret_cast<std::uint64_t>(captured.data()), captured}, {address + 128, liveBytes}}};
+    auto otherCapture = captured;
+    otherCapture[3] = std::byte{0x22};
+    const std::array<GuestMemorySnapshot, 2> otherCopied{{{reinterpret_cast<std::uint64_t>(captured.data()), otherCapture}, snapshots[1]}};
+    const std::array<GuestMemorySnapshot, 1> fewer{{snapshots[0]}};
+    {
+        GuestBufferMemory memory(importing);
+        memory.AcquireRegistered();
+        for (const auto& snapshot : snapshots) memory.AddSnapshot(snapshot);
+        memory.AddWritable(address + 256, 64);
+        memory.Upload(true);
+        if (AddressSpaceCounters().enabled && memory.CopiedBytes() != captured.size()) {
+            Require(!memory.SpaceRegions().has_value(), "an upload with ranges copied per build offered its regions for reuse");
+            std::cout << "registered ranges are copied per build here: address space reuse not tested\n";
+            memory.WriteBack();
+        } else if (AddressSpaceCounters().enabled) {
+            const auto regions = memory.SpaceRegions();
+            Require(regions.has_value() && regions->empty(), "an upload over the address space with only a snapshot copy of its own was refused reuse");
+            const auto written = memory.DirectWrites();
+            Require(written.size() == 1 && written.front() == std::pair{address + 256, address + 320}, "the written range served in place by the address space is not its direct write");
+            Require(memory.SameSnapshots(snapshots), "an upload refused the snapshots it was built from");
+            Require(!memory.SameSnapshots(otherCopied) && !memory.SameSnapshots(fewer), "an upload took snapshots with other copied bytes, or fewer of them");
+            memory.SuspendSpace();
+            Require(!memory.HoldsLease(), "a suspended upload still holds its address space");
+            Require(memory.ResumeSpace() && memory.HoldsLease() && memory.SpaceImportsCurrent(), "an upload could not take its unchanged address space again");
+            memory.SuspendSpace();
+            block[128] ^= std::byte{0xff};
+            Require(!memory.SameSnapshots(snapshots), "an upload took a snapshot that no longer equals the registered memory it covers");
+            block[128] ^= std::byte{0xff};
+            change(block + piece, true);
+            Require(!memory.ResumeSpace() && !memory.HoldsLease(), "an upload took its address space again after another range was registered");
+            change(block + piece, false);
+            Require(!memory.ResumeSpace(), "an upload took a replaced address space again");
+        } else {
+            Require(!memory.SpaceRegions().has_value(), "an upload without the cached address space offered its regions for reuse");
+            memory.WriteBack();
+        }
+    }
+    ClearSnapshotCopies(importing.device);
+    change(block, false);
     ::operator delete(block, std::align_val_t{piece});
 }
 
@@ -2792,6 +2860,170 @@ void gpuMappingTests(const Context& context) {
     ::operator delete(gpu, std::align_val_t{bytes});
 }
 
+namespace {
+
+void directImageFaultTests(const Context& context, const BdaTestAccess& access) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    auto map = binding(Role::ImageTableMap, 4);
+    map.guestDescriptor.resize(ShaderRecompiler::ImageTableAbi::HeaderWords);
+    map.guestDescriptor[ShaderRecompiler::ImageTableAbi::HeaderVersion] = ShaderRecompiler::ImageTableAbi::Version;
+    ShaderRecompiler::RecompileResult shader;
+    Require(!shader.hasDeferredDirectImage && shader.specialization.empty(), "direct image invocation defaults changed");
+    shader.bdaAbiVersion = Abi::Version;
+    shader.bindings = {map, binding(Role::FaultBuffer, 5)};
+    CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    auto faultOnly = context;
+    faultOnly.bufferDeviceAddress = false;
+    const auto report = Abi::Fault{Abi::FaultState::Ready, Abi::FaultReason::DirectImage, 0u, Abi::PackDirectImageFault(8u), 4u, 0x14d8u, 0u};
+    const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
+    for (const bool deferred : {false, true, false}) {
+        shader.hasDeferredDirectImage = deferred;
+        ShaderResources resources(faultOnly, compiled);
+        Require(resources.NeedsCompletion() == (deferred || loopGuarded), "direct image completion did not follow the current invocation flag");
+        Require(shader.specialization.empty(), "direct image completion required finalized specialization constants");
+        const auto fault = access.bytes(access.descriptor(5).buffer);
+        for (const auto byte : fault) Require(byte == std::byte{}, "direct image fault leaked across invocations");
+        if (deferred) {
+            std::memcpy(fault.data(), &report, sizeof(report));
+            reject([&] { resources.WriteBackBuffers(0x80002c4500ULL); }, "direct image: shader 0x80002c4500 stage 4 pc 0x14d8 resource 8: dimension");
+            reject([&] { resources.WriteBackBuffers(0x80003d5600ULL); }, "direct image: shader 0x80003d5600 stage 4 pc 0x14d8 resource 8: dimension");
+            reject([&] { resources.WriteBackBuffers(); }, "direct image: shader address unavailable stage 4 pc 0x14d8 resource 8: dimension");
+            auto malformed = report;
+            malformed.address = 0x80002c4500ULL;
+            std::memcpy(fault.data(), &malformed, sizeof(malformed));
+            reject([&] { resources.WriteBackBuffers(0x80003d5600ULL); }, "invalid direct image fault payload");
+            malformed.address = 0u;
+            malformed.bytes = (8u << 8u) | 2u;
+            std::memcpy(fault.data(), &malformed, sizeof(malformed));
+            reject([&] { resources.WriteBackBuffers(); }, "invalid direct image fault payload");
+            malformed.bytes = Abi::PackDirectImageFault(ShaderRecompiler::ShaderInfo::MaxImages);
+            std::memcpy(fault.data(), &malformed, sizeof(malformed));
+            reject([&] { resources.WriteBackBuffers(); }, "invalid direct image fault payload");
+            std::memset(fault.data(), 0, fault.size());
+        }
+        resources.WriteBackBuffers();
+    }
+    shader.hasDeferredDirectImage = true;
+    shader.bdaAbiVersion = 0u;
+    reject([&] { ShaderResources resources(faultOnly, compiled); }, "BDA table and fault descriptors");
+    shader.bindings = {map};
+    reject([&] { ShaderResources resources(faultOnly, compiled); }, "deferred direct image requires a compute fault buffer");
+    shader.hasDeferredDirectImage = false;
+    {
+        ShaderResources resources(faultOnly, compiled);
+        Require(!resources.NeedsCompletion(), "ordinary image table without a fault buffer required completion");
+    }
+    shader.hasDeferredDirectImage = true;
+    shader.bindings.push_back(binding(Role::FaultBuffer, 5));
+    shader.bdaAbiVersion = Abi::Version;
+    compiled.stage = ShaderRecompiler::ShaderStage::Fragment;
+    reject([&] { ShaderResources resources(faultOnly, compiled); }, "compute resources require a compute shader");
+    reject([&] { ShaderResources resources(faultOnly, std::span<const CompiledShader>(&compiled, 1), ColorTarget{}, 0, 0, 0); }, "deferred direct image requires a compute fault buffer");
+    compiled.stage = ShaderRecompiler::ShaderStage::Compute;
+    alignas(64) std::array<std::uint32_t, 16> guest{};
+    guest[0] = 123u;
+    const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
+    auto writable = binding(Role::GuestBuffers, 6);
+    writable.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, sizeof(guest), 0x31000000u};
+    shader.bindings.push_back(writable);
+    ShaderResources resources(faultOnly, compiled);
+    const auto destination = access.descriptor(6);
+    const std::uint32_t changed = 456u;
+    std::memcpy(access.bytes(destination.buffer).data() + destination.offset, &changed, sizeof(changed));
+    const auto fault = access.bytes(access.descriptor(5).buffer);
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(0x80002c4500ULL); }, "direct image: shader 0x80002c4500 stage 4 pc 0x14d8 resource 8: dimension");
+    Require(guest[0] == 123u, "direct image failure published copied guest writes");
+    std::memset(fault.data(), 0, fault.size());
+    resources.WriteBackBuffers();
+    Require(guest[0] == changed, "cleared direct image fault lost copied guest writes");
+}
+
+void bindlessFaultTests(const Context& context, const BdaTestAccess& access) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    auto map = binding(Role::ImageTableMap, 4);
+    map.guestDescriptor.resize(ShaderRecompiler::ImageTableAbi::HeaderWords);
+    map.guestDescriptor[ShaderRecompiler::ImageTableAbi::HeaderVersion] = ShaderRecompiler::ImageTableAbi::Version;
+    ShaderRecompiler::RecompileResult shader;
+    shader.bdaAbiVersion = Abi::Version;
+    shader.hasDeferredDirectImage = true;
+    shader.bindings = {map, binding(Role::FaultBuffer, 5)};
+    CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    auto faultOnly = context;
+    faultOnly.bufferDeviceAddress = false;
+    ShaderResources resources(faultOnly, compiled);
+    const auto fault = access.bytes(access.descriptor(5).buffer);
+    auto report = Abi::Fault{Abi::FaultState::Ready, Abi::FaultReason::BindlessMiss, 0u, 1024u, 4u, 0x2a0u, 0u};
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(0x80003aa700ULL); }, "bindless images: shader 0x80003aa700 stage 4 pc 0x2a0 missed in the device image table while its miss ring was full (1024 records)");
+    report.reason = Abi::FaultReason::BindlessRefused;
+    report.bytes = 7u;
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(); }, "bindless images: shader address unavailable stage 4 pc 0x2a0 selected the refused device image table entry 7");
+    report.address = 0x1000u;
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(); }, "bindless images: shader address unavailable stage 4 pc 0x2a0 selected the refused device image table entry 7 (descriptor at 0x1000)");
+    report.reason = Abi::FaultReason::BindlessMiss;
+    std::memcpy(fault.data(), &report, sizeof(report));
+    reject([&] { resources.WriteBackBuffers(); }, "invalid bindless image fault payload");
+    std::memset(fault.data(), 0, fault.size());
+    resources.WriteBackBuffers();
+}
+
+void guardedWrapFaultTests(const Context& context, const BdaTestAccess& access) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    const auto* old = std::getenv("APS5_UNNORM_WRAP_GUARD");
+    const std::string previous = old ? old : "";
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("APS5_UNNORM_WRAP_GUARD", value ? value : "");
+#else
+        if (value) setenv("APS5_UNNORM_WRAP_GUARD", value, 1); else unsetenv("APS5_UNNORM_WRAP_GUARD");
+#endif
+        ShaderRecompiler::RefreshEnvironmentGuards();
+    };
+    struct Restore { decltype(set)& action; const char* value; ~Restore() { action(value); } } restore{set, old ? previous.c_str() : nullptr};
+    set("1");
+    auto map = binding(Role::ImageTableMap, 4);
+    map.guestDescriptor.resize(ShaderRecompiler::ImageTableAbi::HeaderWords);
+    map.guestDescriptor[ShaderRecompiler::ImageTableAbi::HeaderVersion] = ShaderRecompiler::ImageTableAbi::Version;
+    auto sampler = binding(Role::GuestSamplers, 57);
+    sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
+    sampler.guestDescriptor = {0x8000u, 0xfff000u, 0x05000000u, 0u};
+    sampler.samplerDepthCompare = {false};
+    sampler.samplerUnnormalized = {true};
+    ShaderRecompiler::RecompileResult shader;
+    shader.bdaAbiVersion = Abi::Version;
+    shader.hasGuardedUnnormalizedWrap = true;
+    shader.bindings = {map, binding(Role::FaultBuffer, 5), sampler};
+    CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    auto sampling = context;
+    sampling.limits.maxPerStageDescriptorSamplers = sampling.limits.maxDescriptorSetSamplers = 32;
+    sampling.limits.maxSamplerAnisotropy = 1.0f;
+    {
+        ShaderResources resources(sampling, compiled);
+        Require(resources.NeedsCompletion() && shader.specialization.empty(), "mixed image table lost guarded sampler completion");
+        const auto fault = access.bytes(access.descriptor(5).buffer);
+        auto report = Abi::Fault{Abi::FaultState::Ready, Abi::FaultReason::UnnormalizedWrap, 0u, std::bit_cast<std::uint32_t>(0.25f), 4u, 0x360u, 0u};
+        std::memcpy(fault.data(), &report, sizeof(report));
+        reject([&] { resources.WriteBackBuffers(0x80002c4500ULL); }, "unnormalized sampler: shader 0x80002c4500 stage 4 pc 0x360 axis 0 coordinate 0.25 outside [0.5, size - 0.5]");
+        reject([&] { resources.WriteBackBuffers(0x80003d5600ULL); }, "unnormalized sampler: shader 0x80003d5600");
+        report.address = 1u;
+        std::memcpy(fault.data(), &report, sizeof(report));
+        reject([&] { resources.WriteBackBuffers(); }, "invalid unnormalized sampler fault payload");
+        std::memset(fault.data(), 0, fault.size());
+        resources.WriteBackBuffers();
+    }
+    shader.hasGuardedUnnormalizedWrap = false;
+    reject([&] { ShaderResources resources(sampling, compiled); }, "unnormalized wrap requires verified guard proof");
+    shader.hasGuardedUnnormalizedWrap = true;
+    shader.bindings.erase(shader.bindings.begin() + 1);
+    shader.bdaAbiVersion = 0u;
+    reject([&] { ShaderResources resources(sampling, compiled); }, "unnormalized wrap requires verified guard proof");
+}
+
+}
+
 void stridedOverhangTests(const Context& context, const BdaTestAccess& access) {
     constexpr std::size_t allocation = 0x8000;
     constexpr std::uint32_t stride = 20;
@@ -3496,7 +3728,387 @@ void RunImportAllocationErrorTests(const Context& context) {
     std::puts("16 import allocation error cases passed");
 }
 
+void addressMovedBufferTests(const Context& context) {
+    alignas(64) static std::array<std::uint32_t, 16> first{};
+    alignas(64) static std::array<std::uint32_t, 16> second{};
+    const auto vsharp = [](const void* data) {
+        const auto address = reinterpret_cast<std::uint64_t>(data);
+        return std::vector<std::uint32_t>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, static_cast<std::uint32_t>(sizeof(first)), 0x31000000u};
+    };
+    ShaderRecompiler::RecompileResult vertex;
+    auto buffer = binding(Role::GuestBuffers, 6);
+    buffer.guestDescriptor = vsharp(first.data());
+    buffer.bufferWritten = {false};
+    auto data = binding(Role::FlattenedSrt, 7);
+    data.guestDescriptor = {7u, 8u, 9u, 10u};
+    vertex.bindings = {buffer, data};
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    auto moved = vertex;
+    moved.bindings[0].guestDescriptor = vsharp(second.data());
+    auto rewritten = vertex;
+    rewritten.bindings[1].guestDescriptor = {7u, 8u, 9u, 11u};
+    const std::array<CompiledShader, 2> built{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> movedStages{{{ShaderRecompiler::ShaderStage::Vertex, &moved, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> rewrittenStages{{{ShaderRecompiler::ShaderStage::Vertex, &rewritten, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(context);
+    {
+        ShaderResources resources(context, built, ColorTarget{}, 0, 0, 0, {});
+        Require(resources.UsesAddressTable(), "a draw build with a BDA table stage does not use the BDA table");
+        const auto unchanged = resources.MovedReadOnlyBuffers(built, recorder);
+        Require(unchanged.has_value() && unchanged->empty(), "an address-based draw build found a buffer moved in the stages it was built from");
+        Require(!resources.MovedReadOnlyBuffers(movedStages, recorder).has_value(), "an address-based draw build would serve a draw whose read-only buffer moved, which it cannot bind per draw");
+        Require(!resources.MovedReadOnlyBuffers(rewrittenStages, recorder).has_value(), "an address-based draw build would serve a draw with other data words, which it cannot bind per draw");
+        resources.WriteBack();
+    }
+    recorder.Sync();
+}
+
+void addressRejectedTableElementTests(const Context& context, bool readOnly) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    constexpr std::size_t surfaceBytes = 65536;
+    constexpr std::uint32_t width = 64;
+    constexpr std::uint32_t height = 4;
+    constexpr std::uint32_t format32Float = 22;
+    constexpr std::uint32_t type2D = 9;
+#ifdef _WIN32
+    auto* surface = static_cast<std::byte*>(VirtualAlloc(nullptr, surfaceBytes, MEM_RESERVE, PAGE_NOACCESS));
+#else
+    void* mapped = mmap(nullptr, surfaceBytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    auto* surface = mapped == MAP_FAILED ? nullptr : static_cast<std::byte*>(mapped);
+#endif
+    Require(surface != nullptr, "cannot reserve an image table element's surface");
+    const auto address = reinterpret_cast<std::uint64_t>(surface);
+    auto tableContext = context;
+    tableContext.hostImportAlignment = 65536;
+    tableContext.imageTableCapacity = 2;
+    tableContext.limits.maxDescriptorSetSampledImages = 2;
+    tableContext.limits.maxPerStageDescriptorSampledImages = 2;
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    auto map = binding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap));
+    map.guestDescriptor.assign(Abi::HeaderWords + 1u, 0u);
+    map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+    map.guestDescriptor[Abi::HeaderElementCount] = 1u;
+    map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+    map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + 1u;
+    auto images = binding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding);
+    images.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    images.guestDescriptor = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format32Float << 20u) | (((width - 1u) & 3u) << 30u), ((width - 1u) >> 2u) | ((height - 1u) << 14u) | (1u << 31u), 0xfacu | (type2D << 28u), 0u, 0u, 0u, 0u};
+    images.imageShapes = {ShaderRecompiler::DescriptorImageShape::Image2D};
+    images.imageDepthCompare = {false};
+    images.imageSamplers = {0u};
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5), map, images};
+    if (readOnly) fragment.spirv = std::vector<std::uint32_t>{0x07230203u, 0x10300u, 0u, 1u, 0u};
+    const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(tableContext);
+    {
+        ShaderResources resources(tableContext, stages, ColorTarget{}, 0, 0, 0, {});
+        Require(resources.UsesAddressTable(), "a draw build with a BDA table stage and an image table does not use the BDA table");
+#ifdef _WIN32
+        Require(VirtualAlloc(surface, surfaceBytes, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the image table element's surface");
+#else
+        Require(mprotect(surface, surfaceBytes, PROT_READ | PROT_WRITE) == 0, "cannot commit the image table element's surface");
+#endif
+        resources.EndUse();
+        Require(!resources.Revalidate(stages, nullptr, {}), "an address-based draw build whose image table element was rejected as unmapped was reused after the element's surface was committed");
+        resources.WriteBack();
+    }
+    recorder.Sync();
+#ifdef _WIN32
+    VirtualFree(surface, 0, MEM_RELEASE);
+#else
+    munmap(surface, surfaceBytes);
+#endif
+}
+
+void addressFailedSubmissionTests(const Context& context, const BdaTestAccess& access) {
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(context);
+    for (const bool reuse : {false, true}) {
+        auto resources = std::make_shared<ShaderResources>(context, stages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{});
+        Require(resources->UsesAddressTable() && resources->Reusable(), "an address-based draw build is not reusable");
+        if (reuse) {
+            resources->EndUse();
+            Require(resources->Revalidate(stages, nullptr, {}), "an unchanged address-based draw build was not proved reusable");
+        }
+        const auto holds = AddressReuseCounters().reusedHolds;
+        recorder.OnComplete([resources, hold = resources->BeginUse()]() mutable {
+            const auto held = std::move(hold);
+            resources->CompleteUse();
+        });
+        resources->EndUse();
+        Require(resources->InUse(), "an address-based draw build taken by a recorded batch is not in use");
+        Require(AddressReuseCounters().reusedHolds == holds + (reuse ? 1u : 0u), reuse ? "a reused address-based draw did not count its hold of the space" : "a built address-based draw counted a reused hold of the space");
+        access.submitResult(VK_ERROR_OUT_OF_HOST_MEMORY);
+        bool failed = false;
+        try {
+            recorder.Submit();
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        access.submitResult(VK_SUCCESS);
+        Require(failed, "a batch whose submission failed did not report it");
+        Require(!resources->InUse(), "an address-based draw build stayed in use after the batch that took it failed to submit");
+        Require(AddressReuseCounters().reusedHolds == holds, "a reused address-based draw's hold of its space stayed counted after the batch that took it failed to submit");
+        resources->WriteBack();
+    }
+    recorder.Sync();
+}
+
+// Address-table templates (APS5_NO_BDA_TEMPLATES unset): a read-only address-table draw build
+// serves later draws while earlier uses are still in flight, takes changed data words through a
+// descriptor set of each use's own and is never written itself. Memory read through the table is
+// served in place, so a store between two uses reaches the GPU; a snapshot copy whose bytes changed,
+// a capture that no longer equals memory, a capture outside the build's regions or one no longer
+// captured makes the draw build again. A build that stores through BDA keeps one use at a time.
+void addressTemplateTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) {
+        std::cout << "cached address space disabled: address-table templates not tested\n";
+        return;
+    }
+    constexpr std::size_t piece = 65536;
+    auto* block = static_cast<std::byte*>(::operator new(piece, std::align_val_t{piece}));
+    std::memset(block, 0x5a, piece);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    DescriptorCache descriptors(importing);
+    importing.descriptorCache = &descriptors;
+    const auto change = [&](bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(true);
+    alignas(256) static std::array<std::byte, 64> captured{};
+    captured.fill(std::byte{0x21});
+    alignas(256) static std::array<std::byte, 32> elsewhere{};
+    const auto capturedAddress = reinterpret_cast<std::uint64_t>(captured.data());
+    std::array<std::byte, 16> liveBytes{};
+    std::memcpy(liveBytes.data(), block + 128, liveBytes.size());
+    const std::array<GuestMemorySnapshot, 2> snapshots{{{capturedAddress, captured}, {address + 128, liveBytes}}};
+    ShaderRecompiler::RecompileResult vertex;
+    auto data = binding(Role::FlattenedSrt, 7);
+    data.guestDescriptor = {7u, 8u, 9u, 10u};
+    vertex.bindings = {data};
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    fragment.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    fragment.spirv = std::vector<std::uint32_t>{0x07230203u, 0x10300u, 0u, 1u, 0u};
+    auto storing = fragment;
+    storing.spirv = std::vector<std::uint32_t>{};
+    auto rewritten = vertex;
+    rewritten.bindings[0].guestDescriptor = {7u, 8u, 9u, 11u};
+    auto again = vertex;
+    again.bindings[0].guestDescriptor = {7u, 8u, 9u, 12u};
+    const std::array<CompiledShader, 2> built{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> storingStages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &storing, 0}}};
+    const std::array<CompiledShader, 2> storingRewritten{{{ShaderRecompiler::ShaderStage::Vertex, &rewritten, 0}, {ShaderRecompiler::ShaderStage::Fragment, &storing, 0}}};
+    const std::array<CompiledShader, 2> rewrittenStages{{{ShaderRecompiler::ShaderStage::Vertex, &rewritten, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    const std::array<CompiledShader, 2> againStages{{{ShaderRecompiler::ShaderStage::Vertex, &again, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    Require(!ShaderResources::StagesStoreThroughAddresses(built) && ShaderResources::StagesStoreThroughAddresses(storingStages), "a read-only BDA stage was taken for a storing one, or the reverse");
+    const auto words = [](const ShaderResources::DrawBindings& bindings, std::initializer_list<std::uint32_t> expected) {
+        if (bindings.snapshots.size() != 1) return false;
+        const auto bytes = bindings.snapshots.front().Bytes();
+        const std::vector<std::uint32_t> list(expected);
+        return bytes.size() == list.size() * sizeof(std::uint32_t) && std::memcmp(bytes.data(), list.data(), bytes.size()) == 0;
+    };
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(importing);
+        const auto take = [&](const std::shared_ptr<ShaderResources>& resources) {
+            recorder.OnComplete([resources, hold = resources->BeginUse()]() mutable {
+                const auto held = std::move(hold);
+                resources->CompleteUse();
+            });
+            resources->EndUse();
+        };
+        auto resources = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
+        Require(resources->UsesAddressTable() && resources->Reusable() && resources->ReusesAddressSpace() && resources->SharesUses(), "a read-only address-table draw build is not a shared template");
+        take(resources);
+        Require(resources->InUse(), "a template taken by a recorded batch is not in use");
+        Require(resources->Revalidate(built, nullptr, snapshots), "a template with a use in flight was not proved for another use");
+        take(resources);
+        block[130] = std::byte{0x77};
+        Require(!resources->Revalidate(built, nullptr, snapshots), "a template took a capture that no longer equals the memory it reads in place");
+        auto storedBytes = liveBytes;
+        storedBytes[2] = std::byte{0x77};
+        const std::array<GuestMemorySnapshot, 2> stored{{snapshots[0], {address + 128, storedBytes}}};
+        Require(resources->Revalidate(built, nullptr, stored), "a template refused a draw after a store to memory it reads in place");
+        take(resources);
+        {
+            GuestBufferMemory memory(importing);
+            memory.AcquireRegistered();
+            for (const auto& snapshot : stored) memory.AddSnapshot(snapshot);
+            memory.Upload(true);
+            const auto ranges = memory.AddressRanges();
+            const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin <= address + 130 && address + 131 <= range.end; });
+            const auto* import = ExistingHostImportFor(importing, address, piece);
+            Require(found != ranges.end() && import != nullptr && found->deviceAddress >= import->address && found->deviceAddress + (found->end - found->begin) <= import->address + import->bytes, "the address space does not serve registered memory in place from its host import");
+            memory.WriteBack();
+        }
+        auto otherCapture = captured;
+        otherCapture[3] = std::byte{0x22};
+        const std::array<GuestMemorySnapshot, 2> otherCopied{{{capturedAddress, otherCapture}, stored[1]}};
+        Require(!resources->Revalidate(built, nullptr, otherCopied), "a template took a snapshot copy whose bytes changed");
+        Require(!resources->Revalidate(built, nullptr, std::span<const GuestMemorySnapshot>(&stored[1], 1)), "a template served a draw that no longer captures its snapshot copy");
+        const std::array<GuestMemorySnapshot, 3> outside{{stored[0], stored[1], {reinterpret_cast<std::uint64_t>(elsewhere.data()), elsewhere}}};
+        Require(!resources->Revalidate(built, nullptr, outside), "a template served a draw capturing memory outside its regions");
+        Require(resources->Revalidate(rewrittenStages, nullptr, stored), "a template was not proved for a draw with other data words");
+        const auto moved = resources->MovedReadOnlyBuffers(rewrittenStages, recorder);
+        Require(moved.has_value() && moved->size() == 1, "a template refused a draw with other data words");
+        const auto first = resources->PrepareDrawBindings(recorder, *moved);
+        Require(first != nullptr && first->allocation.set != VK_NULL_HANDLE && words(*first, {7u, 8u, 9u, 11u}), "a template's use with other data words got no descriptor set of its own holding them");
+        take(resources);
+        const auto unchanged = resources->MovedReadOnlyBuffers(built, recorder);
+        Require(unchanged.has_value() && unchanged->empty(), "a use with other data words wrote the template's own data words");
+        Require(resources->Revalidate(againStages, nullptr, stored), "a template was not proved for a third use");
+        const auto movedAgain = resources->MovedReadOnlyBuffers(againStages, recorder);
+        Require(movedAgain.has_value() && movedAgain->size() == 1, "a template refused a third use's data words");
+        const auto second = resources->PrepareDrawBindings(recorder, *movedAgain);
+        Require(second != nullptr && second->allocation.set != first->allocation.set && words(*second, {7u, 8u, 9u, 12u}) && words(*first, {7u, 8u, 9u, 11u}), "two uses in flight with other data words share a descriptor set or a data buffer");
+        take(resources);
+        Require(resources->PrepareDrawBindings(recorder, {}) == nullptr, "a template use with its own data words took a descriptor set of its own");
+        auto writer = std::make_shared<ShaderResources>(importing, storingStages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
+        Require(!writer->SharesUses(), "an address-table build that stores through BDA is a shared template");
+        take(writer);
+        Require(!writer->Revalidate(storingStages, nullptr, snapshots), "an address-table build that stores through BDA was proved while a use was in flight");
+        Require(!writer->MovedReadOnlyBuffers(storingRewritten, recorder).has_value(), "an address-table build that stores through BDA took other data words");
+        RuntimeSwitches::Assign(RuntimeSwitch::NoBdaTemplates, true);
+        Require(!resources->SharesUses() && !resources->Revalidate(built, nullptr, stored) && !resources->MovedReadOnlyBuffers(rewrittenStages, recorder).has_value(), "APS5_NO_BDA_TEMPLATES left a template in use");
+        Require(ShaderResources::NeverReusable(built) == ShaderResources::NeverReusable(storingStages), "APS5_NO_BDA_TEMPLATES kept a read-only address-table draw cacheable apart from storing ones");
+        auto plain = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(snapshots));
+        Require(!plain->SharesUses() && plain->PrepareDrawBindings(recorder, *moved) == nullptr, "APS5_NO_BDA_TEMPLATES built a template");
+        RuntimeSwitches::Assign(RuntimeSwitch::NoBdaTemplates, false);
+        {
+            recorder.Sync();
+            auto reader = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored));
+            Require(reader->HoldsLease(), "a fresh address-table build holds no lease");
+            reader->MarkGpuWrites(recorder);
+            Require(recorder.PendingWriterSerial(address, 64) == 0, "the lease of a build that never stores through BDA counts as a writer");
+            RuntimeSwitches::Assign(RuntimeSwitch::NoReadOnlyLeaseSkip, true);
+            auto oldReader = std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored));
+            oldReader->MarkGpuWrites(recorder);
+            Require(recorder.PendingWriterSerial(address, 64) == recorder.OpenSerial(), "APS5_NO_READ_ONLY_LEASE_SKIP did not count a read-only lease as a writer");
+            RuntimeSwitches::Assign(RuntimeSwitch::NoReadOnlyLeaseSkip, false);
+            recorder.Sync();
+            auto storer = std::make_shared<ShaderResources>(importing, storingStages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored));
+            storer->MarkGpuWrites(recorder);
+            Require(recorder.PendingWriterSerial(address, 64) == recorder.OpenSerial(), "the lease of a build that stores through BDA does not count as a writer");
+            recorder.Sync();
+            for (auto* item : {&reader, &oldReader, &storer}) (*item)->WriteBack();
+        }
+        {
+#ifdef _WIN32
+            _putenv_s("APS5_ADDRESS_TEMPLATE_ENTRIES", "2");
+#else
+            setenv("APS5_ADDRESS_TEMPLATE_ENTRIES", "2", 1);
+#endif
+            ResourceCache cache;
+            cache.SetBase(2, 8);
+            ShaderRecompiler::RecompileResult plainFragment;
+            const std::array<CompiledShader, 2> plainStages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &plainFragment, 0}}};
+            std::vector<std::shared_ptr<ShaderResources>> objects;
+            const auto add = [&](bool address, std::uint32_t key) {
+                objects.push_back(address ? std::make_shared<ShaderResources>(importing, built, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>(stored)) : std::make_shared<ShaderResources>(importing, plainStages, ColorTarget{}, 0, 0, 0, std::span<const GuestMemorySnapshot>{}));
+                Require(objects.back()->ReusesAddressSpace() == address, "a cache test object is not of the kind asked for");
+                cache.Insert({key}, objects.back());
+            };
+            const auto held = [&](std::uint32_t key) { return cache.Peek({key}) != nullptr; };
+            add(true, 100);
+            add(true, 101);
+            for (std::uint32_t key = 0; key < 4; ++key) add(false, key);
+            Require(held(100) && held(101) && !held(0) && !held(1) && held(2) && held(3), "other entries evicted address-table templates, or overran their own bound");
+            add(true, 102);
+            Require(!held(100) && held(101) && held(102) && held(2) && held(3), "an address-table template over its bound evicted another kind of entry, or not the oldest template");
+            cache.Remove({101});
+            add(true, 103);
+            Require(held(102) && held(103) && cache.Size() == 4, "a removed address-table template still counted against its bound");
+            cache.Clear();
+#ifdef _WIN32
+            _putenv_s("APS5_ADDRESS_TEMPLATE_ENTRIES", "");
+#else
+            unsetenv("APS5_ADDRESS_TEMPLATE_ENTRIES");
+#endif
+            for (auto& object : objects) object->WriteBack();
+        }
+        recorder.Sync();
+        Require(!resources->InUse() && !writer->InUse(), "uses stayed in flight after their batches completed");
+        for (auto* item : {&resources, &writer, &plain}) (*item)->WriteBack();
+    }
+    ClearSnapshotCopies(importing.device);
+    change(false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
+// S1: a draw build made in two stages (DeferredDrawBuild: stage A on another thread without the
+// device lock, CompleteDraw() under it) binds the same layout and buffers as the one-step build;
+// stage A reads no guest bytes, so a store between the stages reaches the GPU; address tables are
+// refused; CompleteDraw runs once.
+void splitDrawBuildTests(const Context& context, const BdaTestAccess& access) {
+    alignas(64) std::array<std::uint32_t, 16> guest{};
+    guest[0] = 11;
+    const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult fragment;
+    auto buffer = binding(Role::GuestBuffers, 6);
+    buffer.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u};
+    buffer.bufferWritten = {false};
+    buffer.bufferRead = {true};
+    fragment.bindings = {buffer};
+    const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    Require(!ShaderResources::StagesUseAddressTables(stages), "a draw without BDA tables counts as address-based");
+    std::vector<std::uint32_t> lockedKey;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> lockedReads;
+    bool lockedReusable = false;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        ShaderResources locked(context, stages, ColorTarget{}, 0, 0, 0, {});
+        lockedKey = locked.LayoutKey();
+        lockedReads = locked.InPlaceReads();
+        lockedReusable = locked.Reusable();
+    }
+    std::unique_ptr<ShaderResources> split;
+    std::thread preparer([&] { split = std::make_unique<ShaderResources>(DeferredDrawBuild{}, context, stages, ColorTarget{}, 0, 0, 0); });
+    preparer.join();
+    Require(split != nullptr && !split->Completed(), "a deferred draw build completed in stage A");
+    guest[0] = 22;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        split->CompleteDraw();
+        Require(split->Completed(), "CompleteDraw left the draw build incomplete");
+        Require(split->LayoutKey() == lockedKey, "the two-stage draw build has another set layout than the one-step build");
+        Require(split->InPlaceReads() == lockedReads && split->Reusable() == lockedReusable, "the two-stage draw build binds its buffers differently from the one-step build");
+        const auto bound = access.descriptor(6);
+        std::uint32_t seen = 0;
+        std::memcpy(&seen, access.bytes(bound.buffer).data() + bound.offset, sizeof(seen));
+        Require(seen == 22, "a store between the stages of a draw build did not reach the bound buffer (stage A read guest bytes)");
+        reject([&] { split->CompleteDraw(); }, "already completed");
+    }
+    ShaderRecompiler::RecompileResult addressed;
+    addressed.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    addressed.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    const std::array<CompiledShader, 2> addressStages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &addressed, 0}}};
+    Require(ShaderResources::StagesUseAddressTables(addressStages), "a draw with a BDA table does not count as address-based");
+    reject([&] { ShaderResources refused(DeferredDrawBuild{}, context, addressStages, ColorTarget{}, 0, 0, 0); }, "cannot map address tables");
+}
+
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
+    splitDrawBuildTests(context, access);
+    directImageFaultTests(context, access);
+    bindlessFaultTests(context, access);
+    guardedWrapFaultTests(context, access);
     alignas(64) std::array<std::uint32_t, 16> guest{};
     guest[0] = 123;
     const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
@@ -3573,7 +4185,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     {
         ShaderResources resources(context, compiled, snapshots);
-        Require(ShaderResources::NeverReusable(std::span<const CompiledShader>(&compiled, 1)) && !resources.Reusable(), "an address-based build is reusable");
+        Require(!ShaderResources::NeverReusable(std::span<const CompiledShader>(&compiled, 1)), "address-based stages are refused the resource cache");
+        Require(!resources.Reusable() && !resources.InUse(), "an address-based dispatch build is reusable");
         Require(resources.UsesAddressTable(), "an address-based build does not use the BDA table");
         ShaderRecompiler::RecompileResult plain;
         plain.bindings = {binding(Role::GuestBuffers, 6)};
@@ -3719,6 +4332,12 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     addressTableKeyTests();
     snapshotTableTests(context, access);
+    spaceReuseTests(context);
+    addressMovedBufferTests(context);
+    addressRejectedTableElementTests(context, false);
+    addressRejectedTableElementTests(context, true);
+    addressFailedSubmissionTests(context, access);
+    addressTemplateTests(context);
     importSpanTests(context);
     importRunGrowthTests(context);
     importRunReplacedTests(context);

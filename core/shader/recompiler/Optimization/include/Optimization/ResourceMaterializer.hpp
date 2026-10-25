@@ -4,10 +4,12 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "ImageTableAbi.hpp"
+#include "BindlessImageAbi.hpp"
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -58,6 +60,18 @@ struct RuntimeImageModeMatch {
     std::optional<std::uint32_t> mode;
     ImageTableAbi::PoisonReason reason = ImageTableAbi::PoisonReason::InvalidFormat;
     std::string detail;
+    bool descriptorInspected = false;
+};
+
+struct ViewLevelsPastChain {
+    std::uint32_t levels = 0;
+    bool base = false;
+};
+
+struct BindlessInterface {
+    std::uint64_t id = 0;
+    ImageResource image;
+    std::vector<ImageResource> modes;
 };
 
 class ConvertedSampleRequired : public std::runtime_error {
@@ -67,19 +81,33 @@ public:
 
 class ResourceMaterializer {
 public:
+    static ViewLevelsPastChain LevelsPastChain(const DescriptorValue& descriptor);
     static std::uint32_t EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index);
     void ApplyStaticInterface(IrProgram& program, bool nativeSampleOffsets = true) const;
     static std::vector<ImageResource> RuntimeImageModes(const ImageResource& image);
     static RuntimeImageModeMatch TryRuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
     static std::uint32_t RuntimeImageMode(const ImageResource& image, const DescriptorValue& descriptor, std::span<const ImageResource> modes);
+    static std::uint32_t DirectImageMode(const ShaderInfo& info, IrShaderStage stage, std::uint32_t index, const DescriptorValue& descriptor, bool allowRefusal = false);
+    static bool CanDeferDirectImage(const IrProgram& program, std::uint32_t index);
+    static bool CanGuardUnnormalizedWrap(const IrProgram& program, std::uint32_t index);
+    static void PrepareDirectImageRefusals(IrProgram& program, bool faultAbi);
+    static void ValidateDirectImageRefusals(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, bool allowRefusal);
     static void PrepareImageModes(ShaderInfo& info);
     static const char* UnnormalizedSampleMismatch(const ImageResource& image);
     static std::shared_ptr<const ResolvedImageTables> ResolveImageTablesShared(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey);
     static bool NullImageDescriptor(const ImageResource& image, const DescriptorValue& descriptor);
     static ResolvedImageTables ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey = 0);
+    static bool BindlessImage(const ShaderInfo& info, IrShaderStage stage, std::uint32_t resource);
+    static bool UsesBindlessImages(const ShaderInfo& info, IrShaderStage stage);
+    static bool RequiresPointSampler(const ImageResource& mode);
+    static std::uint64_t BindlessInterfaceId(const ImageResource& image, std::span<const ImageResource> modes);
+    static std::uint64_t RegisterBindlessInterface(const ImageResource& image, std::span<const ImageResource> modes);
+    static void RegisterBindlessInterfaces(const ShaderInfo& info, IrShaderStage stage);
+    static std::shared_ptr<const BindlessInterface> FindBindlessInterface(std::uint64_t id);
+    static std::vector<BindlessImageAbi::TableRegistration> BindlessTables(const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot);
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     static void CompactPlan(IrResourcePlan& plan);
-    void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
+    void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, bool allowDirectImageRefusal = false) const;
     static std::uint64_t SpecializationNanoseconds();
     static ImageTableReuseCounts TableReuse();
     static std::uint64_t EvaluateNanoseconds();

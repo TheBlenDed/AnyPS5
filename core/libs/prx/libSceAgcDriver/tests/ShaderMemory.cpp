@@ -1073,6 +1073,127 @@ void verifySignedSrtComparison() {
     }
 }
 
+void verifyScalarBufferBounds() {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    plan.memoryInfo.push_back(memory);
+    std::vector<std::unique_ptr<IrValue>> values;
+    const auto make = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, static_cast<std::uint32_t>(values.size())));
+        for (auto* argument : arguments) values.back()->AddArgument(argument);
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t bits) -> IrValue& {
+        auto& value = make(IrOpcode::Void, IrType::U32);
+        value.SetImmediateU32(bits);
+        return value;
+    };
+    auto& base = constant(0x1000u);
+    auto& zero = constant(0u);
+    auto& srt = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+    auto& low = make(IrOpcode::ReadConst, IrType::U32, {&srt, &zero});
+    auto& high = constant(0u);
+    auto& records = constant(0u);
+    auto& word3 = constant(0x5204u);
+    auto& offset = constant(0u);
+    auto& handle = make(IrOpcode::GetBufferResource, IrType::BufferResource, {&low, &high, &records, &word3});
+    auto& read = make(IrOpcode::ReadConstBuffer, IrType::U32, {&handle, &offset});
+    read.SetFlags(MemoryFlags{0u, 0x294u});
+    plan.srtReads = {{&base, 0u}, {&read, 1u}};
+    struct Callbacks {
+        unsigned probes = 0;
+        unsigned reads = 0;
+        bool accessible = true;
+        unsigned failure = 0;
+        std::uint64_t address = 0;
+    } callbacks;
+    SrtReadTrace trace;
+    trace.leaf = &read;
+    trace.leafSlot = 1u;
+    SrtRuntime runtime;
+    runtime.userContext = &callbacks;
+    runtime.readTrace = &trace;
+    runtime.accessible = [](void* context, std::uint64_t address, std::uint64_t bytes) {
+        auto& state = *static_cast<Callbacks*>(context);
+        ++state.probes;
+        require(address == state.address && bytes == 4u, "scalar buffer bounds: accessibility address changed");
+        return state.accessible;
+    };
+    runtime.readMemory = [](void* context, std::uint64_t address, std::uint32_t* value) {
+        auto& state = *static_cast<Callbacks*>(context);
+        ++state.reads;
+        require(address == state.address, "scalar buffer bounds: read address changed");
+        if (state.failure == 2u) throw std::runtime_error("scalar buffer callback failure");
+        *value = 0x12345678u;
+        return state.failure == 0u;
+    };
+    struct Case { std::uint32_t stride, records, offset, immediate; bool inRange; };
+    const std::array cases{
+        Case{0u, 0u, 0u, 0u, false}, Case{8u, 0u, 0u, 0u, false},
+        Case{0u, 1u, 0u, 0u, false}, Case{0u, 2u, 0u, 0u, false}, Case{0u, 3u, 0u, 0u, false},
+        Case{0u, 4u, 0u, 0u, true}, Case{0u, 4u, 3u, 0u, true},
+        Case{0u, 4u, 4u, 0u, false}, Case{0u, 4u, 8u, 0u, false},
+        Case{0u, 6u, 4u, 0u, false}, Case{0u, 8u, 4u, 0u, true},
+        Case{8u, 2u, 8u, 4u, true}, Case{8u, 2u, 12u, 4u, false},
+    };
+    for (const auto& entry : cases) {
+        high.SetImmediateU32(entry.stride << 16u);
+        records.SetImmediateU32(entry.records);
+        offset.SetImmediateU32(entry.offset);
+        plan.memoryInfo[0].offset = entry.immediate;
+        callbacks = {};
+        callbacks.address = 0x1000u + ((entry.offset + entry.immediate) & ~3u);
+        trace.leaves.clear();
+        Detail::InaccessibleRead inaccessible;
+        Detail::Evaluator evaluator(plan, runtime);
+        evaluator.ReportInaccessibleReads(&inaccessible);
+        std::uint32_t result = 0xdeadbeefu;
+        const bool evaluated = evaluator.Evaluate(Detail::IrNode(&read), result);
+        require(evaluated && result == (entry.inRange ? 0x12345678u : 0u), entry.inRange ? "scalar buffer bounds: in-range read changed" : "scalar buffer bounds: out-of-range read was not zero");
+        require(callbacks.probes == unsigned(entry.inRange) && callbacks.reads == unsigned(entry.inRange), "scalar buffer bounds: out-of-range read called memory callbacks");
+        require(trace.otherReads.empty() && trace.leaves.size() == std::size_t(entry.inRange) && inaccessible.read == nullptr, "scalar buffer bounds: out-of-range read was traced or poisoned");
+        if (entry.inRange) require(trace.leaves[0] == std::pair<std::uint32_t, std::uint64_t>{1u, callbacks.address}, "scalar buffer bounds: traced address changed");
+    }
+    high.SetImmediateU32(0u);
+    records.SetImmediateU32(4u);
+    offset.SetImmediateU32(0u);
+    plan.memoryInfo[0].offset = 0u;
+    callbacks = {};
+    callbacks.address = 0x1000u;
+    for (unsigned failure : {1u, 2u}) {
+        callbacks.failure = failure;
+        Detail::Evaluator evaluator(plan, runtime);
+        std::uint32_t result = 0u;
+        if (failure == 1u) require(!evaluator.Evaluate(Detail::IrNode(&read), result), "scalar buffer bounds: failed in-range callback was accepted");
+        else expectFailure([&] { evaluator.Evaluate(Detail::IrNode(&read), result); }, "scalar buffer callback failure", "scalar buffer bounds: callback exception was swallowed");
+    }
+    callbacks = {};
+    callbacks.address = 0x1000u;
+    callbacks.accessible = false;
+    trace.leaves.clear();
+    DescriptorSource source;
+    source.dwordCount = 1u;
+    source.dwords[0] = &read;
+    plan.descriptorSources.push_back(source);
+    const std::array<std::uint32_t, 1> sourceIndices{0u};
+    std::vector<DescriptorValue> descriptors;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    std::vector<SrtReadPoison> poison;
+    require(Detail::EvaluateRuntimeSourcesImpl(plan, sourceIndices, runtime, descriptors, flat, true, {}, active, &poison), "scalar buffer bounds: inaccessible in-range read lost poison handling");
+    require(poison == std::vector<SrtReadPoison>{{1u, 0x294u, 0x1000u}} && descriptors[0].dwords[0] == 0u && flat[1] == 0u, "scalar buffer bounds: inaccessible in-range poison changed");
+    require(callbacks.probes != 0u && callbacks.reads == 0u && trace.leaves.empty() && trace.otherReads.empty(), "scalar buffer bounds: inaccessible in-range read touched memory");
+    records.SetImmediateU32(0u);
+    runtime.readMemory = nullptr;
+    runtime.accessible = nullptr;
+    Detail::Evaluator noCallbacks(plan, runtime);
+    std::uint32_t result = 0xdeadbeefu;
+    require(noCallbacks.Evaluate(Detail::IrNode(&read), result) && result == 0u, "scalar buffer bounds: out-of-range read dereferenced guest memory");
+}
+
 void verifyTypeZeroImageMaterialization() {
     using namespace ShaderRecompiler;
     for (const std::uint32_t type : {0u, 1u}) {
@@ -1324,6 +1445,69 @@ void verifyLaneMaskGuardedDescriptorSources() {
         AgcDriver::ShaderMemory memory({});
         const auto capture = memory.Capture(request);
         require(capture->snapshot.images.size() == 1u && std::equal(valid.begin(), valid.end(), capture->snapshot.images[0].dwords.begin()), "lane-mask guarded sources: the T# behind a branch the lanes may take was not read");
+    }
+}
+
+void verifyExecGuardedDescriptorSources() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Format8888UNorm = 56;
+    constexpr std::uint32_t Type2D = 9;
+    struct alignas(256) Texture { std::array<std::uint8_t, 256> bytes{}; };
+    static Texture texture;
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texture.bytes.data()));
+    const std::array<std::uint32_t, 8> valid{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (3u << 30u), 3u << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+    const std::array<std::uint32_t, 8> invalid{0x43700000u, 0x43070000u, 0x3b888889u, 0x3bf2b9d6u, 0x3b088889u, 0x3b72b9d6u, 0x3f7f7777u, 0x3f7f0d46u};
+    const std::array<std::uint32_t, 4> sampler{0u, 0u, 0u, 0u};
+    std::array<std::uint32_t, 4> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const std::array<std::uint32_t, 4> outputV{static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    std::array<std::uint32_t, 32> srt{};
+    const auto fill = [&](const std::array<std::uint32_t, 8>& image, std::uint32_t mode) {
+        std::copy(image.begin(), image.end(), srt.begin());
+        std::copy(sampler.begin(), sampler.end(), srt.begin() + 8);
+        std::copy(outputV.begin(), outputV.end(), srt.begin() + 16);
+        srt[20] = mode;
+    };
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+    const std::vector<std::uint32_t> code{0xf4000400u, 0xfa000050u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0x7da80010u, 0xbf880006u, 0xf40c0200u, 0xfa000000u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    request.shader = {ShaderStage::Compute, 0x24000u, code, 0, {}};
+    request.context.waveSize = 32;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+
+    fill(invalid, 0u);
+    const auto plan = GetResourcePlan(request);
+    require(plan->info.images.size() == 1u && plan->info.samplers.size() == 1u, "exec guarded sources: the image and its sampler were not planned");
+    require(!plan->controlFlow.empty() && std::ranges::any_of(plan->controlFlow, [](const ResourceBlock& block) { return block.condition != nullptr; }), "exec guarded sources: the EXEC branch around the image kept no condition");
+    {
+        fill(invalid, 0u);
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(request);
+        require(capture->snapshot.images.size() == 1u && std::ranges::all_of(capture->snapshot.images[0].dwords, [](std::uint32_t word) { return word == 0u; }), "exec guarded sources: the T# behind a branch no lane takes was not left null");
+    }
+    fill(invalid, 1u);
+    {
+        AgcDriver::ShaderMemory memory({});
+        expectFailure([&] { static_cast<void>(memory.Capture(request)); }, "runtime image descriptor is invalid", "exec guarded sources: an invalid T# behind a branch the lanes may take was accepted");
+    }
+    fill(valid, 1u);
+    {
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(request);
+        require(capture->snapshot.images.size() == 1u && std::equal(valid.begin(), valid.end(), capture->snapshot.images[0].dwords.begin()), "exec guarded sources: the T# behind a branch the lanes may take was not read");
     }
 }
 
@@ -1652,7 +1836,7 @@ std::vector<std::uint32_t> TableLoadCode(std::vector<std::uint32_t> code) {
 
 ShaderRecompiler::RecompileRequest TableRequest(const std::vector<std::uint32_t>& code, const std::array<std::uint32_t, 2>& userData, std::uint32_t subgroupSize = 32u) {
     using namespace ShaderRecompiler;
-    static constexpr std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    static constexpr std::array<std::uint32_t, 7> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess, spv::CapabilityStorageImageArrayDynamicIndexing, spv::CapabilityStorageImageWriteWithoutFormat, spv::CapabilityStorageImageArrayNonUniformIndexing};
     static constexpr std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     std::uint64_t hash = 0xcbf29ce484222325ull;
     for (const auto word : code) hash = (hash ^ word) * 0x100000001b3ull;
@@ -1795,6 +1979,52 @@ void verifyImageTableKeys() {
         static_cast<void>(ValidateAndOptimizeSpirv(a.spirv, request.target.vulkanVersion, request.target.spirvVersion));
 #endif
     }
+}
+
+void verifyImageTableResolveMemo() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Entries = 600;
+    static TableTexture textures[4];
+    alignas(4096) static TableGuest guest;
+    alignas(4096) static std::array<std::array<std::uint32_t, 8>, Entries> large{};
+    std::fill(guest.heap.begin(), guest.heap.end(), std::array<std::uint32_t, 8>{});
+    guest.heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    guest.heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    for (std::uint32_t entry = 0; entry < Entries; entry++) large[entry] = TableT(textures[entry % 4u].bytes.data(), TableFormat8888UNorm, TableType2D, entry);
+    const auto userData = TableUserData(guest);
+    const auto request = TableRequest(TableWholeCode, userData);
+    const auto small = [&] {
+        guest.materials = {{{0u, 1u, 0u, 0u}, {0u, 0u, 0u, 0u}, {0u, 1u, 0u, 0u}}};
+        FillTableSrt(guest, guest.heap.data(), 32u, 3u);
+        return CompileTable(request);
+    };
+    const auto big = [&] {
+        guest.materials = {{{0u, 3u, 0u, 0u}, {0u, 4u, 0u, 0u}, {0u, 599u, 0u, 0u}}};
+        FillTableSrt(guest, large.data(), 32u, Entries);
+        return CompileTable(request);
+    };
+    const auto same = [](const RecompileResult& a, const RecompileResult& b) {
+        if (a.bindings.size() != b.bindings.size() || a.imageTablePoison.size() != b.imageTablePoison.size() || a.imageTableFaults != b.imageTableFaults || a.bindlessTables.size() != b.bindlessTables.size()) return false;
+        for (std::size_t index = 0; index < a.bindings.size(); ++index) {
+            if (a.bindings[index].role != b.bindings[index].role || a.bindings[index].guestDescriptor != b.bindings[index].guestDescriptor || a.bindings[index].count != b.bindings[index].count) return false;
+        }
+        for (std::size_t index = 0; index < a.bindlessTables.size(); ++index) {
+            if (a.bindlessTables[index].base != b.bindlessTables[index].base || a.bindlessTables[index].records != b.bindlessTables[index].records || a.bindlessTables[index].uses.size() != b.bindlessTables[index].uses.size()) return false;
+        }
+        return true;
+    };
+    const auto first = small();
+    const auto second = big();
+    const auto third = small();
+    const auto fourth = big();
+    require(!same(*first.result, *second.result), "image table resolve memo: two tables resolved alike");
+    require(same(*first.result, *third.result) && same(*second.result, *fourth.result), "image table resolve memo: the same table resolved differently");
+    large[17] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D, 17u);
+    const auto changed = big();
+    require(!same(*fourth.result, *changed.result), "image table resolve memo: a changed record kept the earlier resolution");
+    large[17] = TableT(textures[17 % 4u].bytes.data(), TableFormat8888UNorm, TableType2D, 17u);
+    const auto restored = big();
+    require(same(*fourth.result, *restored.result), "image table resolve memo: a restored record did not resolve as before");
 }
 
 struct CountingMemory {
@@ -2276,7 +2506,7 @@ void verifyTableSnapshotReuse() {
     const auto otherBuffer = CompileTable(request);
     std::copy(outputV.begin(), outputV.end(), guest.srt.begin() + 12);
     const auto resolvedShared = ResourceMaterializer::TableReuse();
-    require(otherBuffer.result != compiled.result && otherBuffer.result->variantId == compiled.result->variantId && resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared == 1u && resolvedShared.resolutions == resolvedBefore.resolutions && TableMap(*otherBuffer.result) == map && TableBinding(*otherBuffer.result, DescriptorRole::ImageTable)->guestDescriptor == images->guestDescriptor, "table snapshot reuse: a result for another buffer did not reuse the unchanged table's resolution");
+    require(otherBuffer.result != compiled.result && otherBuffer.result->variantId == compiled.result->variantId && resolvedShared.resolutionsShared - resolvedBefore.resolutionsShared == (std::getenv("APS5_NO_TABLE_RESOLVE_MEMO") == nullptr ? 0u : 1u) && resolvedShared.resolutions == resolvedBefore.resolutions && TableMap(*otherBuffer.result) == map && TableBinding(*otherBuffer.result, DescriptorRole::ImageTable)->guestDescriptor == images->guestDescriptor, "table snapshot reuse: a result for another buffer did not reuse the unchanged table's resolution");
     const auto storedWord = heap[5u * 8u];
     heap[5u * 8u] = heap[6u * 8u];
     const auto restoredMap = map;
@@ -2907,6 +3137,17 @@ void verifyImageTables() {
     const auto wholeCodes = TableCodes(TableMap(*whole.result), 0);
     require(wholeCodes.size() == 4u && wholeCodes[0] == wholeCodes[3] && wholeCodes[2] == Abi::NullCode && wholeCodes[1] != wholeCodes[0], "image tables: the whole table map is wrong");
 
+    const auto original = heap[1];
+    heap[1] = heap[0];
+    const auto changed = CompileTable(TableRequest(TableWholeCode, userData));
+    const auto& changedTables = changed.capture->snapshot.tables;
+    require(changedTables.tables.at(0).codes.at(1) == changedTables.tables.at(0).codes.at(0) && std::ranges::none_of(changedTables.tables.at(0).words.Span(), [&](const DescriptorValue& value) { return value.dwords == original; }), "image tables: a column reused a record whose words changed");
+    heap[1] = original;
+    const auto restored = CompileTable(TableRequest(TableWholeCode, userData));
+    require(restored.capture->snapshot.tables == whole.capture->snapshot.tables && TableCodes(TableMap(*restored.result), 0) == wholeCodes, "image tables: a column read again after a change differs from its first read");
+    const auto repeated = CompileTable(TableRequest(TableWholeCode, userData));
+    require(repeated.capture->snapshot.tables == restored.capture->snapshot.tables, "image tables: an unchanged column read twice differs");
+
     for (std::uint32_t entry = 4; entry < 100u; entry++) heap[entry] = TableT(textures[entry % 2u].bytes.data(), entry % 3u == 0u ? TableFormat32UInt : TableFormat8888UNorm, TableType2D, entry);
     FillTableSrt(guest, heap.data(), 32u, 100u);
     const auto wide = CompileTable(TableRequest(TableWholeCode, userData));
@@ -3272,6 +3513,41 @@ void verifyImageTableMaskedOffset() {
     require(codes.size() == 4u && codes[0] == codes[3] && codes[2] == Abi::NullCode && codes[1] != codes[0] && (codes[1] & Abi::PoisonFlag) == 0u, "image table masked offset: the whole table map is wrong");
 }
 
+
+void verifyImageTableFirstLaneScale() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    static TableTexture textures[2];
+    alignas(4096) static TableGuest guest;
+    auto& heap = guest.heap;
+    std::fill(heap.begin(), heap.end(), std::array<std::uint32_t, 8>{});
+    heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    heap[3] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    heap[9] = heap[0];
+    FillTableSrt(guest, heap.data(), 32u, 12u);
+    const auto userData = TableUserData(guest);
+    const auto scaled = [](std::initializer_list<std::uint32_t> offset) {
+        std::vector<std::uint32_t> code(TableWholeCode);
+        const auto first = std::find(code.begin(), code.end(), 0x7e200500u);
+        require(first != code.end() && first[1] == 0x8f108510u, "image table first-lane scale: the program has no v_readfirstlane_b32 and s_lshl_b32");
+        code.insert(code.erase(first, first + 2), offset);
+        return code;
+    };
+    const auto code = scaled({0x34020085u, 0xd7460001u, 0x04050301u, 0x7e200501u});
+    const auto request = TableRequest(code, userData);
+    const auto plan = GetResourcePlan(request);
+    require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u && plan->info.images[0].tableOperation == TableOperation::Supported, "image table first-lane scale: the T# was not planned as a table");
+    const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
+    require(column.has_value() && column->stride == 96u && column->addend == 0u && column->offset == 0u && column->dwordCount == 8u && column->unkeyed, "image table first-lane scale: the column is wrong");
+    const auto compiled = CompileTable(request);
+    const auto& snapshot = compiled.capture->snapshot.tables.tables.at(0);
+    require(snapshot.records == 4u && snapshot.keys == 4u && snapshot.fault == 0u, "image table first-lane scale: the snapshot does not hold the four 96-byte records");
+    const auto codes = TableCodes(TableMap(*compiled.result), 0);
+    require(codes.size() == 4u && codes[0] == codes[3] && codes[2] == Abi::NullCode && codes[1] != codes[0] && (codes[0] & Abi::PoisonFlag) == 0u && (codes[1] & Abi::PoisonFlag) == 0u, "image table first-lane scale: the table map is wrong");
+    const auto unscaled = scaled({0x7e200500u});
+    expectFailure([&] { static_cast<void>(GetResourcePlan(TableRequest(unscaled, userData))); }, "GetImageResource dword 0 is not a valid runtime value", "image table first-lane scale: a first-lane offset with no dword multiple was accepted");
+}
+
 void verifyImageTableRegistration() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -3285,33 +3561,36 @@ void verifyImageTableRegistration() {
     const std::vector<std::uint32_t> storeCode{0xf4080100u, 0xfa000000u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf0200f08u, 0x00050200u, 0xbf810000u};
     const auto store = CompileTable(TableRequest(storeCode, userData));
     const auto& storePlan = *store.capture->plan;
-    require(storePlan.info.images.size() == 1u && storePlan.info.images[0].table == 0u && storePlan.info.images[0].tableOperation == TableOperation::Supported, "image table registration: a table T# feeding image_store was not a supported table operation");
+    require(storePlan.info.images.size() == 1u && storePlan.info.images[0].table == 0u && storePlan.info.images[0].tableOperation == TableOperation::Supported, "image table registration: an ordinary 2D image_store was not supported");
     const auto& storeMap = TableMap(*store.result);
     const auto storeFault = storeMap[Abi::TableHeader(0) + Abi::TableFault];
-    const auto* storeTable = TableBinding(*store.result, DescriptorRole::ImageStorageTable);
-    require((storeFault & Abi::PoisonFlag) == 0u && storeTable != nullptr && storeTable->count != 0u && std::all_of(storeTable->imageWritten.begin(), storeTable->imageWritten.end(), [](bool written) { return written; }), "image table registration: the store's table was not bound as written storage elements");
-    require(TableBinding(*store.result, DescriptorRole::ImageTable) == nullptr || TableBinding(*store.result, DescriptorRole::ImageTable)->count == 0u, "image table registration: a store-only table bound sampled elements");
-    auto atomicCode = storeCode;
-    atomicCode[8] = 0xf0440108u;
-    const auto atomic = CompileTable(TableRequest(atomicCode, userData));
-    const auto& atomicPlan = *atomic.capture->plan;
-    require(atomicPlan.info.images.size() == 1u && atomicPlan.info.images[0].table == 0u && atomicPlan.info.images[0].tableOperation == TableOperation::Supported, "image table registration: a table T# feeding image_atomic_add was not a supported table operation");
-    const auto& atomicMap = TableMap(*atomic.result);
-    const auto atomicFault = atomicMap[Abi::TableHeader(0) + Abi::TableFault];
-    const auto* atomicTable = TableBinding(*atomic.result, DescriptorRole::ImageStorageTable);
-    require((atomicFault & Abi::PoisonFlag) == 0u && atomicTable != nullptr && atomicTable->count != 0u && atomicTable->imageAtomic.size() == atomicTable->count && std::all_of(atomicTable->imageWritten.begin(), atomicTable->imageWritten.end(), [](bool written) { return written; }) && std::all_of(atomicTable->imageAtomic.begin(), atomicTable->imageAtomic.end(), [](bool atomic) { return atomic; }), "image table registration: the image_atomic_add table was not bound as atomic storage elements");
-    require(TableBinding(*atomic.result, DescriptorRole::ImageTable) == nullptr || TableBinding(*atomic.result, DescriptorRole::ImageTable)->count == 0u, "image table registration: an atomic-only table bound sampled elements");
-    const std::array<std::pair<std::uint32_t, const char*>, 2> unsupportedStores{{{0xf0240f08u, "image_store_mip"}, {0xf0280f08u, "image_store_pck"}}};
-    for (const auto& [instruction, name] : unsupportedStores) {
-        auto code = storeCode;
-        code[8] = instruction;
-        const auto unsupported = CompileTable(TableRequest(code, userData));
-        const auto& plan = *unsupported.capture->plan;
-        require(plan.info.images.size() == 1u && plan.info.images[0].table == 0u && (plan.info.images[0].tableOperation == TableOperation::Unsupported || plan.info.images[0].mipMode == ImageMipMode::DynamicStorage), (std::string("image table registration: a table T# feeding ") + name + " was not planned as an unsupported or dynamic-mip table store").c_str());
+    require(storeFault == 0u, "image table registration: an ordinary store has a whole-table fault");
+    const auto* stores = TableBinding(*store.result, DescriptorRole::ImageTable);
+    require(stores != nullptr && stores->kind == DescriptorKind::StorageImage && !stores->readOnly && stores->binding == RuntimeAbi::StorageImageTableBinding && stores->count == 2u && std::all_of(stores->imageWritten.begin(), stores->imageWritten.end(), [](bool written) { return written; }), "image table registration: storage elements lack their writable binding");
+    for (const auto opcode : {0x0au, 0x0fu, 0x52u}) {
+        auto unsupportedCode = storeCode;
+        unsupportedCode[8] = (unsupportedCode[8] & ~(0x7fu << 18u)) | (opcode << 18u);
+        if (opcode == 0x0fu) unsupportedCode[8] = (unsupportedCode[8] & ~0xf00u) | 0x100u;
+        if (opcode == 0x52u) {
+            expectFailure([&] { static_cast<void>(CompileTable(TableRequest(unsupportedCode, userData))); }, "MIMG BY2/BY4 stores are not implemented", "image table registration: a BY store passed translation");
+            continue;
+        }
+        const auto unsupported = CompileTable(TableRequest(unsupportedCode, userData));
+        require(unsupported.capture->plan->info.images.at(0).tableOperation == TableOperation::Unsupported, "image table registration: packed or atomic stores were admitted");
         const auto fault = TableMap(*unsupported.result)[Abi::TableHeader(0) + Abi::TableFault];
-        require((fault & Abi::PoisonFlag) != 0u && unsupported.result->imageTablePoison.at(fault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::UnsupportedOperation) && unsupported.result->imageTableFaults != 0u, (std::string("image table registration: the ") + name + " table does not fault on use").c_str());
-        const auto* storage = TableBinding(*unsupported.result, DescriptorRole::ImageStorageTable);
-        require(storage == nullptr || storage->count == 0u, (std::string("image table registration: the unsupported ") + name + " bound storage table elements").c_str());
+        require((fault & Abi::PoisonFlag) != 0u && unsupported.result->imageTablePoison.at(fault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::UnsupportedOperation), "image table registration: an unsupported store lost its whole-table fault");
+        if (opcode != 0x0fu) {
+            auto mixedCode = unsupportedCode;
+            mixedCode.insert(mixedCode.end() - 1, storeCode.begin() + 8, storeCode.begin() + 10);
+            const auto mixed = CompileTable(TableRequest(mixedCode, userData));
+            const auto& info = mixed.capture->plan->info;
+            require(info.images.size() == 2u && info.images[0].tableOperation == TableOperation::Unsupported && info.runtimeImageModes[0].empty() && info.images[1].tableOperation == TableOperation::Supported && !info.runtimeImageModes[1].empty(), "image table registration: a mixed shader emitted unsupported store modes or lost its supported store");
+            const auto& map = TableMap(*mixed.result);
+            const auto mixedFault = map[Abi::TableHeader(info.images[0].table) + Abi::TableFault];
+            require((mixedFault & Abi::PoisonFlag) != 0u && mixed.result->imageTablePoison.at(mixedFault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::UnsupportedOperation) && map[Abi::TableHeader(info.images[1].table) + Abi::TableFault] == 0u, "image table registration: mixed stores did not retain independent support and fault states");
+            const auto* binding = TableBinding(*mixed.result, DescriptorRole::ImageTable);
+            require(binding != nullptr && binding->kind == DescriptorKind::StorageImage && binding->count == stores->count, "image table registration: unsupported stores changed the supported storage binding");
+        }
     }
 
     const std::vector<std::uint32_t> compareCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf0fc0108u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
@@ -3561,6 +3840,167 @@ void verifyPointerTableOffsetCarry() {
 #endif
 }
 
+void TableProtect(void* page, bool readable) {
+#ifdef _WIN32
+    DWORD previous = 0;
+    require(VirtualProtect(page, 4096u, readable ? PAGE_READWRITE : PAGE_NOACCESS, &previous) != 0, "image table column memo: cannot change a page's access");
+#else
+    require(mprotect(page, 4096u, readable ? PROT_READ | PROT_WRITE : PROT_NONE) == 0, "image table column memo: cannot change a page's access");
+#endif
+}
+
+std::vector<std::array<std::uint32_t, 8>> TableRecordWords(const TableCompiled& compiled) {
+    const auto& tables = compiled.capture->snapshot.tables;
+    std::vector<std::array<std::uint32_t, 8>> words;
+    for (const auto code : tables.tables.at(0).codes) words.push_back((code & ShaderRecompiler::ImageTableAbi::PoisonFlag) != 0u ? std::array<std::uint32_t, 8>{} : tables.tables.at(0).words.at(code).dwords);
+    return words;
+}
+
+enum class TableMemoUse { Hit, LayoutReused, Miss };
+
+TableCompiled CompileTableCounted(const ShaderRecompiler::RecompileRequest& request, TableMemoUse expected, const char* message) {
+    static_cast<void>(expected);
+    static_cast<void>(message);
+    return CompileTable(request);
+}
+
+void verifyImageTableColumnMemo() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Pages = 3;
+    constexpr std::uint32_t Palette = 0x40;
+    static TableTexture textures[3];
+    alignas(4096) static TableGuest guest;
+    const auto userData = TableUserData(guest);
+    const auto unmapped = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::Unmapped));
+    const auto image = [&](std::uint32_t index) {
+        return TableT(textures[index % 3u].bytes.data(), index % 2u == 0u ? TableFormat8888UNorm : TableFormat32UInt, TableType2D, 1u + index % 7u);
+    };
+    void* block = nullptr;
+#ifdef _WIN32
+    block = VirtualAlloc(nullptr, Pages * Page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    block = mmap(nullptr, Pages * Page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (block == MAP_FAILED) block = nullptr;
+#endif
+    require(block != nullptr, "image table column memo: cannot map the pages");
+    auto* bytes = static_cast<std::byte*>(block);
+
+    auto* records = reinterpret_cast<std::array<std::uint32_t, 8>*>(bytes + Page - 64u);
+    for (std::uint32_t record = 0; record < 4u; record++) records[record] = image(record);
+    FillTableSrt(guest, records, 32u, 4u);
+    const auto wholeRequest = TableRequest(TableWholeCode, userData);
+    const auto mapped = CompileTableCounted(wholeRequest, TableMemoUse::Miss, "image table column memo: a table seen for the first time was not a miss");
+    require(TableRecordWords(mapped) == std::vector<std::array<std::uint32_t, 8>>(records, records + 4), "image table column memo: a table across two pages was not read");
+    const auto mappedSeen = CompileTableCounted(wholeRequest, TableMemoUse::Miss, "image table column memo: a table seen for the second time was not a miss that keeps its memo");
+    const auto mappedAgain = CompileTableCounted(wholeRequest, TableMemoUse::Hit, "image table column memo: an unchanged table across two pages was not a hit");
+    require(mappedSeen.capture->snapshot.tables == mapped.capture->snapshot.tables && mappedAgain.capture->snapshot.tables == mapped.capture->snapshot.tables, "image table column memo: a hit differs from the first read");
+    TableProtect(bytes + Page, false);
+    const auto cut = CompileTableCounted(wholeRequest, TableMemoUse::Miss, "image table column memo: a page that became inaccessible under the same key kept the layout");
+    const auto cutAgain = CompileTableCounted(wholeRequest, TableMemoUse::Hit, "image table column memo: a table with a page still inaccessible was not a hit");
+    TableProtect(bytes + Page, true);
+    const auto& cutCodes = cut.capture->snapshot.tables.tables.at(0).codes;
+    const auto cutWords = TableRecordWords(cut);
+    require(cutCodes.size() == 4u && cutWords[0] == records[0] && cutWords[1] == records[1] && cutCodes[2] == unmapped && cutCodes[3] == unmapped, "image table column memo: records on a page that became inaccessible under the same key were not Unmapped poison");
+    require(cutAgain.capture->snapshot.tables == cut.capture->snapshot.tables, "image table column memo: a hit with a page still inaccessible differs from its first read");
+    const auto remapped = CompileTableCounted(wholeRequest, TableMemoUse::Miss, "image table column memo: a page accessible again kept the layout");
+    require(remapped.capture->snapshot.tables == mapped.capture->snapshot.tables, "image table column memo: a page accessible again did not read as the first read");
+
+    std::fill(guest.heap.begin(), guest.heap.end(), std::array<std::uint32_t, 8>{});
+    for (std::uint32_t record = 0; record < 8u; record++) guest.heap[record] = image(record);
+    FillTableSrt(guest, guest.heap.data(), 0u, 100u);
+    const auto partial = CompileTableCounted(wholeRequest, TableMemoUse::Miss, "image table column memo: a partial table seen for the first time was not a miss");
+    static_cast<void>(CompileTableCounted(wholeRequest, TableMemoUse::Miss, "image table column memo: a partial table seen for the second time was not a miss that keeps its memo"));
+    const auto partialAgain = CompileTableCounted(wholeRequest, TableMemoUse::Hit, "image table column memo: an unchanged partial table was not a hit");
+    const auto& partialTables = partialAgain.capture->snapshot.tables;
+    const auto& tail = partialTables.tables.at(0).words.at(partialTables.tables.at(0).codes.at(3));
+    require(partialAgain.capture->snapshot.tables == partial.capture->snapshot.tables && tail.availableDwordMask == 1u && tail.dwords[0] == guest.heap[3][0], "image table column memo: a hit lost a cut record's available dwords");
+
+    FillTableSrt(guest, guest.heap.data(), 32u, 8u);
+    std::vector<std::uint32_t> narrowCode(TableWholeCode);
+    const auto shift = std::find(narrowCode.begin(), narrowCode.end(), 0x8f108510u);
+    require(shift != narrowCode.end(), "image table column memo: the program has no s_lshl_b32");
+    narrowCode.insert(shift, 0x87108310u);
+    auto wideCode = narrowCode;
+    *std::find(wideCode.begin(), wideCode.end(), 0x8f108510u) = 0x8f108610u;
+    const auto narrowRequest = TableRequest(narrowCode, userData);
+    auto wideRequest = TableRequest(wideCode, userData);
+    wideRequest.shader.codeAddress = narrowRequest.shader.codeAddress;
+    const auto narrowPlan = GetResourcePlan(narrowRequest);
+    const auto widePlan = GetResourcePlan(wideRequest);
+    require(narrowPlan->info.images.size() == 1u && widePlan->info.images.size() == 1u && narrowPlan->info.images[0].table == 0u && widePlan->info.images[0].table == 0u && narrowPlan->info.images[0].source == widePlan->info.images[0].source, "image table column memo: the two programs do not read their table through one source");
+    const auto& narrowColumn = *narrowPlan->descriptorSources.at(narrowPlan->info.images[0].source).tableColumn;
+    const auto& wideColumn = *widePlan->descriptorSources.at(widePlan->info.images[0].source).tableColumn;
+    require(narrowColumn.stride == 32u && wideColumn.stride == 64u && narrowColumn.maxKey == 3u && wideColumn.maxKey == 3u && narrowColumn.keyDomains.empty() && wideColumn.keyDomains.empty(), "image table column memo: the two columns are wrong");
+    const auto byNarrow = CompileTableCounted(narrowRequest, TableMemoUse::Miss, "image table column memo: the first shader's column seen for the first time was not a miss");
+    static_cast<void>(CompileTableCounted(narrowRequest, TableMemoUse::Miss, "image table column memo: the first shader's column seen for the second time was not a miss that keeps its memo"));
+    const auto byNarrowHit = CompileTableCounted(narrowRequest, TableMemoUse::Hit, "image table column memo: the first shader's unchanged column was not a hit");
+    const auto byWide = CompileTableCounted(wideRequest, TableMemoUse::Miss, "image table column memo: another shader's column at the same code address used the first shader's memo");
+    const auto byNarrowAgain = CompileTableCounted(narrowRequest, TableMemoUse::Miss, "image table column memo: the first shader's column used the second shader's memo");
+    const auto& narrowSnapshot = byNarrow.capture->snapshot.tables.tables.at(0);
+    const auto& wideSnapshot = byWide.capture->snapshot.tables.tables.at(0);
+    require(narrowSnapshot.base == wideSnapshot.base && narrowSnapshot.size == wideSnapshot.size && narrowSnapshot.keys == 4u && wideSnapshot.keys == 4u, "image table column memo: the two columns do not share a base, a size and a key count");
+    require(TableRecordWords(byNarrow) == std::vector<std::array<std::uint32_t, 8>>{guest.heap[0], guest.heap[1], guest.heap[2], guest.heap[3]}, "image table column memo: the stride-32 column read the wrong records");
+    require(TableRecordWords(byWide) == std::vector<std::array<std::uint32_t, 8>>{guest.heap[0], guest.heap[2], guest.heap[4], guest.heap[6]}, "image table column memo: another shader's column at the same code address took the first shader's records");
+    require(byNarrowHit.capture->snapshot.tables == byNarrow.capture->snapshot.tables && byNarrowAgain.capture->snapshot.tables == byNarrow.capture->snapshot.tables, "image table column memo: the first shader's column read differently after the second shader's");
+
+    auto* root = reinterpret_cast<std::uint32_t*>(bytes);
+    std::fill_n(root, Pages * Page / sizeof(std::uint32_t), 0u);
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(root));
+    static std::array<std::uint32_t, 8> keys{};
+    static std::array<std::uint32_t, 4> output{};
+    const auto keysV = TableV(keys.data(), 0u, static_cast<std::uint32_t>(sizeof(keys)));
+    const auto outputV = TableV(output.data(), 0u, static_cast<std::uint32_t>(sizeof(output)));
+    std::copy(keysV.begin(), keysV.end(), root);
+    std::copy(outputV.begin(), outputV.end(), root + 4);
+    const auto place = [&](std::uint32_t index, const std::array<std::uint32_t, 8>& words) {
+        std::copy(words.begin(), words.end(), root + (Palette + index * 32u) / 4u);
+    };
+    const auto held = [&] {
+        std::vector<std::array<std::uint32_t, 8>> words(256u);
+        for (std::uint32_t index = 0; index < 256u; index++) std::copy_n(root + (Palette + index * 32u) / 4u, 8u, words[index].begin());
+        return words;
+    };
+    for (const auto index : {0u, 1u, 2u, 125u, 126u, 127u, 253u, 254u, 255u}) place(index, image(index));
+    const std::array<std::uint32_t, 2> pointerUserData{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u)};
+    const std::vector<std::uint32_t> pointerCode{0xbf800000u, 0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e200500u, 0x8f108210u,
+        0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0xf09c0f08u, 0x01090000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+    const auto pointerRequest = TableRequest(pointerCode, pointerUserData);
+    const auto first = CompileTableCounted(pointerRequest, TableMemoUse::Miss, "image table column memo: a pointer column seen for the first time was not a miss");
+    static_cast<void>(CompileTableCounted(pointerRequest, TableMemoUse::Miss, "image table column memo: a pointer column seen for the second time was not a miss that keeps its memo"));
+    const auto& firstSnapshot = first.capture->snapshot.tables.tables.at(0);
+    require(firstSnapshot.base == base && firstSnapshot.keys == 256u && TableRecordWords(first) == held(), "image table column memo: the pointer column's first read is wrong");
+    const auto repeated = CompileTableCounted(pointerRequest, TableMemoUse::Hit, "image table column memo: an unchanged pointer column was not a hit");
+    require(repeated.capture->snapshot.tables == first.capture->snapshot.tables, "image table column memo: an unchanged pointer column read twice differs");
+    const auto original = held()[126];
+    place(126u, image(200u));
+    const auto changed = CompileTableCounted(pointerRequest, TableMemoUse::LayoutReused, "image table column memo: a changed record of a pointer column did not reuse the layout and read the words again");
+    require(image(200u) != original && TableRecordWords(changed) == held(), "image table column memo: a changed record of a pointer column was not read again");
+    place(126u, original);
+    const auto restored = CompileTableCounted(pointerRequest, TableMemoUse::LayoutReused, "image table column memo: a restored record of a pointer column did not reuse the layout and read the words again");
+    require(restored.capture->snapshot.tables == first.capture->snapshot.tables, "image table column memo: a pointer column restored after a change differs from its first read");
+    TableProtect(bytes + Page, false);
+    const auto pointerCut = CompileTableCounted(pointerRequest, TableMemoUse::Miss, "image table column memo: a pointer column page that became inaccessible kept the layout");
+    TableProtect(bytes + Page, true);
+    const auto& pointerCutCodes = pointerCut.capture->snapshot.tables.tables.at(0).codes;
+    const auto pointerCutWords = TableRecordWords(pointerCut);
+    const auto firstWords = TableRecordWords(first);
+    bool cutRight = pointerCutCodes.size() == 256u;
+    for (std::uint32_t index = 0; cutRight && index < 256u; index++) {
+        const auto offset = Palette + index * 32u;
+        cutRight = offset >= Page && offset < 2u * Page ? pointerCutCodes[index] == unmapped : pointerCutWords[index] == firstWords[index];
+    }
+    require(cutRight, "image table column memo: a pointer column's records on a page that became inaccessible were not Unmapped poison");
+    const auto pointerRemapped = CompileTableCounted(pointerRequest, TableMemoUse::Miss, "image table column memo: a pointer column page accessible again kept the layout");
+    require(pointerRemapped.capture->snapshot.tables == first.capture->snapshot.tables, "image table column memo: a pointer column's page accessible again did not read as the first read");
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    munmap(block, Pages * Page);
+#endif
+}
+
 void verifySelectedRecordFallbacks() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -3731,7 +4171,7 @@ void verifySelectedRecordDirectOperations() {
         require(word0 == 0xf0440308u || (TableBinding(*compiled.result, DescriptorRole::ImageTable) == nullptr && compiled.result->imageTableFaults == 0u && TableCovered(compiled.regions, &heap[2], sizeof(heap[2]))), (what + " through a T# whose record the CPU evaluates was not bound from its record").c_str());
         const auto wholeCode = WithImageOperation(TableWholeCode, word0, false);
         const auto whole = GetResourcePlan(TableRequest(wholeCode, userData));
-        require(whole->info.images.size() == 1u && whole->info.images[0].table == 0u && whole->info.images[0].tableOperation == (word0 == 0xf0200f08u || word0 == 0xf0440108u ? TableOperation::Supported : TableOperation::Unsupported), (what + " through a T# keyed per lane left the image table or has the wrong table operation").c_str());
+        require(whole->info.images.size() == 1u && whole->info.images[0].table == 0u && whole->info.images[0].tableOperation == (word0 == 0xf0200f08u ? TableOperation::Supported : TableOperation::Unsupported), (what + " through a T# keyed per lane left the image table or has the wrong table operation").c_str());
     }
     const auto mixedCode = WithImageOperation(TableSrtKeyCode, 0xf0200f08u, true);
     const auto mixed = GetResourcePlan(TableRequest(mixedCode, userData));
@@ -4252,6 +4692,36 @@ void verifyDescriptorPhis() {
     };
     require(planImages(splitReloads(8u)) == 4u, "descriptor Phi: separate reloads of T# dword 7 and dwords 0-6 were not split into their 4 T#s");
     expectFailure([&] { static_cast<void>(planImages(splitReloads(260u))); }, "GetImageResource dword 0 is not a valid runtime value", "descriptor Phi: a web over more than 512 descriptor tuples was accepted");
+    const auto laneTuple = [](bool mismatchedMask, bool mismatchedPredicate) {
+        std::vector<std::uint32_t> code{
+            0xf40c0200u, 0xfa000000u, 0xf4080400u, 0xfa000020u, 0xf40c0a00u, 0xfa000060u,
+            0xf4080c00u, 0xfa000030u, 0xf4080700u, 0xfa000040u, 0xbebc047eu};
+        for (std::uint32_t word = 0; word < 12u; ++word) code.push_back(0x7e000200u | ((16u + word) << 17u) | (8u + word));
+        code.insert(code.end(), {0xbefe0380u, 0xbeff03c1u});
+        for (std::uint32_t word = 0; word < 12u; ++word) {
+            if (mismatchedPredicate && word == 0u) code.insert(code.end(), {0xbeff03ffu, 0xfffffeffu});
+            if (mismatchedPredicate && word == 1u) code.push_back(0xbeff03c1u);
+            code.push_back(0x7e000200u | ((16u + word) << 17u) | (40u + word));
+        }
+        code.insert(code.end(), {0xbefe0380u, 0xbeff03ffu, 0x100u});
+        for (std::uint32_t word = 0; word < 12u; ++word) {
+            if (mismatchedMask && word == 0u) code.insert(code.end(), {0xbefe0390u, 0xbeff0380u});
+            if (mismatchedMask && word == 1u) code.insert(code.end(), {0xbefe0380u, 0xbeff03ffu, 0x100u});
+            const auto destination = word < 8u ? 36u + word : 32u + word - 8u;
+            code.push_back(0x7e000500u | (destination << 17u) | (16u + word));
+        }
+        code.insert(code.end(), {0xbefe043cu, 0xf09c0f08u, 0x01090401u, 0xe0781000u, 0x80070408u, 0xbf810000u});
+        return code;
+    };
+    const auto coherent = laneTuple(false, false);
+    const auto coherentPlan = GetResourcePlan(makeRequest(coherent, 64u));
+    require(coherentPlan->info.images.size() >= 2u && coherentPlan->info.samplers.size() >= 2u,
+        "descriptor waterfall: coherent lane-selected tuple lost an image or sampler arm");
+    for (const auto mismatch : {std::pair{true, false}, std::pair{false, true}}) {
+        const auto invalid = laneTuple(mismatch.first, mismatch.second);
+        expectFailure([&] { static_cast<void>(GetResourcePlan(makeRequest(invalid, 64u))); }, "GetImageResource dword 0 is not a valid runtime value",
+            mismatch.first ? "descriptor waterfall: distinct lane masks were zipped into one tuple" : "descriptor waterfall: distinct predicates were zipped into one tuple");
+    }
 }
 
 void verifyUniformTableImage() {
@@ -5438,7 +5908,7 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel->layerExported = true;
     minimal.context.pixel->ditheredAlphaToCoverage = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQS4AAAA=", "new requests did not use serialization version 46");
+    require(requestPrefix(encoded, 8u) == "NVNQQS8AAAA=", "new requests did not use serialization version 47");
     const std::array<std::uint32_t, 2> fallbacks{0x40u, 0x1ac4u};
     auto withFallbacks = minimal;
     withFallbacks.context.linkedCallFallbacks = fallbacks;
@@ -5553,10 +6023,10 @@ void verifyPixelRequestSerialization() {
         require(RecompileCacheKey::ContextHash(legacy19.request) == RecompileCacheKey::ContextHash(upgraded19.request), "upgrading version19 changed shader identity");
     }
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
-    for (std::size_t bytes = 0; bytes < 45u; ++bytes) {
-        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export, dither or front-face flag, quad pixel mask or quad sample mask was accepted");
+    for (std::size_t bytes = 0; bytes < 85u; ++bytes) {
+        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export, dither or front-face flag, quad pixel mask, quad sample mask, reversed-order blend code or blend was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQS8AAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQTAAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -5693,6 +6163,7 @@ void verifyVertexInfoVersion19() {
     while (blendOffset < plainPixel.size() && plainPixel[blendOffset] == blendedPixel[blendOffset]) ++blendOffset;
     require(blendOffset + 4u <= plainPixel.size() && blendedPixel[blendOffset] == 0xefu && blendedPixel[blendOffset + 1u] == 0xcdu && blendedPixel[blendOffset + 2u] == 0xabu && blendedPixel[blendOffset + 3u] == 0x89u, "the reversed-order blend code is not the four bytes the version 30 pixel info adds");
     require(std::equal(plainPixel.begin() + static_cast<std::ptrdiff_t>(blendOffset + 4u), plainPixel.end(), blendedPixel.begin() + static_cast<std::ptrdiff_t>(blendOffset + 4u)), "the reversed-order blend code moved the fields after it");
+    const std::size_t blendBytes = pixel.context.pixel->targetBlend.size() * 5u;
     auto allBitsPixel = pixel;
     allBitsPixel.context.pixel->frontFaceAllBits = true;
     const auto allBitsBytes = decodeBase64(serializer.Serialize(allBitsPixel));
@@ -5704,7 +6175,7 @@ void verifyVertexInfoVersion19() {
     constexpr std::size_t sampleOrderBytes = 16u;
     constexpr std::size_t mergeBytes = 40u;
     constexpr std::size_t sampleMaskBytes = 16u;
-    const auto orderOffset = blendOffset + 4u + iterationBytes;
+    const auto orderOffset = blendOffset + 4u + blendBytes + iterationBytes;
     const auto mergeOffset = static_cast<std::ptrdiff_t>(orderOffset + sampleOrderBytes);
     auto merging = pixel;
     merging.context.pixel->targetMerge = {3u, 0xf00fu, 2u, {1u, 2u, 3u, 4u, 5u, 6u, 7u, 0x89abcdefu}, true, true};
@@ -5719,12 +6190,13 @@ void verifyVertexInfoVersion19() {
         return bytes;
     };
     auto version42 = version43Bytes(plainPixel);
+    version42.erase(version42.begin() + static_cast<std::ptrdiff_t>(blendOffset + 4u), version42.begin() + static_cast<std::ptrdiff_t>(blendOffset + 4u + blendBytes));
     version42[4] = 42u;
     const auto replay42 = serializer.Deserialize(encodeBase64(version42));
     require(replay42.request.context.pixel.has_value() && replay42.request.context.pixel->targetMerge == TargetMerge{} && serializer.Serialize(replay42.request) == encodedPixel, "a version 42 request read a color target merge or misread the fields after it");
     auto version39 = version42;
     version39.pop_back();
-    version39.erase(version39.begin() + static_cast<std::ptrdiff_t>(orderOffset), version39.begin() + mergeOffset);
+    version39.erase(version39.begin() + static_cast<std::ptrdiff_t>(orderOffset - blendBytes), version39.begin() + mergeOffset - static_cast<std::ptrdiff_t>(blendBytes));
     version39[4] = 39u;
     const auto replay39 = serializer.Deserialize(encodeBase64(version39));
     require(replay39.request.context.pixel.has_value() && replay39.request.context.pixel->targetMerge == TargetMerge{} && replay39.request.context.pixel->sampleOrder == std::array<std::uint32_t, 4>{} && serializer.Serialize(replay39.request) == encodedPixel, "a version 39 request read a sample order or color target merge, or misread the fields after them");
@@ -5737,6 +6209,7 @@ void verifyVertexInfoVersion19() {
     orderedVersion34.pop_back();
     orderedVersion34.pop_back();
     orderedVersion34.erase(orderedVersion34.begin() + static_cast<std::ptrdiff_t>(orderOffset - 1u), orderedVersion34.begin() + static_cast<std::ptrdiff_t>(orderOffset + sampleOrderBytes));
+    orderedVersion34.erase(orderedVersion34.begin() + static_cast<std::ptrdiff_t>(blendOffset + 4u), orderedVersion34.begin() + static_cast<std::ptrdiff_t>(blendOffset + 4u + blendBytes));
     orderedVersion34[4] = 34u;
     const auto orderedReplay34 = serializer.Deserialize(encodeBase64(orderedVersion34));
     require(orderedReplay34.request.context.pixel.has_value() && orderedReplay34.request.context.pixel->sampleOrder == std::array<std::uint32_t, 4>{} && serializer.Serialize(orderedReplay34.request) == encodedPixel, "a version 34 request read a sample order, or misread the fields after its pixel iteration fields");
@@ -5769,12 +6242,22 @@ void verifyVertexInfoVersion19() {
     sampledPixel.context.pixel->quadSampleMask = {0x1u, 0x2u, 0x4u, 0x8u};
     const auto sampledBytes = decodeBase64(serializer.Serialize(sampledPixel));
     require(std::equal(maskedBytes.begin(), maskedBytes.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u), sampledBytes.begin()) && sampledBytes[maskOffset + 1u] == 0x1u && sampledBytes[maskOffset + 5u] == 0x2u && sampledBytes[maskOffset + 9u] == 0x4u && sampledBytes[maskOffset + 13u] == 0x8u, "the quad sample masks are not the four words after the quad pixel mask");
+    auto localVersion30 = version43Bytes(sampledBytes);
+    localVersion30.pop_back();
+    localVersion30.pop_back();
+    localVersion30.pop_back();
+    localVersion30.pop_back();
+    localVersion30.erase(localVersion30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes), localVersion30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
+    localVersion30.erase(localVersion30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes), localVersion30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u));
+    localVersion30[4] = 30u;
+    const auto replayLocal30 = serializer.Deserialize(encodeBase64(localVersion30));
+    require(replayLocal30.request.context.pixel.has_value() && replayLocal30.request.context.pixel->quadSampleMask == std::array<std::uint16_t, 4>{0x1u, 0x2u, 0x4u, 0x8u} && replayLocal30.request.context.pixel->reversedBlend == 0u && decodeBase64(serializer.Serialize(replayLocal30.request)) == sampledBytes, "a local version 30 request read a reversed-order blend code or misread its blends");
     auto version30 = version43Bytes(sampledBytes);
     version30.pop_back();
     version30.pop_back();
     version30.pop_back();
     version30.pop_back();
-    version30.erase(version30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u), version30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + iterationBytes + sampleOrderBytes));
+    version30.erase(version30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u), version30.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
     version30[4] = 30u;
     const auto replay30 = serializer.Deserialize(encodeBase64(version30));
     require(replay30.request.context.pixel.has_value() && !replay30.request.context.pixel->iteratesSamples && replay30.request.context.pixel->positionLocation == PixelPositionLocation::Center && replay30.request.context.pixel->sampleLocations == std::array<std::uint8_t, 32>{} && decodeBase64(serializer.Serialize(replay30.request)) == sampledBytes, "a version 30 request read pixel iteration, a position location or sample locations, or misread the fields after its reversed-order blend code");
@@ -5785,7 +6268,7 @@ void verifyVertexInfoVersion19() {
     require(version32.size() > 2u && version32.back() == 0u && version32[version32.size() - 2u] == 0u && version32[version32.size() - 3u] == 1u, "the spanned-waves flag is not the byte before the depth remap flag");
     version32.pop_back();
     version32.pop_back();
-    version32.erase(version32.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u), version32.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + iterationBytes + sampleOrderBytes));
+    version32.erase(version32.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u), version32.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
     version32[4] = 32u;
     const auto replay32 = serializer.Deserialize(encodeBase64(version32));
     require(replay32.request.context.pixel.has_value() && !replay32.request.context.pixel->iteratesSamples && replay32.request.context.pixel->sampleLocations == std::array<std::uint8_t, 32>{} && replay32.request.target.spannedWaves && serializer.Serialize(replay32.request) == serializer.Serialize(spanned), "a version 32 request read pixel iteration or sample locations, or lost its spanned-waves flag");
@@ -5794,10 +6277,11 @@ void verifyVertexInfoVersion19() {
     version29.pop_back();
     version29.pop_back();
     version29.pop_back();
-    version29.erase(version29.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes), version29.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + iterationBytes + sampleOrderBytes));
+    version29.erase(version29.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes), version29.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
     auto version36 = version43Bytes(sampledBytes);
     version36.pop_back();
-    version36.erase(version36.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + iterationBytes - 1u), version36.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + iterationBytes + sampleOrderBytes));
+    version36.erase(version36.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes - 1u), version36.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
+    version36.erase(version36.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u), version36.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes));
     version36[4] = 36u;
     const auto replay36 = serializer.Deserialize(encodeBase64(version36));
     require(replay36.request.context.pixel.has_value() && !replay36.request.context.pixel->stencilOperationValueExport && decodeBase64(serializer.Serialize(replay36.request)) == sampledBytes, "a version 36 request read a stencil operation value export or misread the fields after the sample locations");
@@ -5809,7 +6293,7 @@ void verifyVertexInfoVersion19() {
     version28.pop_back();
     version28.pop_back();
     version28.pop_back();
-    version28.erase(version28.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u), version28.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + iterationBytes + sampleOrderBytes));
+    version28.erase(version28.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u), version28.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
     version28[4] = 28u;
     const auto replay28 = serializer.Deserialize(encodeBase64(version28));
     require(replay28.request.context.pixel.has_value() && replay28.request.context.pixel->quadPixelMask == 0x2u && replay28.request.context.pixel->quadSampleMask == std::array<std::uint16_t, 4>{0xffffu, 0xffffu, 0xffffu, 0xffffu} && replay28.request.context.pixel->reversedBlend == 0u && decodeBase64(serializer.Serialize(replay28.request)) == maskedBytes, "a version 28 request read quad sample masks or a reversed-order blend code, or misread the fields after them");
@@ -5818,7 +6302,7 @@ void verifyVertexInfoVersion19() {
     version27.pop_back();
     version27.pop_back();
     version27.pop_back();
-    version27.erase(version27.begin() + static_cast<std::ptrdiff_t>(maskOffset), version27.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + iterationBytes + sampleOrderBytes));
+    version27.erase(version27.begin() + static_cast<std::ptrdiff_t>(maskOffset), version27.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
     version27[4] = 27u;
     const auto replay27 = serializer.Deserialize(encodeBase64(version27));
     require(replay27.request.context.pixel.has_value() && replay27.request.context.pixel->quadPixelMask == 0xfu && replay27.request.context.pixel->reversedBlend == 0u && serializer.Serialize(replay27.request) == encodedPixel, "a version 27 request read a quad pixel mask or reversed-order blend code, or misread the fields after it");
@@ -5827,7 +6311,7 @@ void verifyVertexInfoVersion19() {
     legacyPixel.pop_back();
     legacyPixel.pop_back();
     legacyPixel.pop_back();
-    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(allBitsOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(allBitsOffset + 2u + sampleMaskBytes + 4u + iterationBytes + sampleOrderBytes));
+    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(allBitsOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(allBitsOffset + 2u + sampleMaskBytes + 4u + blendBytes + iterationBytes + sampleOrderBytes));
     legacyPixel[4] = 26u;
     const auto replay26 = serializer.Deserialize(encodeBase64(legacyPixel));
     require(replay26.request.context.pixel.has_value() && replay26.request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle && !replay26.request.context.pixel->frontFaceAllBits && replay26.request.context.pixel->reversedBlend == 0u, "a version 26 request lost its pixel primitive class or read a front-face all-bits flag");
@@ -5942,7 +6426,7 @@ void verifyMergedHullConfiguration() {
     require(!serializer.Deserialize(separate).request.graphics->tessellation->mergedHull, "a separate hull configuration was read as merged");
     constexpr std::size_t pointTailBytes = 13u;
     auto legacy = decodeBase64(merged);
-    require(legacy.size() > 54u + pointTailBytes && legacy[4] == 46u, "a merged hull request did not use serialization version 46");
+    require(legacy.size() > 54u + pointTailBytes && legacy[4] == 47u, "a merged hull request did not use serialization version 47");
     legacy.resize(legacy.size() - sizeof(std::uint32_t) - 2u - pointTailBytes);
     legacy.pop_back();
     require(legacy[legacy.size() - 52u] == 1u, "the merged hull flag is not the last byte of the tessellation configuration");
@@ -6463,7 +6947,7 @@ void verifySpecializedBufferAtomicBindings(bool finalAbiOnly = false) {
         atomicElements += static_cast<std::size_t>(std::count(binding.bufferAtomic.begin(), binding.bufferAtomic.end(), true));
     }
     require(tables == 0, "specialized buffer atomic: a buffer_atomic_inc through a V# the program specializes binds the address tables");
-    require(faults == 1 && result.bdaAbiVersion == BdaAbi::Version, "specialized buffer atomic: the program has no fault buffer for its unaligned atomic");
+    require(faults == 0 && result.bdaAbiVersion == 0u, "specialized buffer atomic: a 32-bit atomic that cannot fault kept the fault buffer its specialized module no longer uses");
     require(atomicElements == 1, "specialized buffer atomic: the V# element is not reported as atomic");
     const auto words = result.spirv.Words();
     std::uint32_t faultFunction = 0;
@@ -7840,7 +8324,7 @@ void verifyGuardedNullPointers() {
             if (opcode == spv::OpFunction) function = names[words[cursor + 2]];
             if (opcode == spv::OpAccessChain && count == 6u && names[words[cursor + 3]] == "fault_buffer" && constants.contains(words[cursor + 5]) && constants[words[cursor + 5]] == BdaAbi::SrtGuardWord) guardWords.push_back(words[cursor + 2]);
             if (function == "main" && opcode == spv::OpFunctionCall && names[words[cursor + 3]] == "record_bda_fault") ++calls;
-            if (function == "main" && opcode == spv::OpAtomicStore && std::find(guardWords.begin(), guardWords.end(), words[cursor + 1]) != guardWords.end()) ++stores;
+            if (function == "main" && opcode == spv::OpAtomicCompareExchange && std::find(guardWords.begin(), guardWords.end(), words[cursor + 3]) != guardWords.end()) ++stores;
             cursor += count;
         }
         return std::pair{calls, stores};
@@ -8388,6 +8872,7 @@ int main(int argc, char** argv) {
             verifyImageTableBulkKeyScan();
             verifyImageTableSrtKey();
             verifyImageTableMaskedOffset();
+            verifyImageTableFirstLaneScale();
             verifyImageTableKeyUnion();
             verifyImageTableLateKey();
             verifyImageTableUnkeyedAccess();
@@ -8395,6 +8880,8 @@ int main(int argc, char** argv) {
             verifyScalarAddressRule();
             verifyPointerImageTable();
             verifyPointerTableOffsetCarry();
+            verifyImageTableColumnMemo();
+            verifyImageTableResolveMemo();
             verifySelectedRecordFallbacks();
             verifySelectedRecordOffsetCarry();
             verifySelectedRecordDirectOperations();
@@ -8449,6 +8936,7 @@ int main(int argc, char** argv) {
         verifyRegisterSources();
         verifyEvaluatedValues();
         verifyFrontendPair();
+        verifyScalarBufferBounds();
         verifyLayoutPair();
         verifySignedSrtComparison();
         verifyTypeZeroImageMaterialization();
@@ -8460,16 +8948,22 @@ int main(int argc, char** argv) {
         verifyPlanRetention();
         verifyPlanRetentionChains();
         verifyPlanCopyAnswers();
-        verifyGuardedDescriptorSources();
         verifyLaneMaskGuardedDescriptorSources();
+        verifyExecGuardedDescriptorSources();
         verifySrtTape();
         verifyTargetFeatureKey();
         verifyImageTableKeys();
         verifyImageTables();
+        verifyImageTableMaskedOffset();
+        verifyImageTableKeyUnion();
+        verifyImageTableUnkeyedAccess();
         verifyImageTableRegistration();
         verifyScalarAddressRule();
         verifyPointerImageTable();
+        verifyGuardedDescriptorSources();
         verifyPointerTableOffsetCarry();
+        verifyImageTableColumnMemo();
+        verifyImageTableResolveMemo();
         verifyChainedTableOffset();
         verifyPointerChainImageTable();
         verifyWaterfallImageTable();

@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -42,6 +44,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
     cache = GetBufferPool(context);
+    live.Set((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0, capacity);
     if (const auto allocation = cache->Take(size, this->usage, properties)) {
         buffer = allocation->buffer;
         memory = allocation->memory;
@@ -95,7 +98,10 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             ready = true;
             return;
         }
-        memory = cache->AllocateMemory(allocation, "vkAllocateMemory buffer");
+        {
+            const MemoryStats::PoolTierScope tier((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 ? MemoryStats::Owner::PoolDevice : MemoryStats::Owner::PoolHost);
+            memory = cache->AllocateMemory(allocation, "vkAllocateMemory buffer");
+        }
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
@@ -146,6 +152,7 @@ void Buffer::Invalidate() {
 DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage) : context(context), size(size), capacity(BufferPool::Capacity(size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)), usage(BufferPool::Usage(usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
     Require(size != 0, "zero-sized device buffer");
     cache = GetBufferPool(context);
+    live.Set(true, capacity);
     if (const auto allocation = cache->Take(size, this->usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
         buffer = allocation->buffer;
         memory = allocation->memory;
@@ -180,7 +187,30 @@ DeviceBuffer::DeviceBuffer(const Context& context, std::size_t size, VkBufferUsa
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, allocation.allocationSize, "device buffer");
         const auto deviceType = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         std::uint32_t allocatedType = allocation.memoryTypeIndex;
-        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer", context.RefusedDeviceMemoryFallback(requirements.memoryTypeBits, allocation.memoryTypeIndex), &allocatedType);
+        {
+            const MemoryStats::PoolTierScope tier(MemoryStats::Owner::PoolDevice);
+            try {
+                memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer", context.RefusedDeviceMemoryFallback(requirements.memoryTypeBits, allocation.memoryTypeIndex), &allocatedType);
+            } catch (const std::runtime_error& error) {
+                const auto overflow = OverflowMemoryType(context.memory, requirements.memoryTypeBits);
+                const auto system = SystemMemoryType(context.memory, requirements.memoryTypeBits);
+                bool placed = false;
+                for (const auto type : {overflow, system}) {
+                    if (!type || *type == allocation.memoryTypeIndex) continue;
+                    allocation.memoryTypeIndex = *type;
+                    try {
+                        memory = cache->AllocateMemory(allocation, "vkAllocateMemory device buffer");
+                        allocatedType = *type;
+                        placed = true;
+                        break;
+                    } catch (const std::runtime_error&) {
+                    }
+                }
+                if (!placed) throw;
+                static std::atomic<std::uint64_t> reports{0};
+                if (reports.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[bufferpool] device buffer of %llu bytes placed in memory type %u outside the device-local heap after: %s\n", static_cast<unsigned long long>(allocation.allocationSize), *overflow, error.what());
+            }
+        }
         hostPlaced = allocatedType != deviceType;
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory device");
         ready = true;
@@ -217,6 +247,7 @@ void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer sourc
 }
 
 void RecordMemoryBarrier(const Context& context, VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
+    Recorder::FilterLaneBarrier(sourceStage, destinationStage, sourceAccess, destinationAccess);
     const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, sourceAccess, destinationAccess};
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
@@ -272,6 +303,7 @@ RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bo
     const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | (blending ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT : 0u);
     Require((properties.optimalTilingFeatures & required) == required, "render-target format does not support required operations");
     constexpr auto usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const MemoryStats::OwnerScope owner(MemoryStats::Owner::RenderTarget);
     VkImageFormatProperties supported{};
     Check(context.imageFormatProperties(context.physical, target.format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0, &supported), "vkGetPhysicalDeviceImageFormatProperties");
     Require(target.extent.width <= supported.maxExtent.width && target.extent.height <= supported.maxExtent.height && (supported.sampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0 && target.bytes <= supported.maxResourceSize, "render target exceeds device image limits");

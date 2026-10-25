@@ -236,8 +236,15 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            # Policy/loop switches are generated cache inputs and live memo keys; axes use keyed sampler words.
+            UnnormalizedWrapEnabled
+            UnnormalizedWrapAxes
+            DirectImageLoopGuardEnabled
+            BdaAbi::BuildRangeIndex
             BdaAbi::RangesOrdered
             BuildBarycentricGeometryShader
+            BdaAbi::DirectImageFaultReason
+            BdaAbi::DirectImageFaultResource
             BuildBarycentricTessellationShaders
             BuildPreparedShaderKey
             BuildRectListShaders
@@ -257,6 +264,7 @@ function(add_shader_recompiler target runtimeTarget)
             PipelineSpecialization::WorkgroupOffsetBase
             PipelineSpecialization::WorkgroupOffsetWords
             PixelInput
+            PointFilteredSamplerWord
             PixelInputBit
             RayTracingStrict
             RayTracingMiss
@@ -270,9 +278,12 @@ function(add_shader_recompiler target runtimeTarget)
             MatchesPreparedShader
             GetPreparedArtifact
             MaterializeShader
+            ResultMemoTotals
+            ResultHeapBytes
             RegistrationResult
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds
+            ResourceMaterializer::FindBindlessInterface
             ResourceMaterializer::MaterializeNanoseconds
             ReleaseUndrawnResourcePlan
             ResourceMaterializer::SpecializationNanoseconds

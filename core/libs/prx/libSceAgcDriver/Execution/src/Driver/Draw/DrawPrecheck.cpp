@@ -1,74 +1,48 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
+#include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
 
-bool Driver::drawPrecheck() {
+namespace {
+
+bool precheckRejections() {
     static const bool precheck = std::getenv("APS5_NO_DRAW_PRECHECK") == nullptr;
     return precheck;
 }
 
-std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
-    if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
-    if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
+template <typename TRestart, typename TReached>
+DrawPrecheckOutcome precheckState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, std::string& rejected, std::optional<Graphics::ColorMetadataPass>& metadata, std::optional<Graphics::DepthCopyPass>& depthCopy, TRestart&& primitiveListRestart, TReached&& reached) {
+    if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawPrecheckOutcome::Nothing;
+    if (auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
-        if (DrawPipeline::Active() && DrawPipeline::MetadataPassesPipelined() && deferredLabels().labels.empty()) {
-            auto writes = Graphics::PipelinedColorMetadataPassWrites(*pass);
-            const auto localDevice = device.Load();
-            if (!writes.empty() && localDevice != nullptr) {
-                const auto queueId = submission.queue;
-                const auto opcode = (packet[0] >> 8u) & 0xffu;
-                DrawPipeline::Queue0().Enqueue([this, localDevice, queueId, opcode, pass = *pass] {
-                    GuestMemory::SetCurrentPacket(opcode, queueId);
-                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                    auto current = device.Load();
-                    const auto& target = current != nullptr ? current : localDevice;
-                    recordLabelsForPacket(target.get(), queueId);
-                    target->ColorMetadataPass(pass);
-                }, std::move(writes));
-                DrawPipeline::CountPipelinedMetadataPass();
-                return DrawVerdict::Drawn;
-            }
-        }
-        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
-        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
-        if (device == nullptr) device = std::make_shared<VulkanDevice>();
-        const std::shared_ptr<VulkanDevice> localDevice = device;
-        recordLabelsForPacket(localDevice.get(), submission.queue);
-        localDevice->ColorMetadataPass(*pass);
-        return DrawVerdict::Drawn;
+        metadata = std::move(pass);
+        return DrawPrecheckOutcome::MetadataPass;
     }
-    if (const auto copy = Graphics::DecodeDepthCopyPass(queue)) {
+    if (auto copy = Graphics::DecodeDepthCopyPass(queue)) {
         require(!drawParameters.indirect, "indirect DB depth copies are unsupported");
-        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
-        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
-        if (device == nullptr) device = std::make_shared<VulkanDevice>();
-        const std::shared_ptr<VulkanDevice> localDevice = device;
-        recordLabelsForPacket(localDevice.get(), submission.queue);
-        localDevice->DepthCopyPass(*copy);
-        return DrawVerdict::Drawn;
+        depthCopy = std::move(copy);
+        return DrawPrecheckOutcome::MetadataPass;
     }
-    if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawVerdict::Nothing;
+    if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawPrecheckOutcome::Nothing;
     rejected = Graphics::DepthMaintenanceRejection(queue);
-    if (!rejected.empty()) return DrawVerdict::Rejected;
-    static const bool traceIndirectEnabled = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
-    traceIndirect = traceIndirectEnabled;
-    if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
+    if (!rejected.empty()) return DrawPrecheckOutcome::Rejected;
+    reached();
     {
         const auto targetMask = queue.context.find(0x8e);
         const auto shaderMask = queue.context.find(0x8f);
         const bool colorWrites = targetMask != queue.context.end() && shaderMask != queue.context.end() && Graphics::ColorWriteMask(queue.context) != 0;
         if (!colorWrites && !queue.shader.contains(0x8)) {
             const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
-            if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) return DrawVerdict::Nothing;
+            if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) return DrawPrecheckOutcome::Nothing;
         }
     }
     if (drawParameters.indexed) {
@@ -80,22 +54,82 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             const auto type = primitive == queue.userConfig.end() ? 0u : primitive->second & 0x3fu;
             const bool strip = type == 3 || type == 5 || type == 6 || type == 21;
             const bool list = type == 1 || type == 2 || type == 4;
-            const auto restartDevice = device.Load();
-            if (!strip && !(list && restartDevice != nullptr && restartDevice->PrimitiveListRestart())) {
+            if (!strip && !(list && primitiveListRestart())) {
                 rejected = "AGC graphics: primitive restart is only supported for strips, and for lists with VK_EXT_primitive_topology_list_restart";
-                return DrawVerdict::Rejected;
+                return DrawPrecheckOutcome::Rejected;
             }
             if (resetIndex == queue.context.end() || (resetIndex->second & allOnes) != allOnes) {
                 rejected = "AGC graphics: primitive restart index other than all ones is unsupported";
-                return DrawVerdict::Rejected;
+                return DrawPrecheckOutcome::Rejected;
             }
         }
     }
-    if (drawPrecheck()) {
+    if (precheckRejections()) {
         rejected = Graphics::DrawRejection(queue, drawParameters.indexed);
-        if (!rejected.empty()) return DrawVerdict::Rejected;
+        if (!rejected.empty()) return DrawPrecheckOutcome::Rejected;
     }
-    return std::nullopt;
+    return DrawPrecheckOutcome::Proceed;
+}
+
+}
+
+bool TraceIndirectDraws() {
+    static const bool trace = std::getenv("APS5_TRACE_INDIRECT_DRAWS") != nullptr;
+    return trace;
+}
+
+DrawPrecheckOutcome PrecheckDrawState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, bool primitiveListRestart, std::string& rejected) {
+    std::optional<Graphics::ColorMetadataPass> metadata;
+    std::optional<Graphics::DepthCopyPass> depthCopy;
+    return precheckState(queue, drawParameters, rejected, metadata, depthCopy, [&] { return primitiveListRestart; }, [] {});
+}
+
+std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
+    std::optional<Graphics::ColorMetadataPass> metadata;
+    std::optional<Graphics::DepthCopyPass> depthCopy;
+    const auto outcome = precheckState(queue, drawParameters, rejected, metadata, depthCopy, [&] {
+        const auto restartDevice = device.Load();
+        return restartDevice != nullptr && restartDevice->PrimitiveListRestart();
+    }, [&] {
+        traceIndirect = TraceIndirectDraws();
+        if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
+    });
+    switch (outcome) {
+        case DrawPrecheckOutcome::MetadataPass: {
+            if (metadata && DrawPipeline::Active() && DrawPipeline::MetadataPassesPipelined() && deferredLabels().labels.empty()) {
+                auto writes = Graphics::PipelinedColorMetadataPassWrites(*metadata);
+                const auto localDevice = device.Load();
+                if (!writes.empty() && localDevice != nullptr) {
+                    const auto queueId = submission.queue;
+                    const auto opcode = (packet[0] >> 8u) & 0xffu;
+                    DrawPipeline::Queue0().Enqueue([this, localDevice, queueId, opcode, pass = *metadata] {
+                        GuestMemory::SetCurrentPacket(opcode, queueId);
+                        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                        auto current = device.Load();
+                        const auto& target = current != nullptr ? current : localDevice;
+                        recordLabelsForPacket(target.get(), queueId);
+                        target->ColorMetadataPass(pass);
+                    }, std::move(writes));
+                    DrawPipeline::CountPipelinedMetadataPass();
+                    return DrawVerdict::Drawn;
+                }
+            }
+            if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (device == nullptr) device = std::make_shared<VulkanDevice>();
+            const std::shared_ptr<VulkanDevice> localDevice = device;
+            recordLabelsForPacket(localDevice.get(), submission.queue);
+            if (depthCopy) localDevice->DepthCopyPass(*depthCopy);
+            else localDevice->ColorMetadataPass(*metadata);
+            return DrawVerdict::Drawn;
+        }
+        case DrawPrecheckOutcome::Nothing: return DrawVerdict::Nothing;
+        case DrawPrecheckOutcome::Rejected: return DrawVerdict::Rejected;
+        case DrawPrecheckOutcome::Proceed: return std::nullopt;
+    }
+    throw std::runtime_error("unknown draw precheck outcome");
 }
 
 }

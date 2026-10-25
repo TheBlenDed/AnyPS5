@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -6,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <optional>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -189,6 +191,7 @@ void changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t l
 }
 
 std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t firstUnit, std::uint32_t units) {
+    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::UnitShadow);
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = static_cast<VkDeviceSize>(units) * UnitBytes;
     info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -228,6 +231,9 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
     auto* recorder = Recorder::Active();
+    // Shared driver state (the shadows serve every queue): recorded into the main lane (see Recorder::LaneSwitch).
+    std::optional<Recorder::LaneSwitch> laneSwitch;
+    if (recorder != nullptr && Recorder::ThreadLane() != 0) laneSwitch.emplace(recorder, 0);
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkAccessFlags covered = 0;

@@ -30,6 +30,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "ImageTableAbi.hpp"
+#include "UnnormalizedWrap.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include <spirv/unified1/spirv.hpp>
 #ifdef _WIN32
@@ -1956,7 +1957,7 @@ void TuningFieldTests() {
 }
 
 void ShadersWriteMemoryTests() {
-    const auto binding = [](ShaderRecompiler::DescriptorKind kind, ShaderRecompiler::DescriptorRole role, std::vector<bool> written) {
+    const auto binding = [](ShaderRecompiler::DescriptorKind kind, ShaderRecompiler::DescriptorRole role, ShaderRecompiler::ElementFlags written) {
         ShaderRecompiler::DescriptorBinding result{};
         result.kind = kind;
         result.role = role;
@@ -2661,6 +2662,51 @@ void OneDimensionalColorTests() {
     queue.context[0x3b0] = 63u << 14u;
     const auto line = AgcDriver::Graphics::DecodeState(queue);
     Require(line.color.extent.width == 64u && line.color.extent.height == 1u && line.color.address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && line.color.depth == 1u, "a 1D color target did not decode as one row");
+}
+
+// S1: the buffer variant of the HTILE mask kernel (Yotei's 0x141d4c500, words and user data as dumped by
+// [htile-writer] in long31): recognized with its range, mask and value; refused with other code, descriptor,
+// group size, mixed masks or an indirect dispatch.
+void htileBufferMaskClearTests() {
+    static constexpr std::array<std::uint32_t, 16> kernel{0xd7460004u, 0x04010c0cu, 0xe00c2000u, 0x80000004u, 0xbf8c3f70u, 0xd7710000u, 0x00120008u, 0xd7710001u, 0x00160209u, 0xd7710002u, 0x001a040au, 0xd7710003u, 0x001e060bu, 0xe01c2000u, 0x80000004u, 0xbf810000u};
+    ShaderRecompiler::ShaderComputeStageInfo compute{};
+    compute.numThreads = {64u, 1u, 1u};
+    compute.groupIdEnable = {true, false, false};
+    compute.threadIdComponentCount = 1u;
+    const std::array<std::uint32_t, 12> userData{0x8e350000u, 0x00100050u, 0x00004000u, 0x0004bfacu, 0u, 0u, 0u, 0u, 0x3f0u, 0x3f0u, 0x3f0u, 0x3f0u};
+    const std::array<std::uint32_t, 5> packet{0u, 0x4000u, 1u, 1u, 0x61u};
+    const auto match = [&](std::span<const std::uint32_t> code, std::span<const std::uint32_t> words, const ShaderRecompiler::ShaderComputeStageInfo& info, std::span<const std::uint32_t> dispatch, std::uint64_t indirect) {
+        return AgcDriver::Graphics::MatchHtileBufferMaskClear(code, words, info, dispatch, indirect);
+    };
+    const auto found = match(kernel, userData, compute, packet, 0);
+    Require(found.has_value() && found->address == 0x508e350000ull && found->bytes == 0x40000u && found->mask == 0x3f0u && found->value == 0u, "the buffer variant of the HTILE mask kernel was not recognized with its range, mask and value");
+    auto groups = packet;
+    groups[4] = 0x41u;
+    groups[1] = 0x100u;
+    const auto byGroups = match(kernel, userData, compute, groups, 0);
+    Require(byGroups.has_value() && byGroups->bytes == 0x40000u, "a group-count dispatch of the buffer HTILE kernel did not cover 0x100 groups of 64 records");
+    groups[1] = 0x80u;
+    Require(match(kernel, userData, compute, groups, 0)->bytes == 0x20000u, "fewer threads than records did not limit the buffer HTILE kernel's range");
+    auto other = kernel;
+    other[6] ^= 1u;
+    Require(!match(other, userData, compute, packet, 0).has_value(), "another kernel was taken for the buffer HTILE mask kernel");
+    Require(!match(std::span(kernel).first(15), userData, compute, packet, 0).has_value(), "a truncated kernel was taken for the buffer HTILE mask kernel");
+    auto mixed = userData;
+    mixed[10] = 0x3ffu;
+    Require(!match(kernel, mixed, compute, packet, 0).has_value(), "a buffer HTILE kernel with per-word masks was recognized");
+    auto format = userData;
+    format[3] = 0x0004dfacu;
+    Require(!match(kernel, format, compute, packet, 0).has_value(), "a buffer HTILE kernel through a float descriptor was recognized");
+    auto stride = userData;
+    stride[1] = 0x00080050u;
+    Require(!match(kernel, stride, compute, packet, 0).has_value(), "a buffer HTILE kernel with an 8-byte stride was recognized");
+    auto wave32 = compute;
+    wave32.numThreads = {32u, 1u, 1u};
+    Require(!match(kernel, userData, wave32, packet, 0).has_value(), "the buffer HTILE kernel matched with another group size");
+    Require(!match(kernel, userData, compute, packet, 0x1000u).has_value(), "an indirect buffer HTILE kernel dispatch was recognized");
+    auto partial = packet;
+    partial[4] = 0x63u;
+    Require(!match(kernel, userData, compute, partial, 0).has_value(), "a partial-group buffer HTILE kernel dispatch was recognized");
 }
 
 void multisampledSingleClearTests() {
@@ -4928,6 +4974,7 @@ struct MockVulkan {
     std::map<VkDescriptorPool, DescriptorPool> descriptorPools;
     std::uint32_t descriptorPoolLimit = 1000000;
     VkResult descriptorResetResult = VK_SUCCESS;
+    VkResult submitResult = VK_SUCCESS;
     std::optional<std::uint32_t> variableDescriptorCount;
     std::vector<MockDescriptorWrite> writes;
     std::map<VkSampler, VkSamplerCreateFlags> samplerFlags;
@@ -5257,7 +5304,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockResetFences(VkDevice, std::uint32_t count, co
 VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t count, const VkFence* fences, VkBool32, std::uint64_t) { for (std::uint32_t index = 0; index < count; ++index) mock.signaled.at(fences[index]) = true; ++mock.fenceWaits; return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
-VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return mock.submitResult; }
 VKAPI_ATTR void VKAPI_CALL mockCmdCopyBuffer(VkCommandBuffer, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
     for (std::uint32_t index = 0; index < count; ++index) mock.bufferCopies.push_back({source, destination, regions[index]});
 }
@@ -6545,6 +6592,7 @@ void imageTableAllocationTests() {
                 images.imageShapes.resize(count);
                 images.imageDepthCompare.resize(count);
                 images.imageSamplers.resize(count);
+                for (std::uint32_t element = 0; element < count; ++element) images.guestDescriptor[element * 8u] = 1u;
                 program.bindings.push_back(std::move(images));
                 const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
                 {
@@ -6563,6 +6611,177 @@ void imageTableAllocationTests() {
                 }
             }
             Require(mock.live == 0, "the bounded image table leaked Vulkan objects");
+        }
+    }
+}
+
+void storageImageTableSizeClassTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    namespace Runtime = ShaderRecompiler::RuntimeAbi;
+    constexpr auto sampledReserve = (Runtime::FirstStorageImageBinding - Runtime::FirstImageBinding) * Runtime::SampledHeapCapacity;
+    constexpr auto storageReserve = (static_cast<std::uint32_t>(Runtime::Binding::Samplers) - Runtime::FirstStorageImageBinding) * Runtime::StorageHeapCapacity;
+    constexpr auto fixedResources = sampledReserve + storageReserve + Runtime::BufferCapacity + 8u;
+    auto context = mockContext();
+    context.runtimeDescriptorArray = context.partiallyBound = context.variableDescriptorCount = context.descriptorIndexing = true;
+    context.limits.maxPerStageDescriptorSampledImages = sampledReserve + 1024u;
+    context.limits.maxDescriptorSetSampledImages = sampledReserve * Runtime::StageCount + 1024u;
+    context.limits.maxPerStageDescriptorStorageImages = storageReserve + 2048u;
+    context.limits.maxDescriptorSetStorageImages = storageReserve * Runtime::StageCount + 2048u;
+    context.limits.maxPerStageResources = fixedResources + 4096u;
+    context.imageTableCapacity = AgcDriver::Graphics::ImageTableCapacity(context);
+    for (const auto [elements, expected] : {std::pair{0u, 1u}, {1u, 512u}, {200u, 512u}, {270u, 512u}, {511u, 512u}, {512u, 512u}, {513u, 1024u}, {UINT32_MAX, 2048u}}) {
+        for (const bool mixed : {false, true}) Require(AgcDriver::Graphics::StorageImageTableDescriptorCount(context, elements, mixed) == expected, "storage layout size class or overflow bound is incorrect");
+    }
+    for (const std::uint32_t capacity : {0u, 1u, 200u, 700u}) {
+        auto limited = context;
+        limited.limits.maxPerStageDescriptorStorageImages = storageReserve + capacity;
+        Require(AgcDriver::Graphics::StorageImageTableDescriptorCount(limited, 0u, false) == std::min(1u, capacity), "empty storage layout changed its capacity rule");
+        Require(AgcDriver::Graphics::StorageImageTableDescriptorCount(limited, 513u, false) == capacity, "storage layout exceeded a partial size class");
+        Require(AgcDriver::Graphics::StorageImageTableDescriptorCount(limited, UINT32_MAX, true) == capacity, "storage layout overflow bypassed the device capacity");
+    }
+    auto unavailable = context;
+    unavailable.partiallyBound = false;
+    Require(AgcDriver::Graphics::StorageImageTableDescriptorCount(unavailable, 200u, true) == 0u, "storage layout ignored missing descriptor features");
+    const auto programFor = [&](std::uint32_t count) {
+        ShaderRecompiler::RecompileResult program;
+        auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(Runtime::Binding::ImageTableMap), 1u, std::vector<std::uint32_t>(Abi::HeaderWords + count));
+        map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+        map.guestDescriptor[Abi::HeaderElementCount] = count;
+        map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+        map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+        program.bindings.push_back(std::move(map));
+        for (const bool storage : {false, true}) {
+            auto images = makeBinding(Role::ImageTable, storage ? Runtime::StorageImageTableBinding : Runtime::ImageTableBinding, count, std::vector<std::uint32_t>(count * 8u));
+            images.kind = storage ? Kind::StorageImage : Kind::SampledImage;
+            images.imageShapes.resize(count, ShaderRecompiler::DescriptorImageShape::Image2D);
+            images.imageDepthCompare.resize(count);
+            images.imageSamplers.resize(count);
+            images.imageWritten.resize(count);
+            program.bindings.push_back(std::move(images));
+        }
+        return program;
+    };
+    for (const bool cached : {false, true}) {
+        mock = MockVulkan{};
+        {
+            auto allocationContext = context;
+            AgcDriver::Graphics::DescriptorCache cache(allocationContext);
+            if (cached) allocationContext.descriptorCache = &cache;
+            std::vector<std::uint32_t> firstKey;
+            VkDescriptorSetLayout firstLayout = VK_NULL_HANDLE;
+            for (const std::uint32_t count : {200u, 270u, 512u, 513u}) {
+                mock.writes.clear();
+                const auto program = programFor(count);
+                const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+                AgcDriver::Graphics::ShaderResources resources(allocationContext, shader, {}, true);
+                const auto expected = count <= 512u ? 512u : 1024u;
+                Require(findLayoutBinding(Runtime::StorageImageTableBinding).descriptorCount == expected, "storage allocation did not use the bounded size class");
+                Require(findLayoutBinding(Runtime::ImageTableBinding).descriptorCount == 1024u && mock.variableDescriptorCount == count, "storage padding changed sampled capacity or the actual variable allocation");
+                if (count == 200u) { firstKey = resources.LayoutKey(); firstLayout = resources.Layout(); }
+                Require((resources.LayoutKey() == firstKey) == (count <= 512u), "different storage counts did not share exactly their layout class");
+                if (cached) Require((resources.Layout() == firstLayout) == (count <= 512u), "storage size classes did not reuse the actual descriptor layout");
+                else {
+                    const auto pool = std::find_if(mock.poolSizes.begin(), mock.poolSizes.end(), [](const auto& size) { return size.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; });
+                    Require(pool != mock.poolSizes.end() && pool->descriptorCount == expected, "storage pool did not reserve the padded fixed binding");
+                }
+                resources.Complete();
+                const auto& bytes = bufferBytes(findWrite(program.bindings.front().binding).buffers.at(0).buffer);
+                std::vector<std::uint32_t> map(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(map.data(), bytes.data(), bytes.size());
+                Require(map[Abi::HeaderElementCount] == count && map[Abi::HeaderElementBase] == 0u && map[Abi::HeaderPoisonCount] == 0u, "layout padding changed the exact guest map or sparse-hole faults");
+                Require(std::none_of(mock.writes.begin(), mock.writes.end(), [](const auto& write) { return write.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || write.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; }), "layout padding or sparse holes emitted image writes");
+            }
+            if (cached) Require(cache.Counters().layoutHits == 2u && cache.Counters().layoutMisses == 2u, "storage class boundary created the wrong number of layouts");
+        }
+        Require(mock.live == 0, "storage size-class allocations leaked Vulkan objects");
+    }
+    mock = MockVulkan{};
+    {
+        auto limited = context;
+        limited.limits.maxPerStageResources = fixedResources + 400u;
+        limited.imageTableCapacity = 200u;
+        Require(AgcDriver::Graphics::StorageImageTableDescriptorCount(limited, 200u, false) == 400u, "storage-only layout did not use its remaining joint budget");
+        const auto program = programFor(200u);
+        const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        AgcDriver::Graphics::ShaderResources resources(limited, shader, {}, true);
+        Require(findLayoutBinding(Runtime::StorageImageTableBinding).descriptorCount == 200u && findLayoutBinding(Runtime::ImageTableBinding).descriptorCount == 200u, "storage padding stole previously available sampled descriptors");
+        resources.Complete();
+    }
+    Require(mock.live == 0, "joint-budget storage class leaked Vulkan objects");
+    mock = MockVulkan{};
+    {
+        auto vertex = programFor(200u);
+        auto fragment = programFor(270u);
+        vertex.bindings.front().binding = Runtime::BindingNumber(Runtime::Stage::Main, Runtime::Binding::ImageTableMap);
+        fragment.bindings.front().binding = Runtime::BindingNumber(Runtime::Stage::Fragment, Runtime::Binding::ImageTableMap);
+        AgcDriver::Graphics::ShaderResources resources(context, vertex, fragment, {}, 0, 0);
+        Require(findLayoutBinding(Runtime::StorageImageTableBinding).descriptorCount == 512u && mock.variableDescriptorCount == 470u, "graphics stages were padded separately instead of sharing their exact aggregate domain");
+        for (const auto& [program, count, base] : {std::tuple{&vertex, 200u, 0u}, {&fragment, 270u, 200u}}) {
+            const auto& bytes = bufferBytes(findWrite(program->bindings.front().binding).buffers.at(0).buffer);
+            std::vector<std::uint32_t> map(bytes.size() / sizeof(std::uint32_t));
+            std::memcpy(map.data(), bytes.data(), bytes.size());
+            Require(map[Abi::HeaderElementCount] == count && map[Abi::HeaderElementBase] == base, "graphics stage map included descriptor padding");
+        }
+    }
+    Require(mock.live == 0, "aggregate storage layout leaked Vulkan objects");
+}
+
+void storageImageTableAllocationTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    namespace Runtime = ShaderRecompiler::RuntimeAbi;
+    constexpr auto sampledReserve = (Runtime::FirstStorageImageBinding - Runtime::FirstImageBinding) * Runtime::SampledHeapCapacity;
+    constexpr auto storageReserve = (static_cast<std::uint32_t>(Runtime::Binding::Samplers) - Runtime::FirstStorageImageBinding) * Runtime::StorageHeapCapacity;
+    for (const bool storageFirst : {false, true}) {
+        for (const std::uint32_t count : {0u, 2u, 3u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.runtimeDescriptorArray = context.partiallyBound = context.variableDescriptorCount = context.descriptorIndexing = true;
+            context.limits.maxPerStageDescriptorSampledImages = sampledReserve + 2u;
+            context.limits.maxDescriptorSetSampledImages = sampledReserve * Runtime::StageCount + 2u;
+            context.limits.maxPerStageDescriptorStorageImages = storageReserve + 2u;
+            context.limits.maxDescriptorSetStorageImages = storageReserve * Runtime::StageCount + 2u;
+            context.limits.maxPerStageResources = sampledReserve + storageReserve + Runtime::BufferCapacity + 8u + 3u;
+            context.imageTableCapacity = AgcDriver::Graphics::ImageTableCapacity(context);
+            Require(context.imageTableCapacity == 2u && AgcDriver::Graphics::StorageImageTableCapacity(context) == 2u, "mixed image tables did not honor the image descriptor limits");
+            ShaderRecompiler::RecompileResult program;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(Runtime::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + count));
+            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+            map.guestDescriptor[Abi::HeaderElementCount] = count;
+            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+            program.bindings.push_back(map);
+            for (const bool storage : {storageFirst, !storageFirst}) {
+                auto images = makeBinding(Role::ImageTable, storage ? Runtime::StorageImageTableBinding : Runtime::ImageTableBinding, count, std::vector<std::uint32_t>(count * 8u));
+                images.kind = storage ? Kind::StorageImage : Kind::SampledImage;
+                images.imageShapes.resize(count, ShaderRecompiler::DescriptorImageShape::Image2D);
+                images.imageDepthCompare.resize(count);
+                images.imageSamplers.resize(count);
+                images.imageWritten.resize(count);
+                for (std::uint32_t element = 0; element < count; ++element) {
+                    if (((element % 2u == 0u) == storageFirst) != storage) continue;
+                    images.guestDescriptor[element * 8u] = 1u;
+                    images.imageWritten[element] = storage;
+                }
+                program.bindings.push_back(std::move(images));
+            }
+            {
+                const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+                AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                const auto storageCount = std::max(1u, std::min(count, 2u));
+                const auto& storage = findLayoutBinding(Runtime::StorageImageTableBinding);
+                const auto& sampled = findLayoutBinding(Runtime::ImageTableBinding);
+                Require(storage.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && storage.descriptorCount == storageCount && sampled.descriptorCount == std::min(2u, 3u - storageCount), "mixed image tables exceeded their combined resource budget");
+                const auto pool = std::find_if(mock.poolSizes.begin(), mock.poolSizes.end(), [](const auto& size) { return size.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; });
+                Require(pool != mock.poolSizes.end() && pool->descriptorCount == storageCount, "fixed storage table pool size disagrees with its declared layout");
+                Require(mock.variableDescriptorCount == std::max(1u, std::min(count, sampled.descriptorCount)), "sampled table lost its bounded variable allocation");
+                resources.Complete();
+                const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(actual.data(), bytes.data(), bytes.size());
+                Require(actual[Abi::HeaderElementCount] == count && actual[Abi::HeaderPoisonCount] == count, "mixed table holes created or overwrote faults in the other class");
+                for (std::uint32_t element = 0; element < count; ++element) Require((actual[Abi::HeaderWords + element] & Abi::PoisonFlag) != 0u, "a live invalid or over-capacity table element lost its fault");
+            }
+            Require(mock.live == 0, "mixed image tables leaked Vulkan objects");
         }
     }
 }
@@ -6746,6 +6965,7 @@ void hostImportBudgetTests() {
     Require(HostImportBudget(memory, 16 * GiB) == 4064 * MiB, "imports on a 16 GiB machine take more than half its 8128 MiB host heap");
     memory.memoryHeaps[1].size = 16 * GiB;
     Require(HostImportBudget(memory, 32 * GiB) == 8 * GiB, "imports on a 32 GiB machine take more than half its 16 GiB host heap");
+    Require(HostImportBudget(memory, 32 * GiB, false) == 14 * GiB, "without the half-heap reserve, imports on a 32 GiB machine do not keep the 2 GiB reserve budget");
     memory.memoryHeaps[1].size = 32 * GiB;
     Require(HostImportBudget(memory, 64 * GiB) == 16 * GiB, "imports on a 64 GiB machine take more than half its 32 GiB host heap");
     memory.memoryHeaps[1].size = 3 * GiB;
@@ -7094,58 +7314,67 @@ void textureCacheBudgetTests() {
 }
 
 void sampledTextureBudgetTests() {
-    using AgcDriver::Graphics::SampledTextureBudget;
+    using AgcDriver::Graphics::TextureCacheBudgetsFor;
+    using AgcDriver::Graphics::TextureCacheBudgets;
+    using AgcDriver::Graphics::TextureMemoryUse;
     constexpr std::uint64_t GiB = 1ull << 30u;
     constexpr std::uint64_t MiB = 1ull << 20u;
+    const auto expect = [](const TextureCacheBudgets& budgets, std::uint64_t ceiling, std::uint64_t storage, std::uint64_t target, const std::string& what) {
+        Require(budgets.ceiling == ceiling && budgets.sampled == ceiling - ceiling / 5u && budgets.storage == storage && budgets.target == target, what + ": ceiling " + std::to_string(budgets.ceiling >> 20u) + " MiB, sampled " + std::to_string(budgets.sampled >> 20u) + " MiB, storage " + std::to_string(budgets.storage >> 20u) + " MiB, share " + std::to_string(budgets.target >> 20u) + " MiB");
+    };
     VkPhysicalDeviceMemoryProperties memory{};
     memory.memoryHeapCount = 3;
     memory.memoryHeaps[0] = {256 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
     memory.memoryHeaps[1] = {32 * GiB, 0};
     memory.memoryHeaps[2] = {16 * GiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-    Require(SampledTextureBudget(memory, nullptr, 0) == 4 * GiB, "without VK_EXT_memory_budget the sampled texture cache does not keep a quarter of the 16 GiB heap");
+    expect(TextureCacheBudgetsFor(memory, nullptr, {}), 5 * GiB, 4 * GiB, 0, "without VK_EXT_memory_budget the caches do not keep a quarter of the 16 GiB heap each, the sampled ceiling a quarter over");
     reported.heapBudget[0] = 100 * GiB;
     reported.heapBudget[1] = 100 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 0) == 4 * GiB, "a zero budget for the largest device-local heap did not fall back to a quarter of the heap");
+    expect(TextureCacheBudgetsFor(memory, &reported, {}), 5 * GiB, 4 * GiB, 0, "a zero budget for the largest device-local heap did not fall back to the static budgets");
+    // 15 GiB budget, 960 MiB headroom, 9 GiB in use of which 5 GiB are textures: the caches share
+    // 10 GiB 64 MiB; the storage cache keeps its 4 GiB, the sampled images outside the cache take
+    // 1 GiB, the sampled cache the 5 GiB 64 MiB left.
     reported.heapBudget[2] = 15 * GiB;
     reported.heapUsage[2] = 9 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 5 * GiB + 128 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches does not leave 5 GiB 128 MiB after the 4 GiB storage cache and 1 GiB 896 MiB of headroom");
-    reported.heapUsage[2] = 3 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 9 * GiB + 128 * MiB, "usage below the cached bytes is not read as no other device memory in use");
+    const TextureMemoryUse use{3 * GiB, 2 * GiB, 2 * GiB};
+    const auto shared = TextureCacheBudgetsFor(memory, &reported, use);
+    expect(shared, 5184 * MiB, 4 * GiB, 10304 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches");
+    Require(shared.ceiling + shared.storage + (use.sampled - use.sampledCached) + 4 * GiB + 960 * MiB == 15 * GiB, "the texture caches, the sampled images outside them, the other users and the headroom do not add up to the device's budget");
+    // The reported usage moving by less than a sixty-fourth of the share (161 MiB here) keeps the
+    // share of the last read; the caches' own bytes still move the ceiling at once.
+    reported.heapUsage[2] = 9 * GiB + 150 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, shared.target), 5184 * MiB, 4 * GiB, 10304 * MiB, "150 MiB more reported usage moved a 10304 MiB share");
+    reported.heapUsage[2] = 9 * GiB - 150 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, shared.target), 5184 * MiB, 4 * GiB, 10304 * MiB, "150 MiB less reported usage moved a 10304 MiB share");
+    expect(TextureCacheBudgetsFor(memory, &reported, {3 * GiB, 1 * GiB, 2 * GiB}, shared.target), 4160 * MiB, 4 * GiB, 10304 * MiB, "a GiB more of sampled images outside the cache did not take the ceiling down under a kept share");
+    reported.heapUsage[2] = 9 * GiB + 200 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, shared.target), 4984 * MiB, 4 * GiB, 10104 * MiB, "200 MiB more reported usage did not take the share down");
+    reported.heapUsage[2] = 9 * GiB - 64 * MiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use, 1024 * MiB), 5248 * MiB, 4 * GiB, 10368 * MiB, "a share 9 GiB above the last one was held at the last one");
+    // Sampled images in the overflow type are the caches' own (not other usage) and are not taken
+    // from the sampled ceiling: 1 GiB of the 3 GiB outside the cache in it leaves the ceiling 1 GiB
+    // higher. Their budget is the system heap's headroom less a sixteenth of its budget.
     reported.heapUsage[2] = 9 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 4 * GiB + 512 * MiB) == 4 * GiB + 640 * MiB, "a storage image cache larger than TextureCacheBudget was not reserved in full");
-    Require(SampledTextureBudget(memory, &reported, 5 * GiB, 1 * GiB) == 5 * GiB + 128 * MiB, "a storage image cache smaller than TextureCacheBudget did not keep the TextureCacheBudget reservation");
-    reported.heapUsage[2] = 12 * GiB;
-    Require(SampledTextureBudget(memory, &reported, 1 * GiB) == 2 * GiB, "a heap whose other users leave no room does not keep the 2 GiB floor");
-    {
-        using AgcDriver::Graphics::StorageTextureBudget;
-        auto small = memory;
-        small.memoryHeaps[2].size = 8 * GiB;
-        VkPhysicalDeviceMemoryBudgetPropertiesEXT example{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-        example.heapBudget[2] = 7373 * MiB;
-        example.heapUsage[2] = 2 * GiB + 3686 * MiB;
-        Require(SampledTextureBudget(small, &example, 3686 * MiB, 3686 * MiB) == 2 * GiB, "3686 MiB of storage images on an 8 GiB heap with a 7373 MiB budget and 2 GiB of other use left the sampled cache above its floor");
-        for (const auto heapGiB : {8u, 16u}) {
-            small.memoryHeaps[2].size = heapGiB * GiB;
-            for (std::uint64_t budget = 4 * GiB; budget <= heapGiB * GiB; budget += GiB) {
-                example.heapBudget[2] = budget;
-                for (std::uint64_t other = 0; other <= budget; other += GiB) {
-                    for (std::uint64_t sampled = 0; sampled <= 4 * GiB; sampled += 512 * MiB) {
-                        for (std::uint64_t storage = 0; storage <= heapGiB * GiB / 2u; storage += 512 * MiB) {
-                            example.heapUsage[2] = other + sampled + storage;
-                            const auto sampledLimit = SampledTextureBudget(small, &example, sampled + storage, storage);
-                            const auto storageLimit = StorageTextureBudget(small, &example, sampled, storage);
-                            if (sampledLimit > 2 * GiB) Require(other + storage + sampledLimit + budget / 8u <= budget, "the sampled cache budget and the storage images held exceed the reported budget less its eighth");
-                            if (storageLimit > 512 * MiB) Require(other + sampled + storageLimit + budget / 8u <= budget, "the storage cache budget and the sampled textures held exceed the reported budget less its eighth");
-                        }
-                    }
-                }
-            }
-        }
-    }
+    const auto withOverflow = TextureCacheBudgetsFor(memory, &reported, {3 * GiB, 1 * GiB, 2 * GiB, 1 * GiB});
+    expect(withOverflow, 5184 * MiB, 4 * GiB, 10304 * MiB, "a GiB of sampled images in the overflow type was taken from the sampled ceiling or read as other usage");
+    Require(withOverflow.overflow == 100 * GiB - 100 * GiB / 16u, "the overflow budget is not the system heap's budget less its usage and a sixteenth");
+    reported.heapBudget[1] = 16 * GiB;
+    reported.heapUsage[1] = 11 * GiB;
+    Require(TextureCacheBudgetsFor(memory, &reported, use).overflow == 4 * GiB, "16 GiB of system heap budget with 11 GiB used does not leave 4 GiB of overflow budget");
+    reported.heapUsage[1] = 16 * GiB;
+    Require(TextureCacheBudgetsFor(memory, &reported, use).overflow == 1, "a full system heap does not leave the overflow type the least budget");
+    reported.heapBudget[1] = 100 * GiB;
+    reported.heapUsage[1] = 0;
+    reported.heapUsage[2] = 3 * GiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, use), 9280 * MiB, 4 * GiB, 14400 * MiB, "usage below the texture bytes is not read as no other device memory in use");
+    reported.heapUsage[2] = 9 * GiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, {1 * GiB, 1 * GiB, 6 * GiB}), 6208 * MiB, 4 * GiB, 12352 * MiB, "a storage cache above its budget is not counted at its size against the sampled cache");
+    reported.heapUsage[2] = 15 * GiB;
+    expect(TextureCacheBudgetsFor(memory, &reported, {1 * GiB, 1 * GiB, 0}), 256 * MiB, 256 * MiB, 512 * MiB, "a heap whose other users leave no room does not keep the 512 MiB floor, half of it for each cache");
     memory.memoryHeaps[0].flags = 0;
     memory.memoryHeaps[2].flags = 0;
-    Require(SampledTextureBudget(memory, &reported, 0) == 2 * GiB, "a device without a device-local heap does not keep 2 GiB of sampled textures");
+    expect(TextureCacheBudgetsFor(memory, &reported, {}), 2 * GiB + 512 * MiB, 2 * GiB, 0, "a device without a device-local heap does not keep 2 GiB for each texture cache");
 }
 
 void storageTextureBudgetTests() {
@@ -10038,12 +10267,6 @@ void unorm10_11_11TargetTests() {
     changed.context[0x31c] |= 1u << 8u;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "unsupported color format 6 number type 1");
     changed = queue;
-    changed.context[0x1e0] = 0x40010001u;
-    for (std::uint32_t i = 0; i < 4; ++i) changed.context[0x105 + i] = 0;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "blending into a 10_11_11 unorm color target");
-    changed = queue;
-    changed.context[0x8e] = 3;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "partial writes of a 10_11_11 unorm color target");
     changed.context[0x8e] = 7;
     Require(AgcDriver::Graphics::DecodeState(changed).color.packing == ColorExportPacking::Unorm10_11_11, "an RGB write of a 10_11_11 unorm target was refused");
     for (const auto format : {5u, 6u}) {
@@ -10634,6 +10857,161 @@ void DualSourceBlendTests() {
     auto singleState = state;
     singleState.dualSourceBlend = false;
     expectFailure([&] { validate(dual, singleState); }, "Index decoration");
+}
+
+void unorm10_11_11BlendTests() {
+    using ShaderRecompiler::ColorExportPacking;
+    using ShaderRecompiler::ColorTargetBlend;
+    auto queue = makeState();
+    queue.context[0x31c] = (queue.context.at(0x31c) & ~0x7cu) | (6u << 2u);
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    queue.context[0x1e0] = 0x40010504u;
+    for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = 0;
+    std::vector<AgcDriver::Graphics::RegisterRead> log;
+    const auto state = [&] {
+        const AgcDriver::Graphics::RegisterReadLogScope logScope(&log);
+        return AgcDriver::Graphics::DecodeState(queue);
+    }();
+    for (const auto read : log) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register the blend decode reads: " + std::to_string(read.offset));
+    Require(std::any_of(log.begin(), log.end(), [](const AgcDriver::Graphics::RegisterRead& read) { return read.offset == 0x1d6u; }), "the blend decode did not read SX_BLEND_OPT_EPSILON");
+    Require(std::any_of(log.begin(), log.end(), [](const AgcDriver::Graphics::RegisterRead& read) { return read.offset == 0x001u; }), "the blend decode did not read DB_COUNT_CONTROL");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "the precheck rejected a blend into a 10_11_11 unorm target");
+    Require(state.colors.empty() && state.blends.empty() && state.blendedColors.size() == 1u && state.blendedColors[0].packing == ColorExportPacking::Unorm10_11_11 && state.blendedColors[0].format == VK_FORMAT_R32_UINT && state.hasColorTarget && state.color.address == state.blendedColors[0].address, "a blended 10_11_11 unorm target was decoded as an attachment");
+    Require(state.targetBlends[0] == ColorTargetBlend{true, 4u, 5u, 0u, 7u} && std::none_of(state.targetBlends.begin() + 1, state.targetBlends.end(), [](const ColorTargetBlend& blend) { return blend.enable; }), "the SRC_ALPHA / ONE_MINUS_SRC_ALPHA blend was not decoded");
+    Require(AgcDriver::Graphics::ExportPackings(state)[0] == ColorExportPacking::Unorm10_11_11, "the blended target lost its export packing");
+    const auto decoded = [&](std::uint32_t control, std::uint32_t mask) {
+        auto changed = queue;
+        changed.context[0x1e0] = control;
+        changed.context[0x8e] = mask;
+        return AgcDriver::Graphics::DecodeState(changed).targetBlends[0];
+    };
+    Require(decoded(0, 3) == ColorTargetBlend{true, 1u, 0u, 0u, 3u}, "a partial write of a 10_11_11 unorm target did not become a masked read-modify-write");
+    Require(decoded(0x40010524u, 0xf) == ColorTargetBlend{true, 4u, 5u, 1u, 7u} && decoded(0x40010988u, 5) == ColorTargetBlend{true, 8u, 9u, 4u, 5u} && decoded(0x40010302u, 0xf) == ColorTargetBlend{true, 2u, 3u, 0u, 7u}, "a subtracting or color-factor blend was not decoded");
+    for (const auto factor : {6u, 7u, 10u, 13u, 14u, 19u, 20u}) {
+        expectFailure([&] { decoded(0x40010500u | factor, 0xf); }, "blend factor " + std::to_string(factor) + " into a 10_11_11 unorm color target");
+        expectFailure([&] { decoded(0x40010004u | (factor << 8u), 0xf); }, "blend factor " + std::to_string(factor) + " into a 10_11_11 unorm color target");
+    }
+    for (const auto function : {2u, 3u}) expectFailure([&] { decoded(0x40010504u | (function << 5u), 0xf); }, "blend function " + std::to_string(function) + " into a 10_11_11 unorm color target");
+    const auto rejected = [&](std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> registers, std::string_view reason) {
+        auto changed = queue;
+        for (const auto& [offset, value] : registers) changed.context[offset] = value;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, reason);
+    };
+    rejected({{0x1d5, 3u}}, "SX export conversion");
+    rejected({{0x1e0, 0u}, {0x8e, 3u}, {0x1d5, 3u}}, "SX export conversion");
+    rejected({{0x1d6, 1u}}, "SX blend optimizations with a nonzero epsilon");
+    rejected({{0x2dc, 0xaa01u}}, "alpha-to-coverage beside a blended 10_11_11 unorm color target");
+    rejected({{0x1c4, 1u}, {0x203, 0x801u}}, "exports depth, stencil or a sample mask cannot blend");
+    for (const auto counting : {0x100u, 0x800u}) rejected({{0x203, 0x840u}, {0x001, counting}}, "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while DB_COUNT_CONTROL counts passing samples");
+    for (const auto& [control, counting] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x840u, 0u}, {0x800u, 0x100u}}) {
+        auto changed = queue;
+        changed.context[0x203] = control;
+        changed.context[0x001] = counting;
+        Require(AgcDriver::Graphics::DecodeState(changed).targetBlends[0].enable, "a blend that kills without ZPASS counting, or counts without kills, was refused");
+    }
+    auto accepted = queue;
+    accepted.context[0x1d5] = 0x30u;
+    accepted.context[0x1d6] = 0x5u;
+    accepted.context[0x1d7] = 0x1u;
+    Require(AgcDriver::Graphics::DecodeState(accepted).targetBlends[0] == state.targetBlends[0], "a blend with disabled SX optimizations or another MRT's conversion was refused");
+    auto holed = queue;
+    for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du}) holed.context[offset + 4u * 0xfu] = queue.context.at(offset);
+    for (const auto offset : {0x390u, 0x3b0u, 0x3b8u}) holed.context[offset + 4u] = queue.context.at(offset);
+    holed.context[0x1e4] = queue.context.at(0x1e0);
+    holed.context[0x8e] = 0x70000u;
+    holed.context[0x8f] = 0xf0000u;
+    const auto holedState = AgcDriver::Graphics::DecodeState(holed);
+    Require(holedState.blendedColors.size() == 1u && holedState.blendedColors[0].slot == 4u && holedState.blendedColors[0].exportIndex == 0u && holedState.targetBlends[0] == state.targetBlends[0], "a blend into MRT slot 4 behind a CB_SHADER_MASK hole was not decoded as export 0");
+    for (const auto conversion : {0x3u, 0x30000u}) {
+        auto changed = holed;
+        changed.context[0x1d5] = conversion;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "SX export conversion");
+    }
+    holed.context[0x1d6] = 0x10001u;
+    for (const auto disabled : {0x1u, 0x10000u}) {
+        auto changed = holed;
+        changed.context[0x1d7] = disabled;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "SX blend optimizations with a nonzero epsilon");
+    }
+    holed.context[0x1d7] = 0x10001u;
+    Require(AgcDriver::Graphics::DecodeState(holed).targetBlends[0].enable, "a blend behind a CB_SHADER_MASK hole with the SX optimizations disabled at its export and slot was refused");
+    auto tested = queue;
+    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x000, 0}, {0x002, 0}, {0x007, (1u << 16u) | 3u}, {0x00a, 7}, {0x00b, 0}, {0x010, 0x22900983}, {0x011, 0x20000181}, {0x012, 0x100}, {0x014, 0x100}, {0x013, 0x200}, {0x015, 0x200}, {0x10b, 0}, {0x10c, 0x01ffff02}, {0x10d, 0x01000001}, {0x200, 0x00200211}, {0x203, 0x850}}) tested.context[offset] = value;
+    const auto stencilTested = AgcDriver::Graphics::DecodeState(tested);
+    Require(stencilTested.depth && stencilTested.stencilTest && stencilTested.targetBlends[0].enable, "a stencil-tested blend from a killing early-Z pixel shader was refused");
+    for (const auto control : {0x840u, 0xa50u, 0x870u}) {
+        auto changed = tested;
+        changed.context[0x203] = control;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "needs Z_ORDER EARLY_Z_THEN_LATE_Z without EXEC_ON_HIER_FAIL");
+    }
+    auto writing = tested;
+    writing.context[0x10b] = 0x00050050;
+    writing.context[0x10c] = 0x01ffff01;
+    writing.context[0x200] = 0x00700711;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(writing); }, "a pixel shader that kills cannot blend into a 10_11_11 unorm color target while it writes depth or stencil");
+    writing.context[0x203] = 0x810;
+    Require(AgcDriver::Graphics::DecodeState(writing).targetBlends[0].enable, "a stencil-writing blend from a pixel shader without kills was refused");
+
+    constexpr std::array<std::uint32_t, 3> code{0xf800180fu, 0x07060504u, 0xbf810000u};
+    const std::array<std::uint32_t, 2> interlock{spv::CapabilityShader, spv::CapabilityFragmentShaderPixelInterlockEXT};
+    auto request = packedExportRequest(queue, state, code);
+    request.context.pixel->targetBlend = state.targetBlends;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(request)); }, "blending into a 10_11_11 unorm target needs the fragmentShaderPixelInterlock feature");
+    request.target.supportedCapabilities = interlock;
+    const ShaderRecompiler::RequestSerializer serializer;
+    Require(serializer.Deserialize(serializer.Serialize(request)).request.context.pixel->targetBlend == request.context.pixel->targetBlend, "the blend of a 10_11_11 unorm target was lost in serialization");
+    auto unblended = request;
+    unblended.context.pixel->targetBlend = {};
+    std::vector<std::uint64_t> key;
+    std::vector<std::uint64_t> unblendedKey;
+    ShaderRecompiler::BuildPreparedShaderKey(request, key);
+    ShaderRecompiler::BuildPreparedShaderKey(unblended, unblendedKey);
+    Require(key == unblendedKey, "the blend entered the static shader ABI");
+    const auto prepared = ShaderRecompiler::PrepareShader(unblended);
+    Require(ShaderRecompiler::MatchesPreparedShader(request, *prepared), "a blended draw did not match the registered pixel shader");
+    const auto blended = ShaderRecompiler::Recompile(request);
+    const auto plain = ShaderRecompiler::Recompile(unblended);
+    Require(blended.variantId == plain.variantId && blended.variantId == ShaderRecompiler::GetPreparedArtifact(*prepared).variantId, "the blended draw did not reuse the registered artifact");
+    Require(blended.PipelineVariantId() != plain.PipelineVariantId() && ShaderRecompiler::Recompile(request).PipelineVariantId() == blended.PipelineVariantId(), "the blend did not key its own specialization");
+    Require(interlockShape(plain.spirv.Words()).empty(), "an unblended pixel shader declared a pixel interlock: " + interlockShape(plain.spirv.Words()));
+    const auto words = blended.spirv.Words();
+    Require(interlockShape(words) == "capability extension ordered begin end end ", "a blending pixel shader declared the wrong pixel interlock: " + interlockShape(words));
+    std::size_t kills = 0;
+    std::size_t terminates = 0;
+    const auto exits = interlockExits(words, kills, terminates);
+    Require(exits.empty(), "a blending pixel shader: " + exits);
+    std::size_t reads = 0, writes = 0, early = 0, set1 = 0;
+    for (std::size_t at = 5; at < words.size() && (words[at] >> 16u) != 0; at += words[at] >> 16u) {
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        reads += op == spv::OpImageRead;
+        writes += op == spv::OpImageWrite;
+        early += op == spv::OpExecutionMode && words[at + 2] == spv::ExecutionModeEarlyFragmentTests;
+        set1 += op == spv::OpDecorate && words[at + 2] == spv::DecorationDescriptorSet && words[at + 3] == ShaderRecompiler::RuntimeAbi::BlendedTargetDescriptorSet;
+    }
+    Require(reads == 1u && writes == 1u && early == 1u && set1 == 1u, "a blending pixel shader does not read and write its target once through the blended target set with early fragment tests");
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.spirv = makeModule({});
+    const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    const auto validate = [&](const AgcDriver::Graphics::State& target) {
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &blended, 0}}};
+        return AgcDriver::Graphics::ValidateShaders(shaders, target, subgroup, false);
+    };
+    Require(validate(state).empty(), "a blended 10_11_11 unorm target was validated as an attachment output");
+    auto unblendedState = state;
+    unblendedState.blendedColors.clear();
+    expectFailure([&] { validate(unblendedState); }, "blends into an export that has no blended 10_11_11 unorm target");
+    for (const auto& invalid : {ColorTargetBlend{true, 6u, 5u, 0u, 7u}, ColorTargetBlend{true, 4u, 13u, 0u, 7u}, ColorTargetBlend{true, 4u, 5u, 2u, 7u}, ColorTargetBlend{true, 4u, 5u, 0u, 8u}}) {
+        auto wrong = request;
+        wrong.context.pixel->targetBlend[0] = invalid;
+        expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(wrong)); }, "requests a blend into a non-10_11_11 target or with an unsupported factor, function or mask");
+    }
+    auto unpacked = request;
+    unpacked.context.pixel->targetExportPacking[0] = ColorExportPacking::None;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(unpacked)); }, "requests a blend into a non-10_11_11 target");
+    auto depthExport = request;
+    depthExport.context.pixel->depthExportEnable = true;
+    expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(depthExport)); }, "exports depth or a sample mask cannot blend");
 }
 
 void ReversedBlendShaderTests() {
@@ -11380,7 +11758,7 @@ void ResourceContentKeyTests(bool benchmark) {
     using ShaderRecompiler::DescriptorRole;
     const auto reference = [](const AgcDriver::Graphics::CompiledShader& shader, bool dataWords, bool movable) {
         const auto& program = *shader.program;
-        std::vector<std::uint32_t> words{dataWords ? 1u : 0u, static_cast<std::uint32_t>(shader.stage), static_cast<std::uint32_t>(program.PipelineVariantId()), static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u), static_cast<std::uint32_t>(program.bindings.size())};
+        std::vector<std::uint32_t> words{program.hasGuardedUnnormalizedWrap ? 1u : 0u, ShaderRecompiler::UnnormalizedWrapEnabled() ? 1u : 0u, dataWords ? 1u : 0u, static_cast<std::uint32_t>(shader.stage), static_cast<std::uint32_t>(program.PipelineVariantId()), static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u), static_cast<std::uint32_t>(program.bindings.size())};
         for (const auto& binding : program.bindings) {
             for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) words.push_back(word);
             if (movable && binding.role == DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
@@ -11440,6 +11818,10 @@ void ResourceContentKeyTests(bool benchmark) {
         for (const bool dataWords : {false, true}) for (const bool movable : {false, true}) {
             const auto original = ShaderResources::ContentKey(shader, dataWords, movable);
             Require(original == reference(shader, dataWords, movable), "content key differs from the word-by-word reference");
+            program.hasGuardedUnnormalizedWrap = true;
+            const auto guarded = ShaderResources::ContentKey(shader, dataWords, movable);
+            Require(guarded != original && guarded == reference(shader, dataWords, movable), "content key ignored guarded unnormalized wrapping");
+            program.hasGuardedUnnormalizedWrap = false;
             std::vector<std::uint32_t> appended{0xdeadbeefu, 0xabcdef01u};
             ShaderResources::AppendContentKey(shader, dataWords, movable, appended);
             Require(appended.size() == original.size() + 2 && appended[0] == 0xdeadbeefu && appended[1] == 0xabcdef01u && std::equal(original.begin(), original.end(), appended.begin() + 2), "appending a content key changed its prefix or words");
@@ -11981,7 +12363,7 @@ int main(int argc, char** argv) {
                 auto context = mockContext();
                 context.limits.maxStorageBufferRange = 1u << 27;
                 passed = RunSparseBufferHoleTests(context, {
-                    [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); }, {}, {}, {}, {}
+                    [](VkBuffer buffer) -> std::span<std::byte> { return mockBufferMemory(buffer); }, {}, {}, {}, {}, {}
                 });
             }
             Require(mock.live == 0, "sparse buffer hole tests leaked Vulkan objects");
@@ -12214,10 +12596,12 @@ int main(int argc, char** argv) {
         DepthStencilTests();
         OneDimensionalColorTests();
         htileDepthClearTests();
+        htileBufferMaskClearTests();
         multisampledSingleClearTests();
         memoryValueFillTests();
         ZExportTests();
         unorm10_11_11TargetTests();
+        unorm10_11_11BlendTests();
         float11_11_10TargetTests();
         unorm4_4_4_4TargetTests();
         DepthBoundsBiasTests();
@@ -12291,6 +12675,8 @@ int main(int argc, char** argv) {
         bufferBudgetPlacementTests();
         imageTableAllocationTests();
         imageTableSnapshotAllocationTests();
+        storageImageTableAllocationTests();
+        storageImageTableSizeClassTests();
         samplerTableNonSeamlessCubeTests();
         samplerTableDeviceLimitTests();
         tableUpdateAfterBindTests();
@@ -12342,6 +12728,7 @@ int main(int argc, char** argv) {
                 mock.memoryLimit = headroom.has_value() ? std::optional<VkDeviceSize>(mock.allocatedBytes + *headroom) : std::nullopt;
             },
             [] { return mock.allocationAttempts; },
+            [](VkResult result) { mock.submitResult = result; },
             [](std::optional<VkDeviceSize> limit) { mock.importLimit = limit; }
         });
         Require(mock.live == 0, "BDA resources leaked Vulkan objects");
@@ -12353,6 +12740,7 @@ int main(int argc, char** argv) {
         RunTextureTilingTests();
         RunGuestTextureResourceTests();
         RunDepthSurfaceReuseTests();
+        RunTextureMipChainTests();
         RunGuestSamplerResourceTests();
         RunLastRecordIndicesTests();
         mock = MockVulkan{};

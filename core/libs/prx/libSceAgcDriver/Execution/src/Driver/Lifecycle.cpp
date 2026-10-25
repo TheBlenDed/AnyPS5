@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -136,6 +137,7 @@ Driver& Driver::Get() {
 }
 
 Driver::~Driver() {
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     stop();
 }
@@ -150,6 +152,7 @@ void Driver::stop() {
     require(!onWorkerThread(), "worker cannot stop itself");
     std::lock_guard shutdownLock(shutdownMutex);
     if (stopped) return;
+    MemoryStats::Stop();
     LibcRequestShutdown_nid_postfix();
     {
         std::lock_guard lock(mutex);
@@ -165,6 +168,7 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    drawAhead.reset();
     try {
         DrawFinisher::Get().Drain();
     } catch (...) {
@@ -205,6 +209,7 @@ Driver::Driver() {
         stop();
         throw;
     }
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&GuestMemory::PrepareHostWrite);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
         const auto import = [&] {
             try {

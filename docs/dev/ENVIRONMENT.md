@@ -96,6 +96,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_CAPTURE_INPUTS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | records each draw's inputs in the capture trace (requires APS5_CAPTURE_TRACE) |
 | `APS5_CAPTURE_TRACE` | presence | `core/libs/prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp` |  | writes capture events to capture-trace.log |
 | `APS5_CHECK_INDIRECT_ARGS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | reads GPU-side indirect draw records back on the CPU and prints the first ones |
+| `APS5_CLEAR_HAND_OVER` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | local: hands pending results over to an image refreshed with a clear key (#7427); off by default on this branch |
 | `APS5_COMPLETION_STORE_SYNC` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | makes a store made by a completion action wait for later batches over its range |
 | `APS5_COPY_DESTINATION_STRICT` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | refuses a CPU copy whose destination has any pending writer, not only an unsettled one |
 | `APS5_COPY_HLE_CPU_MAX` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferCopy.cpp` | 262144 | largest copy in bytes the CPU side of the copy HLE handles |
@@ -169,6 +170,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_HOOK_LOCKED_WAIT` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | keeps the flush hook's pending-write wait under the GpuMutex |
 | `APS5_HOST_IMPORT_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 0 | budget in MiB for pinned host imports; `0` selects the larger of 6144 MiB and half the physical memory, at most the largest host heap minus the larger of 2 GiB and half that heap (4055 MiB on a 16 GB Windows PC with an RTX 4060) |
 | `APS5_IGNORE_DEPTH_TEST` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp` |  | renders depth- and stencil-tested draws without a depth target as if the tests always passed |
+| `APS5_IMAGE_POOL` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/BufferPool.cpp` |  | local: keeps released image memory in the buffer pool (#7870); off by default on this branch |
 | `APS5_IMAGE_POOL_MIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/BufferPool.cpp` |  | size in MiB of the released image memory the buffer pool keeps for reuse by memory type and size while the device-local heap is under its reported budget, a quarter of the device tier's budget by default; `0` frees image memory at once |
 | `APS5_INDIRECT_VERTEX_MIB` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/IndirectDraw.cpp` | 64 | cap in MiB on a vertex attribute extent, above which a GPU-side indirect draw resolves on the CPU |
 | `APS5_INSERT_COMPARE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/DispatchCache.cpp` |  | compares a fresh capture's regions against the recorder before inserting it into the cache |
@@ -303,6 +305,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_RECORDER_SYNC_DRAWS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | gives the draws the recorder waits for their own batch instead of recording them with the wait |
 | `APS5_NO_RECORD_COPIED_DRAWS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | waits for copied-write draws at once instead of listing their write-back for later |
 | `APS5_NO_RECT_INDIRECT` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/IndirectDraw.cpp` |  | sends an indirect rectangle-list draw down the CPU path instead of the GPU-side path |
+| `APS5_NO_REFRESH_LOOKUP_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | answers a storage image's overlap and host-import lookups by a scan and a full lookup instead of an index and a cache |
 | `APS5_NO_RESIDENT_LINEAR` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | drops the residency of a linear color target whose address already has a host import, so it is copied in and out again |
 | `APS5_NO_RESIDENT_PRESENT` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | always presents through guest memory instead of the resident image |
 | `APS5_NO_RESIDENT_TARGETS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | copies every render target in and out again instead of keeping it resident |
@@ -357,6 +360,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_PIPELINE_JOURNAL_THREADS` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/PipelineJournal.cpp` |  | threads that replay the journal's pipelines, 0 disables the replay; unset uses half the hardware threads, at least one |
 | `APS5_PIPELINE_STATS` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | captures and prints driver statistics for each new pipeline, requiring `VK_KHR_pipeline_executable_properties`; `1` enables |
 | `APS5_PIPELINE_STORE_ENTRIES` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/Pipeline.cpp` | 1024 | LRU bound on the entries of the pipeline store; an entry is evicted only once no recorded draw holds it |
+| `APS5_PLAYGO_SCENARIO_CHUNKS` | presence | `core/libs/prx/libScePlayGo/Export.cpp` |  | local: lists chunks 1-999 for a package with only playgo-scenario.json (#7726); off by default on this branch |
 | `APS5_PM4_RING` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/SubmissionRing.cpp` | 16 | number of submissions the PM4 ring keeps for dumps, from 0 to 4096; 0 disables the ring |
 | `APS5_POLL_REAP` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | reaps completions on every poll tick |
 | `APS5_POLL_TRY_EACH` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/WaitMemory.cpp` |  | tries the poll service on every tick instead of at the poll interval |
@@ -393,6 +397,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_STORE_AT_LABEL` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | flushes every pending storage-image result when a label is written on the GPU |
 | `APS5_SUBMISSION_EPOCH_EACH` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketExecution.cpp` |  | bumps the guest-memory collect epoch on every submission instead of only when the submission is newer than the last bump |
 | `APS5_SUBMIT_AT_END` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketExecution.cpp` |  | submits recorded work at the end of a submission even when a worker is queued |
+| `APS5_SUBMIT_PROGRESS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp` |  | enables opt-in pacing for eligible queue-zero submission prefixes within a shared nominal two-millisecond acknowledgement/timeline budget; timeout retains asynchronous acceptance |
 | `APS5_SUSPEND_DRAIN` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketExecution.cpp` |  | drains the device at a suspend point |
 | `APS5_SYNC_COMPLETION_DRAWS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | keeps every draw with completion work synchronous |
 | `APS5_SYNC_DISPATCH` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | waits for every dispatch instead of batching it |

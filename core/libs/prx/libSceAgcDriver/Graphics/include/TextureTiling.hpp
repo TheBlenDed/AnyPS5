@@ -40,6 +40,7 @@ std::array<std::uint32_t, 3> ThinBlockLayout(TextureTileMode tileMode, std::uint
 // without the pitch padding when linear. A tail mip has none (its block also holds the other tail
 // levels and their padding). A retile of the mip writes every byte of these and no other.
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CoveredMipBytes(TextureTileMode tileMode, std::uint32_t bytesPerElement, const TileMipLayout& mip);
+std::array<std::uint32_t, 2> SwizzleRemapTile(TextureTileMode stored, TextureTileMode viewed, std::uint32_t bytesPerElement, std::uint32_t viewedPipeBankXor);
 
 // 3D surface. Each slab holds the whole mip chain: the mip tail block, if any, then the other levels from the
 // smallest to level 0. Depth slice z of a level is detiled from slab z / blockDepth (slabBytes apart) with the
@@ -66,6 +67,9 @@ struct SurfaceGeometry {
     bool thick = false;
     std::uint32_t blockDepth = 1;
     std::uint64_t layerBytes = 0;
+    // Technical debt: the descriptor's levels, at most FullMipChainLevels of the extent
+    // (VUID-VkImageCreateInfo-mipLevels-00947); the guest's 1x1 levels past them are not represented.
+    std::uint32_t imageLevels = 1;
 
     std::uint64_t GuestLayerOffset(std::uint32_t layer) const { return thick ? static_cast<std::uint64_t>(layer / blockDepth) * layerBytes : static_cast<std::uint64_t>(layer) * layerBytes; }
     std::uint64_t LinearLayerOffset(std::uint32_t layer) const { return static_cast<std::uint64_t>(layer) * sliceLinearBytes; }
@@ -73,6 +77,7 @@ struct SurfaceGeometry {
     std::int32_t CopyDepth(std::uint32_t layer) const { return imageDepth > 1 ? static_cast<std::int32_t>(layer) : 0; }
     bool HasLayer(std::uint32_t level, std::uint32_t layer) const { return imageDepth <= 1 || layer < std::max(imageDepth >> level, 1u); }
 };
+std::uint32_t FullMipChainLevels(std::uint32_t width, std::uint32_t height, std::uint32_t depth);
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor);
 bool LevelsFitAllocation(const GuestTextureResource& surface, std::uint32_t levels);
 GuestTextureResource ViewedArrayWindow(const GuestTextureResource& viewed);

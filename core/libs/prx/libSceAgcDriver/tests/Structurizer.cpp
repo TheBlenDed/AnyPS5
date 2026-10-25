@@ -458,6 +458,16 @@ int main() {
         }
         Structurizer{}.Structurize(sharedDiscard);
         requireStructuredBranches(sharedDiscard, "early discards that share one ending block");
+        auto exitJoin = makeGraph({{1}, {2, 3}, {4, 5}, {}, {3, 6}, {7, 3}, {1}, {1}});
+        bool exitJoinStructured = true;
+        try {
+            Structurizer{}.Structurize(exitJoin);
+        } catch (const std::runtime_error&) {
+            exitJoinStructured = false;
+        }
+        if (exitJoinStructured) {
+            requireStructuredBranches(exitJoin, "loop selection arms that rejoin only after leaving the loop body");
+        }
         requireSameStructuredExecutions({{1, 2}, {3, 0}, {}, {2}}, "an entry loop with two exits whose merges collide");
         requireSameStructuredExecutions({{2}, {}, {4, 1}, {1}, {2, 3}}, "a selection region that wraps around to its dominator");
         requireSameStructuredExecutions({{1}, {2, 3}, {0, 4}, {}, {3}}, "an entry loop whose merge splitting runs out of budget");
