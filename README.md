@@ -6,21 +6,21 @@
 <p align="center"><img src="https://raw.githubusercontent.com/Celegans12/AnyPS5/bringup-media/yotei/2026-10-21/open-world-merge19.png" alt="Atsu at the Nupur river by the Ainu village in the open world of Ghost of Yōtei on AnyPS5, on this build (2026-10-21)" width="880"></p>
 
 > [!NOTE]
-> This is a work-in-progress test branch, not upstream code. Since 2026-10-22 it is based on `main` from 2026-10-21
-> (`557682ca44`) and carries local rewrites that haven't been reviewed upstream, plus diagnostics. It moves forward only
+> This is a work-in-progress test branch, not upstream code. Since 2026-10-24 it is based on `main` from 2026-10-24
+> (`a39be6252d`) and carries local rewrites that haven't been reviewed upstream, plus diagnostics. It moves forward only
 > when a build renders our 60-frame title reference exactly and runs faster in the open world than the build before it.
 > Fixes that apply to `main` go upstream as separate PRs.
 
-## Where it stands (2026-10-22)
+## Where it stands (2026-10-25)
 
 | | |
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.5-0.6 fps** (5.2-6.6 presents per 10 s depending on the session; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
-| **Stability** | with the second Vulkan queue on its own compute-only queue family, every world run since the fix has been clean (up to 22 minutes); see known issues |
+| **Frame rate in the world** | about **0.5-0.8 fps** (5-8 presents per 10 s depending on the spot and the session; 7.6 at the river village on 10-25; this laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session) |
+| **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (up to 22 minutes); one crash on 10-25 from a second-queue label bug, fix pending (see known issues) |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `4aae313e38` (our tree merged with `main` 2026-10-24 `a39be6252d`, plus mrfelek's #9957 and #10228, fixes from #675, #6188 (off by default), #9558, #8887, #7514, address-table templates, the read-only lease skip and hritikutekar's committer batches) + docs, shader-cache SourceVersion `6c403b0d2815d602`, title reference T1 exact |
+| **Build** | `9d0ee8e1af` (our tree merged with `main` 2026-10-24 `a39be6252d`, plus owned texture proofs, mrfelek's #9957 and #10228, fixes from #675, #6188 (off by default), #9558, #8887, #7514, address-table templates, the read-only lease skip and hritikutekar's committer batches) + docs, shader-cache SourceVersion `6c403b0d2815d602`, title reference T1 exact |
 
 <table>
 <tr>
@@ -55,6 +55,9 @@
 | 10-21 | **5.9** (lane off 5.45 in the same session: +8 % presents, -16 % median frame; provisional) | the cloth compute ring's second Vulkan queue back on, now on a compute-only queue family |
 | 10-21 | +11 % in an in-run A/B (6.26 vs 5.62) | hritikutekar's two committer fixes: a count of prepared bindless tables instead of a full walk every 4 ms, and small texture snapshots in pooled slabs |
 | 10-22 | **5.2** (the previous build with hritikutekar's fixes: 5.13 in the same session) | merged with `main` 2026-10-21; same speed, newer `main` underneath |
+| 10-24 | +2.8 % / +2 % / +3 % in in-run A/Bs | hritikutekar's second committer batch; #7514; queue-0 dispatches through the draw pipeline (`APS5_PIPELINE_DISPATCH=1`) |
+| 10-24 | even with the build before | merged with `main` 2026-10-24 |
+| 10-25 | **7.6** (7.2 with them off in the same run: +8.5 %, frames ~100 ms shorter) | owned texture proofs: the committer's texture checks become a few word reads instead of a memory walk |
 
 ## Run it
 
@@ -91,6 +94,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
   - `APS5_NO_LEAN_BDA_TABLES=1`, `APS5_NO_DEPTH_LOOKUP_FAST=1`, `APS5_NO_REFUSAL_MEMO=1`, `APS5_NO_DISTINCT_WRITE_SCANS=1`, `APS5_NO_COLLECT_HEAP=1`, `APS5_NO_LARGER_SMALL_POOLS=1`, `APS5_NO_DEFER_IMPORTED_STORES=1`: hritikutekar's second batch (`APS5_VERIFY_COLLECT_HEAP=1` checks the heap merge against the old one; `APS5_DEFER_FLIP_STORE=1` is his opt-in flip-store deferral, off here).
   - `APS5_FLUSH_WAIT_WHOLE_RANGE=1`: a storage flush waits for writers over its whole range again instead of only the image layers it stores (SleglJan's #8887); `APS5_NO_REFRESH_LOOKUP_CACHE=1`: texture refreshes walk the pending registry and look up host imports in full again (AlxcBTW's #7514).
   - `APS5_NO_READ_ONLY_LEASE_SKIP=1`: an address-table build whose shaders never store through pointers counts as a writer of its leased memory again, so texture refreshes wait for it (#10382).
+  - `APS5_NO_OWNED_PROOFS=1`: owned texture proofs (`APS5_VERIFY_OWNED_PROOFS=<n>` re-runs the old proof for the first n armed proofs every 10 s and reports any disagreement). Windows only; elsewhere the old proof runs.
   - `APS5_NO_OVERLAP_RANGE_CHECK=1`: overlapped dispatches no longer need disjoint access ranges (the old rule).
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
   - Every local change has an off switch (`APS5_NO_...`), named in its commit message.
@@ -100,6 +104,9 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 
 ## Known issues
 
+- **A rare crash with the second queue:** `AGC graphics: no batch to append a completion label to`, then the presenter aborts. A label on queue 0 that must wait for a copy-back sometimes finds the copied writer only in the second queue's batch. It happened once (10-25); the fix is tested and comes with the next move. Leaving `APS5_ASYNC_LANE` out avoids it.
+- A silver sheen appears on Atsu and the boat a few frames after entering the world. Not investigated yet.
+
 - **The second queue needs a compute-only queue family.** On a third queue of the graphics family (the old setup, or a GPU without a compute-only family, where the driver falls back to it), 8 of 9 world runs lost the GPU within 4-14 minutes. An Nsight Aftermath dump showed a DMA page fault inside the second queue's batch. On the compute-only family, 4 of 4 runs were clean. If you hit GPU hangs, leave `APS5_ASYNC_LANE` out.
 - The second queue is tested only on Windows with NVIDIA (RTX 3080 Laptop, driver 610.62). AMD and Linux are untested.
 - A GPU hang can reset NVIDIA's shader store for the game. After that, the saved pipelines no longer load and every run compiles again (long stalls on the last loading screen). If that happens after a hang, expect one slow run.
@@ -108,9 +115,9 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - Once, during loading on the build before this one, the game stopped with `missing static shader ABI register 531`. It did not come back in any later run; if you see it, please post the log in #675.
 - A dispatch joins an overlapped run only when its access ranges are disjoint from the run's; address-based, BDA and bindless dispatches count as conflicting. That costs about 5 % GPU time per frame against the old rule. Frames are CPU-bound, so presents don't move.
 - One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
-- About 0.5 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
+- About 0.5-0.8 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
-## What it carries on top of `main` 2026-10-21
+## What it carries on top of `main` 2026-10-24
 
 - Most of the upstream PRs this branch adopted earlier are part of `main` now.
 - Local work:
@@ -128,6 +135,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
   - presenter revalidation prepared off the GPU lock, and a cheaper image-table miss path;
   - batched staging: a dispatch run's copy-ins in one prelude ahead of it and its copy-backs behind one barrier (on NVIDIA any barrier between dispatches serializes them);
   - an in-run A/B switch registry;
+  - owned texture proofs: the 64 KiB blocks under the committer's untracked texture snapshots are write-protected (or, when unmapped, watched through every map and commit path), so a snapshot proof is a few word reads instead of a memory walk;
   - fixes for three slowdowns that `main` added in the draw committer:
     - small device buffers get their own pool tier;
     - an exact-size buffer is reused instead of rebinding another one;
@@ -159,6 +167,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - 2026-10-24: added SleglJan's #8887 and AlxcBTW's #7514 (`06ef2cbc1f`, same shader cache, T1 exact). In-run A/Bs on this build (1,300 s, 9 phases each, change on minus off): #8887 +0.03 ± 0.06 presents per 10 s (neutral), #7514 +0.15 ± 0.12 (about +2 %, frames ~25 ms shorter). Frames clean in every phase. Our perf-evidence runs for the six PRs we have open are linked from those PRs; the round showed that separate runs drift too much (up to 22 % between two unchanged runs) to resolve changes this size, so the switches are now measured inside one run.
 - 2026-10-24: new env line item `APS5_PIPELINE_DISPATCH=1` (same build, same shader cache, T1 exact with it). A dispatch whose program is already in the dispatch cache no longer makes queue 0 drain the draw pipeline first; it goes through the pipeline as an item instead. Two in-run A/Bs (9 phases each): +0.18 ± 0.16 and +0.54 ± 0.53 presents per 10 s with it on, pooled about +0.21 ± 0.15 (+3 %), frames 31 and 78 ms shorter. Leave `APS5_PIPELINE_DISPATCH_MISSES` off: with misses pipelined too, the committer becomes the limit and frames get slower (-0.26 ± 0.10).
 - 2026-10-24: moved to our tree merged with `main` 2026-10-24 (`a39be6252d`, includes #6721 and #8992) plus mrfelek's #9957 (buffer V# presence read at run time) and #10228 (image table for a T# read at a first-lane offset) (`4aae313e38`, **new shader cache**, T1 exact cold and warm). Linux: the PipelineJournal `State` size check is now right for GCC/glibc (ported from hritikutekar's linux branch; not yet built on Linux by us). Two same-session pairs against the previous build, both with the README env: frame p50 1,917 / 1,818 ms against 1,896 / 1,994 ms, frame 90 at 521 / 405 s against 428 / 427 s (the first new-build run came right after the cold run). Pooled that's even (median frame about 4 % shorter, GPU time about the same), so this move is about being on a newer `main`. Upstream's new sparse heap mirrors stay on: `APS5_NO_SPARSE_HEAP_MIRROR=1` measured the same.
+- 2026-10-25: owned texture proofs (`9d0ee8e1af`, same shader cache, T1 exact). The draw committer used to re-prove every "untracked" texture snapshot by walking its memory, about 3,000 times a frame with almost nothing ever changed. Now the 64 KiB blocks under those textures are armed: write-protected (or, for unmapped blocks, watched through every map and commit path), and any CPU store or mapping change bumps a per-block word before it lands. A proof is then a few word reads. Driver, DMA and GPU writes are still caught by the write trackers as before. About 97 % of the proofs take the fast path. In-run A/B (`APS5_NO_OWNED_PROOFS` as B, 9 phases each): **+0.61 ± 0.06 presents per 10 s** with them on (about +8.5 %), frames about 100 ms shorter, the committer 4 points less busy; the verify mode (`APS5_VERIFY_OWNED_PROOFS`) found 0 disagreements and there were 0 faults. `APS5_NO_OWNED_PROOFS=1` turns it off.
 
 ---
 
