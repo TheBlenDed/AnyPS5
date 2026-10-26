@@ -70,7 +70,36 @@ APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 ```
 
-- **This build has a new shader-cache version (since 2026-10-24, `6c403b0d2815d602`), so the first run compiles cold**: about 50 minutes to the world on our machine (frame 90 at 3,006 s). Later runs start warm.
+On Windows, use a fresh PowerShell session in the directory containing the converted executable. Keep the installation-specific `ANYPS5_SHADER_CACHE_DIR` and `ANYPS5_ENTITLEMENTS` values from the validated launch. Set the complete driver configuration together:
+
+```powershell
+Get-ChildItem Env:APS5_* | ForEach-Object {
+    [Environment]::SetEnvironmentVariable($_.Name, $null, 'Process')
+}
+$yoteiSettings = @{
+    APS5_SPANNED_WAVE = '1'
+    APS5_BINDLESS_IMAGES = '1'
+    APS5_BINDLESS_LAZY = '1'
+    APS5_NO_RESULT_MEMO = '1'
+    APS5_STAGING_DIFF = '1'
+    APS5_PIPELINE_INDIRECT = '1'
+    APS5_NO_ADDRESS_DRAW_REUSE = '1'
+    APS5_NO_PIPELINE_JOURNAL = '1'
+    APS5_RESOURCE_CACHE_ENTRIES = '1024'
+    APS5_ASYNC_LANE = '51'
+    APS5_NO_DRAW_AHEAD = '1'
+    APS5_DEFER_REFRESH_FLUSH = '1'
+    APS5_PIPELINE_DISPATCH = '1'
+}
+$yoteiSettings.GetEnumerator() | ForEach-Object {
+    [Environment]::SetEnvironmentVariable($_.Key, $_.Value, 'Process')
+}
+& '.\yotei.exe'
+```
+
+This clears inherited `APS5_` experiments in that PowerShell process, including A/B toggles and forced lazy shader preparation. These switches belong to the experimental integration branch. In particular, lazy image tables can miss on first use; reaching a menu does not establish rendering correctness.
+
+- Recompiler changes select a separate shader-cache version automatically. The author reported about 50 minutes to the world on the first cold run of the 2026-10-24 build; this is not a startup-time guarantee for other builds or machines. Keep the cache between launches. A long pause with advancing shader or pipeline preparation is different from a deadlock.
 - `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
 - `APS5_DEFER_REFRESH_FLUSH=1` lets a storage refresh record its GPU-direct write-backs behind the pending writer instead of waiting for it; hritikutekar's GPU slice copies for reflection probes need it.
 - `APS5_NO_DRAW_AHEAD=1` keeps mitul72's draw-ahead (#6188) off: worker threads that capture and compile upcoming draws ahead of queue 0. Leave it out to try it: in our A/B it was +4 % presents (not significant), and one of four title checks with it on stalled at boot and rendered wrong, which we haven't reproduced or explained yet.
