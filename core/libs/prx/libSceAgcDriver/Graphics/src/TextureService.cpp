@@ -468,8 +468,8 @@ void TextureService::place(const DeviceImageKeys::Key& key, BindlessResolution r
     if (resolution.owner != nullptr) {
         auto& owner = owners[resolution.owner.get()];
         if (owner.references++ == 0u) {
-            owner.bytes = resolution.bytes;
-            pinnedBytes += resolution.bytes;
+            owner.bytes = resolution.allocationBytes;
+            pinnedBytes += resolution.allocationBytes;
         }
     }
     const bool perUse = resolution.perUse;

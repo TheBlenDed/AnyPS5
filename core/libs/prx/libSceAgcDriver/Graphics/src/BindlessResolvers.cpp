@@ -175,6 +175,7 @@ BindlessResolution DriverBindlessResolver::Commit(const BindlessPrepared& prepar
     resolution.value = DeviceImageValue{0u, state->mode, 0u, 0u};
     resolution.address = prepared.address;
     resolution.bytes = prepared.bytes;
+    resolution.allocationBytes = texture->AllocationBytes();
     resolution.generation = prepared.generation;
     resolution.dcc = state->resource.dccAddress != 0u;
     resolution.perUse = texture->IsDepthCopy() || texture->RefreshedPerUse() || resolution.dcc;

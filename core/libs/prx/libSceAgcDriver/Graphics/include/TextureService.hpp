@@ -64,6 +64,7 @@ struct BindlessResolution {
     VkSampler sampler = VK_NULL_HANDLE;
     std::uint64_t address = 0;
     std::uint64_t bytes = 0;
+    std::uint64_t allocationBytes = 0;
     std::uint64_t generation = 0;
     bool perUse = false;
     bool dcc = false;

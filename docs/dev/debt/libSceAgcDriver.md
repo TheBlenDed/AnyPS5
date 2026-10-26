@@ -266,4 +266,6 @@
 
 ### Opt-in draw paths
 
+- [Bindless table priming](../../../core/libs/prx/libSceAgcDriver/Graphics/src/TextureService.cpp) prepares every distinct descriptor before an exact-mode table is served. Budget eviction runs during revalidation, while a table being prepared or used by the open batch keeps its images live. A large table can therefore exceed the available memory before another present permits revalidation; idle-cache eviction does not bound this peak. Lazy priming is a measurement mode: a first-use miss is not resolved before that invocation reads the image, so it is not an exact replacement for priming.
+
 - [Draw finisher](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp) (`APS5_DRAW_PIPELINE`) - opt-in. The Linux main-image page table it adds matches what Windows already does by default.

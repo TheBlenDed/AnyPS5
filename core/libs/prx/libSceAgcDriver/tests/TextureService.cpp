@@ -533,6 +533,7 @@ public:
         resolution.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         resolution.address = prepared.address;
         resolution.bytes = prepared.bytes;
+        resolution.allocationBytes = allocationBytes;
         resolution.generation = prepared.generation;
         resolution.dcc = dcc.contains(image);
         resolution.perUse = resolution.dcc;
@@ -553,6 +554,7 @@ public:
     std::atomic<std::uint64_t> refreshes{0};
     std::set<std::uint32_t> reused;
     std::set<std::uint32_t> dcc;
+    std::uint64_t allocationBytes = TextureService::PageBytes;
 
 private:
     const Images& images;
@@ -1010,31 +1012,32 @@ void perUseTests(const Device& device) {
     std::cout << "per-use refresh: DCC entries re-resolved for the tables being served only (1, 2, 3 of 3), none after the record moved off its DCC surface\n";
 }
 
-void budgetTests(const Device& device) {
+void budgetTests(const Device& device, std::uint64_t allocationBytes = TextureService::PageBytes) {
     Fixture fixture(device);
+    fixture.resolver->allocationBytes = allocationBytes;
     Recorder recorder(fixture.context, device.Timeline());
     recorder.Activate();
     TextureService::Options options;
     options.worker = false;
-    options.budgetBytes = 16u * TextureService::PageBytes;
+    options.budgetBytes = 16u * allocationBytes;
     options.idleSubmits = 1u;
     TextureService service(*fixture.table, fixture.resolver, fixture.memory, options);
     std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
     const std::array<std::uint64_t, 1> served{service.Register(fixture.Registration(0u, 40u))};
     service.Serve(served, recorder);
-    Require(service.Totals().pinnedBytes == 40u * TextureService::PageBytes, "pinned bytes do not count one surface per image");
+    Require(service.Totals().pinnedBytes == 40u * allocationBytes, "pinned bytes do not count one allocation per image");
     service.Revalidate(recorder);
     Require(service.Totals().evicted == 0u, "entries used by the open batch were evicted");
     Advance(recorder);
     Advance(recorder);
     service.Revalidate(recorder);
     const auto counts = service.Totals();
-    Require(counts.evicted == 28u && counts.pinnedBytes == 12u * TextureService::PageBytes, "budget eviction did not drop the oldest idle entries down to three quarters of the budget: " + std::to_string(counts.evicted) + " evicted, " + std::to_string(counts.pinnedBytes) + " bytes pinned");
+    Require(counts.evicted == 28u && counts.pinnedBytes == 12u * allocationBytes, "budget eviction did not drop the oldest idle entries down to three quarters of the budget: " + std::to_string(counts.evicted) + " evicted, " + std::to_string(counts.pinnedBytes) + " bytes pinned");
     const auto pending = fixture.table->Heap().PendingReleases();
     recorder.Sync();
     service.Publish(recorder);
     Require(pending != 0u && fixture.table->Heap().PendingReleases() == 0u, "evicted slots were not freed after their retire serial");
-    std::cout << "budget eviction: " << counts.evicted << " idle entries evicted to " << counts.pinnedBytes / TextureService::PageBytes << " pinned surfaces\n";
+    std::cout << "budget eviction: " << counts.evicted << " idle entries evicted to " << counts.pinnedBytes / allocationBytes << " pinned surfaces, " << allocationBytes << " allocation bytes per surface\n";
 }
 
 void liveBudgetTests(const Device& device) {
@@ -1116,7 +1119,7 @@ std::array<std::uint32_t, 8> GuestDescriptor(std::uint64_t address, std::uint32_
     };
 }
 
-void driverTests(const Device& device) {
+void driverTests(const Device& device, bool compact = false) {
     using ShaderRecompiler::ResourceMaterializer;
     auto context = device.GetContext();
     AgcDriver::Graphics::TextureDetiler detiler(context);
@@ -1135,7 +1138,8 @@ void driverTests(const Device& device) {
     for (std::uint32_t record = 0; record < Records; ++record) {
         if (record == 4u || record == 11u) continue;
         const auto address = record == Unmapped ? 0x7ff000000000ull : block.Surface(record % GuestBlock::Surfaces);
-        const auto descriptor = GuestDescriptor(address, GuestBlock::SurfaceSide);
+        auto descriptor = GuestDescriptor(address, compact ? 32u : GuestBlock::SurfaceSide);
+        if (compact) descriptor[3] &= ~(0x1fu << 20u);
         std::copy(descriptor.begin(), descriptor.end(), words.begin() + static_cast<std::ptrdiff_t>(record) * 8);
     }
     struct ClearTextures {
@@ -1158,6 +1162,7 @@ void driverTests(const Device& device) {
         AgcDriver::Graphics::ServeBindlessTables(serving, recorder, tables);
         Require(service.Totals().registered == 1u && service.Totals().primed == 1u, "the draw-path helpers did not register and prime the table once");
         std::set<const void*> textures;
+        std::uint64_t allocationBytes = 0;
         std::uint32_t compared = 0;
         for (std::uint32_t record = 0; record < Records; ++record) {
             const auto descriptor = std::span<const std::uint32_t, 8>(words.data() + static_cast<std::size_t>(record) * 8u, 8u);
@@ -1180,10 +1185,12 @@ void driverTests(const Device& device) {
             Require(value->fault == 0u && value->mode == oldMode, "record " + std::to_string(record) + " got mode " + std::to_string(value->mode) + ", the old resolver's mode is " + std::to_string(oldMode));
             Require(service.Owner(key).get() == oldTexture.get(), "record " + std::to_string(record) + " holds another texture than the old resolver's cached texture");
             Require(table.Heap().Live(DescriptorHeap::Array::SampledImages, value->slot), "record " + std::to_string(record) + " names a dead heap slot");
-            textures.insert(oldTexture.get());
+            if (textures.insert(oldTexture.get()).second) allocationBytes += oldTexture->AllocationBytes();
             ++compared;
         }
         const auto counts = service.Totals();
+        std::cout << "driver budget: " << counts.pinnedBytes << " bytes counted, " << allocationBytes << " bytes allocated\n";
+        Require(counts.pinnedBytes == allocationBytes, "the texture service budget counts guest surface bytes instead of GPU image allocation bytes");
         Require(textures.size() == GuestBlock::Surfaces && counts.imageSlots == GuestBlock::Surfaces && counts.created == GuestBlock::Surfaces + 2u && counts.refused == 1u, "the primer did not share one cached texture and one heap slot per surface: " + std::to_string(textures.size()) + " textures, " + std::to_string(counts.imageSlots) + " slots, " + std::to_string(counts.created) + " entries, " + std::to_string(counts.refused) + " refused");
         recorder.Sync();
         std::cout << "driver resolver: " << compared << " primed entries match the old resolver (same cached texture, same runtime mode), " << counts.imageSlots << " heap slots, unmapped T# refused, null records are null-slot entries\n";
@@ -1295,6 +1302,7 @@ int main(int argc, char** argv) {
             return Skipped;
         }
         if (mode == "--driver") {
+            driverTests(*device, true);
             driverTests(*device);
             r128Tests(*device);
             return 0;
@@ -1305,6 +1313,7 @@ int main(int argc, char** argv) {
         fullTests(*device);
         perUseTests(*device);
         budgetTests(*device);
+        budgetTests(*device, 16u * TextureService::PageBytes);
         liveBudgetTests(*device);
         return 0;
     } catch (const std::exception& error) {
