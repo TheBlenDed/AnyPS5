@@ -62,7 +62,7 @@ alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
     0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
 };
 
-alignas(256) std::array<std::array<std::uint32_t, 64>, 64> Programs{};
+alignas(256) std::array<std::array<std::uint32_t, 64>, 256> Programs{};
 std::size_t programCount = 0;
 
 const std::vector<std::array<float, 4>>& Triangles(std::uint32_t count) {
@@ -125,11 +125,11 @@ std::uint32_t Blend(std::uint32_t word, const std::array<float, 4>& color, const
 }
 
 std::uint32_t Half(float value) {
-    Require(value == 0.0f || (value >= 0.0625f && value <= 1.0f), "the test's half values are normal and at most 1");
+    Require(value == 0.0f || (std::fabs(value) >= 0.0625f && std::fabs(value) <= 2.0f), "the test's half values are normal and at most 2 in magnitude");
     if (value == 0.0f) return 0;
     const auto bits = std::bit_cast<std::uint32_t>(value);
     Require((bits & 0x1fffu) == 0, "the test's half values are exact");
-    return ((((bits >> 23u) & 0xffu) - 112u) << 10u) | ((bits >> 13u) & 0x3ffu);
+    return ((bits >> 16u) & 0x8000u) | ((((bits >> 23u) & 0xffu) - 112u) << 10u) | ((bits >> 13u) & 0x3ffu);
 }
 
 std::span<const std::uint32_t> Store(const std::vector<std::uint32_t>& words) {
@@ -149,10 +149,11 @@ void MultiplyLiteral(std::vector<std::uint32_t>& code, std::uint32_t vgpr, std::
     code.push_back(std::bit_cast<std::uint32_t>(value));
 }
 
-std::span<const std::uint32_t> ConstantProgram(const std::array<float, 4>& color) {
+std::span<const std::uint32_t> ConstantProgram(const std::array<float, 4>& color, std::uint32_t target = 0u, std::uint32_t additionalTarget = 8u) {
     std::vector<std::uint32_t> code;
     for (std::uint32_t lane = 0; lane < 4; ++lane) MoveLiteral(code, 4 + lane, std::bit_cast<std::uint32_t>(color[lane]));
-    code.insert(code.end(), {0xf800180fu, 0x07060504u, 0xbf810000u});
+    if (additionalTarget < 8u) code.insert(code.end(), {0xf800000fu | (additionalTarget << 4u), 0x07060504u});
+    code.insert(code.end(), {0xf800180fu | (target << 4u), 0x07060504u, 0xbf810000u});
     return Store(code);
 }
 
@@ -276,7 +277,7 @@ struct Attachment {
 
 Attachment Attached;
 
-void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, const ColorTargetBlend& blend, std::uint32_t exportFormat, std::span<const std::uint32_t> pixelCode, std::uint32_t triangles = 1, Attachment* attached = nullptr) {
+void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget& color, const ColorTargetBlend& blend, std::uint32_t exportFormat, std::span<const std::uint32_t> pixelCode, std::uint32_t triangles = 1, Attachment* attached = nullptr, std::uint32_t exportIndex = 0u, const AgcDriver::Graphics::ColorTarget* additionalTarget = nullptr) {
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
     const auto& vertices = Triangles(triangles);
@@ -298,9 +299,13 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, waveSize, waveSize, std::nullopt, std::nullopt};
     auto blended = color;
-    blended.exportIndex = 0;
+    blended.exportIndex = exportIndex;
     state.blendedColors = {blended};
-    state.targetBlends[0] = blend;
+    state.targetBlends[exportIndex] = blend;
+    if (additionalTarget != nullptr) {
+        state.blendedColors.push_back(*additionalTarget);
+        state.targetBlends[additionalTarget->exportIndex] = blend;
+    }
     state.color = blended;
     if (attached != nullptr) {
         AgcDriver::Graphics::ColorTarget other{reinterpret_cast<std::uintptr_t>(attached->pixels.data()), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, attached->pixels.size(), 0xe4u};
@@ -326,7 +331,8 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
     pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
     pixel.posX = true;
     pixel.posY = true;
-    pixel.targetOutputMode.at(0) = static_cast<std::uint8_t>(exportFormat);
+    pixel.targetOutputMode.at(exportIndex) = static_cast<std::uint8_t>(exportFormat);
+    if (additionalTarget != nullptr) pixel.targetOutputMode.at(additionalTarget->exportIndex) = static_cast<std::uint8_t>(exportFormat);
     if (attached != nullptr) pixel.targetOutputMode.at(1) = static_cast<std::uint8_t>(Float32Export);
     pixel.targetExportMapping = AgcDriver::Graphics::ExportMappings(state);
     pixel.targetExportPacking = AgcDriver::Graphics::ExportPackings(state);
@@ -504,9 +510,112 @@ void LinearTest(AgcDriver::VulkanDevice& device, Block& block) {
     Require(failure.find("blending into a linear 10_11_11 unorm color target is unsupported") != std::string::npos, "a blend into a linear 10_11_11 unorm target reported \"" + failure + "\"");
 }
 
+void UnclampedByteTests(AgcDriver::VulkanDevice& device, std::uint32_t channels) {
+    const ColorTargetLayout layout(Width, Height, ColorTileMode::RenderTarget, channels);
+    Block block(layout.Bytes());
+    AgcDriver::Registers cx;
+    cx[0x318] = static_cast<std::uint32_t>(block.Address() >> 8u);
+    cx[0x31b] = 0;
+    cx[0x31c] = channels == 1u ? 0x4u : channels == 2u ? 0xcu : 0x28u;
+    cx[0x31d] = 0;
+    cx[0x3b0] = ((Width - 1u) << 14u) | (Height - 1u);
+    cx[0x3b8] = TiledAttrib3;
+    cx[0x390] = static_cast<std::uint32_t>(block.Address() >> 40u);
+    auto color = AgcDriver::Graphics::DecodeColorBuffer(cx, 0);
+    color.format = channels == 1u ? VK_FORMAT_R8_UINT : channels == 2u ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
+    color.packing = channels == 1u ? ShaderRecompiler::ColorExportPacking::UnclampedUnorm8 : channels == 2u ? ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8 : ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8_8_8;
+    const std::array<std::array<float, 4>, 4> sources{{
+        {-0.5f, 1.5f, 0.0f, 0.25f}, {2.0f, -1.0f, 0.0f, 0.5f},
+        {0.25f, 0.75f, 0.0f, 1.5f}, {0.25f, 0.75f, 0.0f, -0.5f}
+    }};
+    std::size_t draws = 0;
+    const auto masks = channels == 1u ? std::vector<std::uint32_t>{1u} : channels == 2u ? std::vector<std::uint32_t>{1u, 2u, 3u} : std::vector<std::uint32_t>{1u, 2u, 4u, 8u, 15u};
+    for (const auto& source : sources) {
+        for (const auto exportFormat : {Float32Export, Float16Export}) {
+            for (const auto mask : masks) {
+                for (const auto operation : {0u, 1u, 4u}) {
+                    const ColorTargetBlend blend{true, 4u, 5u, static_cast<std::uint8_t>(operation), static_cast<std::uint8_t>(mask)};
+                    const auto before = Fill(block, static_cast<std::uint32_t>(draws + 1u));
+                    Draw(device, color, blend, exportFormat, exportFormat == Float32Export ? ConstantProgram(source) : HalfProgram(source), Overlaps);
+                    const auto stored = ReadBack(device, block);
+                    for (std::uint32_t y = 0; y < Height; ++y) {
+                        for (std::uint32_t x = 0; x < Width; ++x) {
+                            const auto offset = layout.Offset(x, y);
+                            std::uint32_t expected = 0, actual = 0;
+                            std::memcpy(&expected, reinterpret_cast<const std::byte*>(before.data()) + offset, channels);
+                            std::memcpy(&actual, reinterpret_cast<const std::byte*>(stored.data()) + offset, channels);
+                            if (x < ScissorWidth) {
+                                for (std::uint32_t step = 0; step < Overlaps; ++step) {
+                                    for (std::uint32_t lane = 0; lane < channels; ++lane) {
+                                        if ((mask & (1u << lane)) == 0u) continue;
+                                        const auto shift = lane * 8u;
+                                        const float destination = static_cast<float>((expected >> shift) & 255u) / 255.0f;
+                                        volatile float sourceTerm = source[lane] * source[3];
+                                        volatile float destinationTerm = destination * (1.0f - source[3]);
+                                        const auto value = operation == 0u ? sourceTerm + destinationTerm : operation == 1u ? sourceTerm - destinationTerm : destinationTerm - sourceTerm;
+                                        const auto field = Unorm(value, 8u);
+                                        expected = (expected & ~(255u << shift)) | (field << shift);
+                                    }
+                                }
+                            }
+                            Require(actual == expected, "unclamped " + std::to_string(channels) + "-channel blend mismatch at " + std::to_string(x) + "," + std::to_string(y) + ": " + std::to_string(actual) + " instead of " + std::to_string(expected));
+                        }
+                    }
+                    ++draws;
+                }
+            }
+        }
+    }
+    const ColorTargetLayout wideLayout(Width, Height, ColorTileMode::RenderTarget, 4);
+    Block wide(wideLayout.Bytes());
+    const auto wideColor = DecodeTarget(wide, TiledAttrib3);
+    const std::array<float, 4> bounded{0.25f, 0.75f, 0.5f, 0.5f};
+    const auto program = ConstantProgram(bounded);
+    const auto before = Fill(wide, 113u);
+    Draw(device, wideColor, AlphaBlend, Float32Export, program);
+    Draw(device, color, ColorTargetBlend{true, 4u, 5u, 0u, static_cast<std::uint8_t>((1u << channels) - 1u)}, Float32Export, program);
+    Draw(device, wideColor, AlphaBlend, Float32Export, program);
+    Expect(device, wide, wideLayout, before, AlphaBlend, 2u, [&](std::uint32_t, std::uint32_t) { return bounded; }, "an R32ui blend reused after an R16ui specialization of the same shader");
+    const auto lastBefore = Fill(block, 157u);
+    const std::array<float, 4> lastColor{1.0f, 0.0f, 1.0f, 1.0f};
+    Draw(device, color, ColorTargetBlend{true, 4u, 5u, 0u, static_cast<std::uint8_t>((1u << channels) - 1u)}, Float32Export, ConstantProgram(lastColor, 7u), 1u, nullptr, 7u);
+    const auto lastStored = ReadBack(device, block);
+    const std::array<std::uint8_t, 4> expectedBytes{255u, 0u, 255u, 255u};
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            const auto offset = layout.Offset(x, y);
+            for (std::uint32_t lane = 0; lane < channels; ++lane) {
+                const auto expected = x < ScissorWidth ? expectedBytes[lane] : reinterpret_cast<const std::uint8_t*>(lastBefore.data())[offset + lane];
+                Require(reinterpret_cast<const std::uint8_t*>(lastStored.data())[offset + lane] == expected, "an unclamped blend through MRT7 wrote the wrong texel");
+            }
+        }
+    }
+    Block second(layout.Bytes());
+    auto secondColor = color;
+    secondColor.address = second.Address();
+    secondColor.slot = 7u;
+    secondColor.exportIndex = 7u;
+    const auto firstBefore = Fill(block, 171u);
+    const auto secondBefore = Fill(second, 183u);
+    Draw(device, color, ColorTargetBlend{true, 4u, 5u, 0u, static_cast<std::uint8_t>((1u << channels) - 1u)}, Float32Export, ConstantProgram(lastColor, 0u, 7u), 1u, nullptr, 0u, &secondColor);
+    for (const auto& [target, initial] : std::array<std::pair<const Block*, const std::vector<std::uint32_t>*>, 2>{{{&block, &firstBefore}, {&second, &secondBefore}}}) {
+        const auto stored = ReadBack(device, *target);
+        for (std::uint32_t y = 0; y < Height; ++y) {
+            for (std::uint32_t x = 0; x < Width; ++x) {
+                const auto offset = layout.Offset(x, y);
+                for (std::uint32_t lane = 0; lane < channels; ++lane) {
+                    const auto expected = x < ScissorWidth ? expectedBytes[lane] : reinterpret_cast<const std::uint8_t*>(initial->data())[offset + lane];
+                    Require(reinterpret_cast<const std::uint8_t*>(stored.data())[offset + lane] == expected, "simultaneous unclamped blends wrote the wrong texel");
+                }
+            }
+        }
+    }
+    std::printf("Unclamped %u-channel UNORM blending passed: %zu draws, FP32/FP16 exports, out-of-range colors and alpha, %u overlapping fragments, channel masks, scissor, MRT7, simultaneous targets and shader reuse\n", channels, draws + 5u, Overlaps);
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -514,6 +623,10 @@ int main() {
         if (std::find(capabilities.begin(), capabilities.end(), PixelInterlockCapability) == capabilities.end()) {
             std::puts("skipped, the device lacks fragmentShaderPixelInterlock");
             return VulkanTestSkipped;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--unclamped-pair") {
+            for (const auto channels : {1u, 2u, 4u}) UnclampedByteTests(*device, channels);
+            return 0;
         }
         Block tiled(ColorTargetLayout(Width, Height, ColorTileMode::RenderTarget, 4).Bytes());
         Block linear(ColorTargetLayout(Width, Height, ColorTileMode::Linear, 4).Bytes());

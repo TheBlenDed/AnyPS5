@@ -607,12 +607,13 @@ std::uint32_t BlendFactorF32(SpirvEmitterState& state, std::uint32_t factor, std
     return result;
 }
 
-void EmitBlendedTarget(SpirvEmitterState& state, std::uint32_t index, std::uint32_t blend) {
-    const auto info = GetFormatInfo(IrBufferFormat::Format11_11_10UNorm);
+void EmitBlendedTarget(SpirvEmitterState& state, std::uint32_t index, std::uint32_t blend, std::uint32_t channels) {
+    const auto format = channels == 1u ? IrBufferFormat::Format8UNorm : channels == 2u ? IrBufferFormat::Format8_8UNorm : channels == 4u ? IrBufferFormat::Format8_8_8_8UNorm : IrBufferFormat::Format11_11_10UNorm;
+    const auto info = GetFormatInfo(format);
     const auto sourceFactor = BlendField(state, blend, 8u, 5u);
     const auto destinationFactor = BlendField(state, blend, 16u, 5u);
     const auto function = BlendField(state, blend, 24u, 3u);
-    const auto writeMask = BlendField(state, blend, 28u, 3u);
+    const auto writeMask = BlendField(state, blend, 28u, 4u);
     const auto imageType = state.module.Type(spv::OpTypeImage, TypeU32(state), spv::Dim2D, 0u, 0u, 0u, 2u, spv::ImageFormatR32ui);
     const auto image = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, imageType, image, state.blendTargetImages[index]);
@@ -639,7 +640,7 @@ void EmitBlendedTarget(SpirvEmitterState& state, std::uint32_t index, std::uint3
     const auto component = [&](std::uint32_t lane) {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, source, lane);
-        return ClampUnitF32(state, value);
+        return channels != 0u ? value : ClampUnitF32(state, value);
     };
     const auto alpha = component(3u);
     auto packed = ConstantU32(state, 0u);
@@ -929,7 +930,12 @@ void EmitBlendedTargets(SpirvEmitterState& state) {
                 state.module.AddFunction(spv::OpLoad, TypeU32(state), mask, state.pixelValidMaskVariable);
                 condition = EmitLogicalAndBool(state, condition, EmitCompareU32Constant(state, spv::OpINotEqual, mask, 0u));
             }
-            EmitIfCondition(state, condition, [&] { EmitBlendedTarget(state, index, blend); });
+            EmitIfCondition(state, condition, [&] {
+                const auto format = EmitAndConstant(state, blend, 14u);
+                for (const auto& [mode, channels] : std::array<std::pair<std::uint32_t, std::uint32_t>, 4>{{{0u, 0u}, {2u, 2u}, {4u, 1u}, {8u, 4u}}}) {
+                    EmitIfCondition(state, EmitCompareU32Constant(state, spv::OpIEqual, format, mode), [&] { EmitBlendedTarget(state, index, blend, channels); });
+                }
+            });
         });
     }
 }

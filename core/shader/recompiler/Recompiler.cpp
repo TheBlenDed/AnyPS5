@@ -553,21 +553,29 @@ bool LazyCapturePlan() {
     return enabled;
 }
 
-std::uint32_t targetBlendWord(const ColorTargetBlend& blend) {
+std::uint32_t targetBlendWord(const ColorTargetBlend& blend, ColorExportPacking packing) {
     if (!blend.enable) return 0u;
-    return 1u | (static_cast<std::uint32_t>(blend.sourceFactor) << 8u) | (static_cast<std::uint32_t>(blend.destinationFactor) << 16u) | (static_cast<std::uint32_t>(blend.function) << 24u) | (static_cast<std::uint32_t>(blend.writeMask) << 28u);
+    const auto format = packing == ColorExportPacking::UnclampedUnorm8_8 ? 2u : packing == ColorExportPacking::UnclampedUnorm8 ? 4u : packing == ColorExportPacking::UnclampedUnorm8_8_8_8 ? 8u : 0u;
+    return 1u | format | (static_cast<std::uint32_t>(blend.sourceFactor) << 8u) | (static_cast<std::uint32_t>(blend.destinationFactor) << 16u) | (static_cast<std::uint32_t>(blend.function) << 24u) | (static_cast<std::uint32_t>(blend.writeMask) << 28u);
 }
 
 void validateTargetBlends(const RecompileRequest& request) {
     if (!request.context.pixel) return;
     const auto& pixel = *request.context.pixel;
+    for (std::size_t index = 0; index < pixel.targetBlend.size(); ++index) {
+        if (pixel.targetExportPacking[index] >= ColorExportPacking::UnclampedUnorm8_8 && pixel.targetExportPacking[index] <= ColorExportPacking::UnclampedUnorm8_8_8_8 && !pixel.targetBlend[index].enable) throw std::runtime_error("unclamped UNORM packing requires ordered shader blending");
+    }
     if (std::none_of(pixel.targetBlend.begin(), pixel.targetBlend.end(), [](const ColorTargetBlend& blend) { return blend.enable; })) return;
     if (pixel.depthExportEnable || pixel.sampleMaskExportEnable) throw std::runtime_error("a pixel shader that exports depth or a sample mask cannot blend into a 10_11_11 unorm target");
     const auto factor = [](std::uint32_t value) { return value <= 5u || value == 8u || value == 9u; };
     for (std::uint32_t index = 0; index < pixel.targetBlend.size(); ++index) {
         const auto& blend = pixel.targetBlend[index];
         if (!blend.enable) continue;
-        if (pixel.targetExportPacking[index] != ColorExportPacking::Unorm10_11_11 || !factor(blend.sourceFactor) || !factor(blend.destinationFactor) || (blend.function != 0u && blend.function != 1u && blend.function != 4u) || blend.writeMask > 7u) {
+        const auto packing = pixel.targetExportPacking[index];
+        const bool unclamped = packing >= ColorExportPacking::UnclampedUnorm8_8 && packing <= ColorExportPacking::UnclampedUnorm8_8_8_8;
+        const auto mask = packing == ColorExportPacking::UnclampedUnorm8 ? 1u : packing == ColorExportPacking::UnclampedUnorm8_8 ? 3u : packing == ColorExportPacking::UnclampedUnorm8_8_8_8 ? 15u : 7u;
+        if (unclamped && (pixel.targetOutputMode[index] == 5u || pixel.targetOutputMode[index] == 6u || pixel.targetOutputMode[index] == 7u)) throw std::runtime_error("unclamped UNORM blending requires a floating-point export");
+        if ((!unclamped && packing != ColorExportPacking::Unorm10_11_11) || !factor(blend.sourceFactor) || !factor(blend.destinationFactor) || (blend.function != 0u && blend.function != 1u && blend.function != 4u) || blend.writeMask > mask) {
             throw std::runtime_error("export " + std::to_string(index) + " requests a blend into a non-10_11_11 target or with an unsupported factor, function or mask");
         }
     }
@@ -1386,7 +1394,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         moduleKey.push_back(request.context.pixel->reversedBlend);
         if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
         if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
-        for (const auto& blend : request.context.pixel->targetBlend) moduleKey.push_back(targetBlendWord(blend));
+        for (std::size_t index = 0; index < request.context.pixel->targetBlend.size(); ++index) moduleKey.push_back(targetBlendWord(request.context.pixel->targetBlend[index], request.context.pixel->targetExportPacking[index]));
     }
     const bool depthRemap = request.target.depthRangeRemap && request.shader.stage == ShaderStage::Vertex && request.context.vertex.has_value();
     if (depthRemap) {
@@ -1850,7 +1858,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(request.context.pixel->reversedBlend);
         mix(static_cast<std::uint64_t>(request.context.pixel->rasterPrimitive));
         mix(request.context.pixel->layerExported);
-        for (const auto& blend : request.context.pixel->targetBlend) mix(targetBlendWord(blend));
+        for (std::size_t index = 0; index < request.context.pixel->targetBlend.size(); ++index) mix(targetBlendWord(request.context.pixel->targetBlend[index], request.context.pixel->targetExportPacking[index]));
         const auto& merge = request.context.pixel->targetMerge;
         mix(merge.target);
         mix(merge.mask);

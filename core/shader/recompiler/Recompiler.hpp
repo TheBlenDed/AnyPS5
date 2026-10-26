@@ -137,7 +137,10 @@ enum class ColorExportPacking : std::uint8_t {
     None,
     Unorm10_11_11,
     Float11_11_10,
-    Unorm4_4_4_4
+    Unorm4_4_4_4,
+    UnclampedUnorm8_8,
+    UnclampedUnorm8,
+    UnclampedUnorm8_8_8_8
 };
 
 enum class RasterPrimitive : std::uint8_t {

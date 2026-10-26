@@ -243,6 +243,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
 
                 const bool isBaseCapability =
                     capability == spv::CapabilityShader ||
+                    capability == spv::CapabilityStorageImageExtendedFormats ||
                     capability == spv::CapabilitySignedZeroInfNanPreserve;
 
                 const bool isBdaCapability =
@@ -591,7 +592,9 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                 const auto exportIndex = *decoration.binding;
                 Require(std::any_of(state.blendedColors.begin(), state.blendedColors.end(), [&](const ColorTarget& color) { return color.exportIndex == exportIndex; }), "fragment shader blends into an export that has no blended 10_11_11 unorm target");
                 Require(blendedTargets.insert(exportIndex).second, "duplicate blended 10_11_11 unorm target binding");
-                Require(type.size() == 9 && (type[0] & 0xffffu) == spv::OpTypeImage && module.Signature(type[2]) == "u32" && type[3] == spv::Dim2D && type[4] == 0 && type[5] == 0 && type[6] == 0 && type[7] == 2 && type[8] == spv::ImageFormatR32ui, "a blended 10_11_11 unorm target must be an R32ui 2D storage image");
+                const auto color = std::find_if(state.blendedColors.begin(), state.blendedColors.end(), [&](const auto& item) { return item.exportIndex == exportIndex; });
+                const auto imageFormat = color->packing == ShaderRecompiler::ColorExportPacking::UnclampedUnorm8 ? spv::ImageFormatR8ui : color->packing == ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8 ? spv::ImageFormatR16ui : spv::ImageFormatR32ui;
+                Require(type.size() == 9 && (type[0] & 0xffffu) == spv::OpTypeImage && module.Signature(type[2]) == "u32" && type[3] == spv::Dim2D && type[4] == 0 && type[5] == 0 && type[6] == 0 && type[7] == 2 && type[8] == imageFormat, "a blended color target must have a matching unsigned 2D storage image format");
                 continue;
             }
             const auto key = std::make_pair(*decoration.set, *decoration.binding);

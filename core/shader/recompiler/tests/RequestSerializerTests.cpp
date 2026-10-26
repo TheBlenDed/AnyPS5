@@ -841,5 +841,11 @@ int main() {
         Require(!serializer.Deserialize(EncodeBase64(bytes)).request.target.fusedExactArithmetic);
     }
 
+    for (const auto packing : {ShaderRecompiler::ColorExportPacking::UnclampedUnorm8, ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8, ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8_8_8}) {
+        request.context.pixel->targetExportPacking[0] = packing;
+        request.context.pixel->targetBlend[0] = ShaderRecompiler::ColorTargetBlend{true, 4u, 5u, 0u, 3u};
+        const auto unclamped = serializer.Deserialize(serializer.Serialize(request));
+        Require(unclamped.request.context.pixel->targetExportPacking == request.context.pixel->targetExportPacking && unclamped.request.context.pixel->targetBlend == request.context.pixel->targetBlend);
+    }
     return 0;
 }

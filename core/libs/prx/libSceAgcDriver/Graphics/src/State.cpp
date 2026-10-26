@@ -793,7 +793,8 @@ ShaderRecompiler::ColorTargetBlend decodeTargetBlend(const Registers& cx, const 
     for (const auto index : {color.exportIndex, color.slot}) {
         Require(((optionalRegister(cx, 0x1d5) >> (4u * index)) & 0xfu) == 0, "SX export conversion into a blended or partially written 10_11_11 unorm color target is unsupported");
     }
-    ShaderRecompiler::ColorTargetBlend blend{true, 1u, 0u, 0u, static_cast<std::uint8_t>(state.colorWriteMask & 7u)};
+    const auto mask = color.packing == ShaderRecompiler::ColorExportPacking::UnclampedUnorm8 ? 1u : color.packing == ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8 ? 3u : color.packing == ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8_8_8 ? 15u : 7u;
+    ShaderRecompiler::ColorTargetBlend blend{true, 1u, 0u, 0u, static_cast<std::uint8_t>(state.colorWriteMask & mask)};
     if (!state.blendEnable) return blend;
     blend.sourceFactor = static_cast<std::uint8_t>(control & 0x1fu);
     blend.destinationFactor = static_cast<std::uint8_t>((control >> 8u) & 0x1fu);
@@ -1707,9 +1708,19 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             result.dualSourceBlend = true;
         }
         if (const auto info = read(cx, 0x31c + slot * 0xfu); state.blendEnable && (info & 0x8000u) == 0 && ((info >> 8u) & 7u) <= 1u) {
-            char detail[80];
-            std::snprintf(detail, sizeof(detail), " (CB_COLOR_INFO 0x%08x, CB_BLEND%u_CONTROL 0x%08x)", info, slot, blend);
-            throw std::runtime_error(std::string("AGC graphics: blending unclamped normalized color is not implemented") + detail);
+            const auto bytes = color.format == VK_FORMAT_R8_UNORM ? 1u : color.format == VK_FORMAT_R8G8_UNORM ? 2u : color.format == VK_FORMAT_R8G8B8A8_UNORM ? 4u : 0u;
+            if (bytes == 0u || color.componentMapping != 0xe4u || color.samples != 1u || result.samples != 1u || color.layers != 1u || color.dccAddress != 0u || color.cmaskAddress != 0u) {
+                char detail[128];
+                std::snprintf(detail, sizeof(detail), " (CB_COLOR_INFO 0x%08x, CB_BLEND%u_CONTROL 0x%08x, SPI_SHADER_COL_FORMAT 0x%08x)", info, slot, blend, exportFormat);
+                throw std::runtime_error(std::string("AGC graphics: blending unclamped normalized color is not implemented") + detail);
+            }
+            const auto slotExport = (exportFormat >> (4u * color.exportIndex)) & 0xfu;
+            Require(slotExport != 5u && slotExport != 6u, "unclamped UNORM blending of 16-bit normalized exports is unsupported");
+            Require(bytes != 4u || (blend & 0x20000000u) == 0u || ((blend >> 16u) & 0x1fffu) == (blend & 0x1fffu), "unclamped RGBA8 blending with a separate alpha equation is unsupported");
+            color.packing = bytes == 1u ? ShaderRecompiler::ColorExportPacking::UnclampedUnorm8 : bytes == 2u ? ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8 : ShaderRecompiler::ColorExportPacking::UnclampedUnorm8_8_8_8;
+            color.format = bytes == 1u ? VK_FORMAT_R8_UINT : bytes == 2u ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT;
+            result.targetBlends[color.exportIndex] = decodeTargetBlend(cx, color, blend, state);
+            state.blendEnable = VK_FALSE;
         }
         result.blends[color.exportIndex] = state;
     }
@@ -1731,6 +1742,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         for (const auto& color : result.colors) (result.targetBlends[color.exportIndex].enable ? result.blendedColors : attached).push_back(color);
         result.colors = std::move(attached);
         result.blends.resize(result.colors.empty() ? 0u : result.colors.back().exportIndex + 1u);
+        if (result.colors.empty()) result.color = result.blendedColors.front();
     }
     if (!result.colors.empty()) {
         result.color = result.colors.front();

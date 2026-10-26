@@ -1804,10 +1804,19 @@ void UnclampedNormalizedColorTests() {
     const auto pass = AgcDriver::Graphics::DecodeColorMetadataPass(eliminate);
     Require(pass.has_value() && pass->mode == AgcDriver::Graphics::ColorMetadataPass::Mode::EliminateFastClear && pass->targets.size() == 1 && pass->targets[0].format == VK_FORMAT_R8G8_UNORM, "a fast-clear eliminate over an unclamped UNORM target was refused");
     queue.context[0x1e0] = blending;
-    expectFailure([&] { DecodeState(queue); }, "blending unclamped normalized color is not implemented (CB_COLOR_INFO 0x0000000c, CB_BLEND0_CONTROL 0x40000504)");
+    state = DecodeState(queue);
+    Require(state.colors.empty() && state.blendedColors.size() == 1 && state.blendedColors[0].format == VK_FORMAT_R16_UINT && state.targetBlends[0] == ShaderRecompiler::ColorTargetBlend{true, 4u, 5u, 0u, 3u}, "an unclamped 8_8 UNORM blend did not use ordered shader blending");
+    queue.context[0x1e0] = 0x40010504u;
+    Require(DecodeState(queue).targetBlends[0] == state.targetBlends[0], "an unused separate-alpha field changed the two-channel blend");
     queue.context[0x31c] |= 0x10000u;
     state = DecodeState(queue);
     Require(!state.blends.at(0).blendEnable && state.blends.at(0).colorWriteMask != 0, "an unclamped UNORM target with BLEND_BYPASS was refused or blended");
+    for (const auto& [info, format, mask] : std::array<std::tuple<std::uint32_t, VkFormat, std::uint8_t>, 2>{{{0x4u, VK_FORMAT_R8_UINT, 1u}, {0x28u, VK_FORMAT_R32_UINT, 15u}}}) {
+        auto other = target(info);
+        other.context[0x1e0] = 0x40010504u;
+        const auto decoded = DecodeState(other);
+        Require(decoded.colors.empty() && decoded.blendedColors.size() == 1u && decoded.blendedColors[0].format == format && decoded.targetBlends[0] == ShaderRecompiler::ColorTargetBlend{true, 4u, 5u, 0u, mask}, "an unclamped byte-format blend did not use an integer storage image");
+    }
     queue = target(0x0000010cu);
     Require(DecodeState(queue).colors.at(0).format == VK_FORMAT_R8G8_SNORM, "an unclamped SNORM target that does not blend was refused");
     queue.context[0x1e0] = blending;
@@ -10720,7 +10729,7 @@ void float11_11_10TargetTests() {
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &packed, 0}}};
     Require(AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false) == std::set<std::uint32_t>{0u}, "the packed float export did not reach attachment 0");
     auto invalid = request;
-    invalid.context.pixel->targetExportPacking[0] = static_cast<ColorExportPacking>(4);
+    invalid.context.pixel->targetExportPacking[0] = static_cast<ColorExportPacking>(static_cast<std::uint8_t>(ColorExportPacking::UnclampedUnorm8_8_8_8) + 1u);
     expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(invalid)); }, "invalid prepared fragment export packing");
 }
 
@@ -12306,6 +12315,11 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--unclamped-normalized-color") {
+            UnclampedNormalizedColorTests();
+            BlendBypassTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {
             descriptorCacheTests();
             return 0;

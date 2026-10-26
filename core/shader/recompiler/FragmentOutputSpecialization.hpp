@@ -3,6 +3,8 @@
 
 #include "PipelineSpecialization.hpp"
 #include "Recompiler.hpp"
+#include "RuntimeAbi.hpp"
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <initializer_list>
@@ -17,6 +19,90 @@
 #include <spirv/unified1/spirv.hpp>
 
 namespace ShaderRecompiler {
+
+inline std::vector<std::uint32_t> SpecializeBlendedTargetImages(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants) {
+    std::map<std::uint32_t, spv::ImageFormat> targets;
+    for (const auto& constant : constants) {
+        if (constant.id < PipelineSpecialization::ExportBlendBase || constant.id >= PipelineSpecialization::ExportBlendBase + 8u || (constant.value & 1u) == 0u) continue;
+        const auto format = constant.value & 14u;
+        if (format != 0u && format != 2u && format != 4u && format != 8u) throw std::runtime_error("invalid unclamped blend format");
+        if (format == 2u || format == 4u) targets.emplace(constant.id - PipelineSpecialization::ExportBlendBase, format == 2u ? spv::ImageFormatR16ui : spv::ImageFormatR8ui);
+    }
+    if (targets.empty()) return words;
+    if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid blended image specialization module");
+    std::map<std::uint32_t, std::vector<std::uint32_t>> types;
+    std::map<std::uint32_t, std::uint32_t> sets, bindings, variables;
+    bool extended = false;
+    for (std::size_t at = 5; at < words.size();) {
+        const auto count = words[at] >> 16u;
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        if (count == 0u || count > words.size() - at) throw std::runtime_error("truncated blended image specialization instruction");
+        if (op == spv::OpCapability && count == 2u && words[at + 1u] == spv::CapabilityStorageImageExtendedFormats) extended = true;
+        if ((op == spv::OpTypeImage || op == spv::OpTypePointer) && count >= 3u) types.emplace(words[at + 1u], std::vector<std::uint32_t>(words.begin() + at, words.begin() + at + count));
+        if (op == spv::OpVariable && count >= 4u && words[at + 3u] == spv::StorageClassUniformConstant) variables.emplace(words[at + 2u], words[at + 1u]);
+        if (op == spv::OpDecorate && count == 4u) {
+            if (words[at + 2u] == spv::DecorationDescriptorSet) sets.emplace(words[at + 1u], words[at + 3u]);
+            if (words[at + 2u] == spv::DecorationBinding) bindings.emplace(words[at + 1u], words[at + 3u]);
+        }
+        at += count;
+    }
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> replacements;
+    auto bound = words[3];
+    const auto internType = [&](std::vector<std::uint32_t> declaration) {
+        for (const auto& [id, existing] : types) {
+            if (existing.size() == declaration.size() && existing[0] == declaration[0] && std::equal(existing.begin() + 2u, existing.end(), declaration.begin() + 2u)) return id;
+        }
+        if (bound == std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("blended image specialization ID overflow");
+        const auto id = bound++;
+        declaration[1] = id;
+        types.emplace(id, std::move(declaration));
+        return id;
+    };
+    for (const auto& [variable, pointer] : variables) {
+        if (!sets.contains(variable) || sets.at(variable) != RuntimeAbi::BlendedTargetDescriptorSet || !bindings.contains(variable) || !targets.contains(bindings.at(variable))) continue;
+        const auto& oldPointer = types.at(pointer);
+        if (oldPointer.size() != 4u) throw std::runtime_error("invalid blended image pointer type");
+        auto image = types.at(oldPointer[3]);
+        if (image.size() != 9u || image[8] != spv::ImageFormatR32ui) throw std::runtime_error("a blended byte-format target has no R32ui image to specialize");
+        image[8] = targets.at(bindings.at(variable));
+        const auto imageId = internType(std::move(image));
+        const auto pointerId = internType({(4u << 16u) | spv::OpTypePointer, 0u, spv::StorageClassUniformConstant, imageId});
+        replacements.emplace(variable, std::make_pair(pointerId, imageId));
+    }
+    if (replacements.empty()) return words;
+    std::vector<std::uint32_t> result(words.begin(), words.begin() + 5);
+    std::set<std::uint32_t> emittedTypes;
+    const auto emitType = [&](auto&& self, std::uint32_t id) -> void {
+        if (!types.contains(id) || emittedTypes.contains(id)) return;
+        const auto& declaration = types.at(id);
+        self(self, declaration[(declaration[0] & 0xffffu) == spv::OpTypePointer ? 3u : 2u]);
+        result.insert(result.end(), declaration.begin(), declaration.end());
+        emittedTypes.insert(id);
+    };
+    bool capability = extended;
+    for (std::size_t at = 5; at < words.size();) {
+        const auto count = words[at] >> 16u;
+        const auto op = static_cast<spv::Op>(words[at] & 0xffffu);
+        if (!capability && op != spv::OpCapability) {
+            result.insert(result.end(), {(2u << 16u) | spv::OpCapability, spv::CapabilityStorageImageExtendedFormats});
+            capability = true;
+        }
+        if (op == spv::OpTypeImage || op == spv::OpTypePointer) {
+            emitType(emitType, words[at + 1u]);
+        } else if (op == spv::OpVariable && count >= 4u && replacements.contains(words[at + 2u])) {
+            const auto variable = words[at + 2u];
+            emitType(emitType, replacements.at(variable).first);
+            result.insert(result.end(), words.begin() + at, words.begin() + at + count);
+            result[result.size() - count + 1u] = replacements.at(variable).first;
+        } else {
+            result.insert(result.end(), words.begin() + at, words.begin() + at + count);
+            if (op == spv::OpLoad && count >= 4u && replacements.contains(words[at + 3u])) result[result.size() - count + 1u] = replacements.at(words[at + 3u]).second;
+        }
+        at += count;
+    }
+    result[3] = bound;
+    return result;
+}
 
 inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uint32_t> words, std::span<const PipelineSpecializationConstant> constants, const std::set<std::uint32_t>& specializedIds) {
     namespace Code = ReversedBlendCode;
@@ -39,7 +125,7 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
             reversed = constant.value;
         }
         if (constant.id < PipelineSpecialization::ExportPackingBase || constant.id >= PipelineSpecialization::ExportPackingBase + 8u) continue;
-        if (constant.value > static_cast<std::uint32_t>(ColorExportPacking::Unorm4_4_4_4)) throw std::runtime_error("invalid prepared fragment export packing");
+        if (constant.value > static_cast<std::uint32_t>(ColorExportPacking::UnclampedUnorm8_8_8_8)) throw std::runtime_error("invalid prepared fragment export packing");
         if (constant.value != static_cast<std::uint32_t>(ColorExportPacking::None)) packed.insert(constant.id - PipelineSpecialization::ExportPackingBase);
     }
     if (packed.empty() && blendTargets.empty() && !dualSource && reversed == 0u) return words;
@@ -334,7 +420,7 @@ inline std::vector<std::uint32_t> SpecializeFragmentOutputs(std::vector<std::uin
     if (!inserted) throw std::runtime_error("fragment output specialization module has no function");
     if (interlock && !begun) throw std::runtime_error("fragment output specialization found no entry block for the pixel interlock");
     result[3] = bound;
-    return result;
+    return SpecializeBlendedTargetImages(std::move(result), constants);
 }
 
 }
