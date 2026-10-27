@@ -80,21 +80,29 @@ PipelineCreationGate::Ticket PipelineCreationGate::Admit(std::size_t words, bool
     if (settings.budgetBytes == 0) return {};
     const auto bytes = EstimateBytes(words);
     std::unique_lock lock(mutex);
-    if (!fits(bytes)) {
-        if (mayWait && bytes > settings.smallBytes) {
-            const auto start = std::chrono::steady_clock::now();
-            ++stats.waited;
-            while (!fits(bytes)) released.wait_for(lock, std::chrono::milliseconds(250));
-            stats.waitNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-        } else {
-            ++stats.unwaited;
+    const bool fitsNow = fits(bytes);
+    if (mayWait && bytes > settings.smallBytes && (!waiters.empty() || !fitsNow)) {
+        const auto waiter = waiters.emplace(waiters.end());
+        const auto start = std::chrono::steady_clock::now();
+        ++stats.waited;
+        try {
+            while (waiter != waiters.begin() || !fits(bytes)) released.wait_for(lock, std::chrono::milliseconds(250));
+        } catch (...) {
+            waiters.erase(waiter);
+            released.notify_all();
+            throw;
         }
+        waiters.erase(waiter);
+        stats.waitNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    } else if (!fitsNow) {
+        ++stats.unwaited;
     }
     ++stats.admitted;
     ++stats.inFlight;
     stats.inFlightBytes += bytes;
     stats.peakInFlight = std::max(stats.peakInFlight, stats.inFlight);
     stats.peakBytes = std::max(stats.peakBytes, stats.inFlightBytes);
+    if (!waiters.empty()) released.notify_all();
     return Ticket(this, bytes);
 }
 

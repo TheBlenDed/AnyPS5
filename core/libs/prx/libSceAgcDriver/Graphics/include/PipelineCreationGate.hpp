@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <mutex>
 
 namespace AgcDriver::Graphics {
@@ -79,6 +80,7 @@ private:
     Settings settings;
     mutable std::mutex mutex;
     std::condition_variable released;
+    std::list<std::uint8_t> waiters;
     Stats stats;
 };
 
