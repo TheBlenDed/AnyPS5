@@ -400,6 +400,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
     std::uint64_t memoBytes = 0;
     std::unique_ptr<ResultMemoTable> memoTable;
+    std::size_t memoTableEntries = 0;
     std::uint64_t memoClock = 0;
 };
 
@@ -1986,8 +1987,31 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 }
             }
             if (!present) {
-                if (victim->result != nullptr) counters.evictions.fetch_add(1, std::memory_order_relaxed);
-                *victim = {variant->artifact.variantId, hash, shared, 0, ++source.memoClock};
+                const auto drop = [&](ResultMemoEntry& entry) {
+                    source.memoBytes -= entry.bytes;
+                    --source.memoTableEntries;
+                    counters.liveEntries.fetch_sub(1, std::memory_order_relaxed);
+                    counters.liveBytes.fetch_sub(entry.bytes, std::memory_order_relaxed);
+                    counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                    counters.totalEvictions.fetch_add(1, std::memory_order_relaxed);
+                    counters.evictedBytes.fetch_add(entry.bytes, std::memory_order_relaxed);
+                    entry = {};
+                };
+                const auto bytes = ResultHeapBytes(*shared);
+                if (victim->result != nullptr) drop(*victim);
+                *victim = {variant->artifact.variantId, hash, shared, bytes, ++source.memoClock};
+                source.memoBytes += bytes;
+                ++source.memoTableEntries;
+                counters.liveEntries.fetch_add(1, std::memory_order_relaxed);
+                counters.liveBytes.fetch_add(bytes, std::memory_order_relaxed);
+                const auto budget = resultMemoSourceBytes().load(std::memory_order_relaxed);
+                while (source.memoTableEntries > 1u && source.memoBytes > budget) {
+                    ResultMemoEntry* oldest = nullptr;
+                    for (auto& entry : *source.memoTable) {
+                        if (entry.result != nullptr && (oldest == nullptr || entry.used < oldest->used)) oldest = &entry;
+                    }
+                    drop(*oldest);
+                }
             }
             reportResultMemo();
             return shared;

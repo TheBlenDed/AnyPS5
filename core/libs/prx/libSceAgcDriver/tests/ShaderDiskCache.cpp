@@ -1860,12 +1860,16 @@ void verifyResultMemoBudget() {
     };
     const auto budget = ResultMemoSourceBytes();
     const auto first = materialize(0x10000000u);
+    const auto retained = ResultMemoTotals();
+    require(retained.entries != 0u && retained.bytes >= ResultHeapBytes(*first), "the result memo did not account for a retained result's bytes");
     require(materialize(0x10000000u) == first, "the result memo did not reuse a result within its budget");
     const auto before = ResultMemoTotals();
+    require(before.entries == retained.entries && before.bytes == retained.bytes, "a result memo hit changed its retained byte accounting");
     SetResultMemoSourceBytes(1u);
     const auto second = materialize(0x10010000u);
     const auto after = ResultMemoTotals();
     require(after.evictions == before.evictions + 1u && after.evictedBytes - before.evictedBytes == ResultHeapBytes(*first) && after.entries == before.entries, "a source over its result memo budget did not evict exactly its older result");
+    require(after.bytes + ResultHeapBytes(*first) == before.bytes + ResultHeapBytes(*second), "a result memo eviction did not replace the retained result's byte accounting");
     const auto again = materialize(0x10000000u);
     require(again != first, "an evicted result was still served from the memo");
     requireSameResult(*first, *again, "a result rematerialized after its memo eviction");
@@ -1877,6 +1881,63 @@ void verifyResultMemoBudget() {
     catch (const std::invalid_argument&) { refused = true; }
     require(refused && ResultMemoSourceBytes() == budget, "a zero result memo budget was accepted");
     std::cout << "result memo: per-source byte budget evicts older results, rematerializes them exactly and keeps the newest\n";
+}
+
+void verifyResultMemoTablePressure() {
+    constexpr std::uint32_t Inputs = 257;
+    constexpr std::uint32_t FirstAddress = 0x10000000u;
+    constexpr std::uint32_t AddressStep = 0x10000u;
+    const auto originalBudget = ResultMemoSourceBytes();
+    SetResultMemoSourceBytes(1ull << 30u);
+    ComputeRequest request(true);
+    const auto handle = PrepareShader(request.request);
+    const auto materialize = [&](std::uint32_t address) {
+        request.userData[0] = address;
+        SrtRuntime runtime{};
+        runtime.userData = request.userData;
+        return MaterializeShader(request.request, *CaptureResources(request.request, runtime, *handle), *handle);
+    };
+    const auto initial = ResultMemoTotals();
+    require(initial.entries == 0u && initial.bytes == 0u, "result memo table pressure requires a fresh process");
+    std::vector<std::shared_ptr<const RecompileResult>> results;
+    results.reserve(Inputs);
+    std::uint64_t bytes = 0;
+    for (std::uint32_t index = 0; index < Inputs; ++index) {
+        const auto result = materialize(FirstAddress + index * AddressStep);
+        if (index == 0) bytes = ResultHeapBytes(*result);
+        require(ResultHeapBytes(*result) == bytes, "result memo table pressure: the fixtures have different result sizes");
+        if (index != 0) require(!sameBindings(results.back()->bindings, result->bindings) || results.back()->pushConstants != result->pushConstants, "result memo table pressure: changing the buffer address returned stale runtime data");
+        results.push_back(result);
+        const auto now = ResultMemoTotals();
+        require(now.entries >= initial.entries && now.evictions >= initial.evictions && now.bytes >= initial.bytes && now.evictedBytes >= initial.evictedBytes, "result memo table pressure: an accounting counter wrapped");
+        const auto entries = now.entries - initial.entries;
+        const auto evictions = now.evictions - initial.evictions;
+        require(entries <= 256u && evictions <= index + 1u && entries + evictions == index + 1u, "result memo table pressure: full-set replacement counted entries or evictions incorrectly");
+        require(now.bytes - initial.bytes == entries * bytes, "result memo table pressure: retained bytes disagree with retained entries");
+        require(now.evictedBytes - initial.evictedBytes == evictions * bytes, "result memo table pressure: evicted bytes disagree with evicted entries");
+    }
+    const auto filled = ResultMemoTotals();
+    require(filled.evictions > initial.evictions && filled.entries > 1u, "result memo table pressure: the fixtures did not replace an occupied way and retain multiple entries");
+    SetResultMemoSourceBytes(1u);
+    constexpr std::uint32_t NewestAddress = 0x20000000u;
+    const auto newest = materialize(NewestAddress);
+    const auto trimmed = ResultMemoTotals();
+    require(ResultHeapBytes(*newest) == bytes && trimmed.entries == 1u && trimmed.bytes == bytes, "result memo table pressure: the byte budget did not retain exactly one newest result");
+    require(trimmed.evictions - filled.evictions == filled.entries && trimmed.evictedBytes - filled.evictedBytes == filled.entries * bytes, "result memo table pressure: trimming multiple entries counted evictions incorrectly");
+    require(materialize(NewestAddress) == newest, "result memo table pressure: trimming evicted the newest result");
+    const auto repeated = ResultMemoTotals();
+    require(repeated.entries == trimmed.entries && repeated.bytes == trimmed.bytes && repeated.evictions == trimmed.evictions && repeated.evictedBytes == trimmed.evictedBytes, "result memo table pressure: a hit changed the byte or eviction counters");
+    const auto restored = materialize(FirstAddress + (Inputs - 1u) * AddressStep);
+    require(restored != results.back(), "result memo table pressure: trimming still served an older memo entry");
+    requireSameResult(*results.back(), *restored, "result memo table pressure: rematerialized older result");
+    require(materialize(FirstAddress + (Inputs - 1u) * AddressStep) == restored, "result memo table pressure: the rematerialized result was not retained");
+    const auto newestAgain = materialize(NewestAddress);
+    require(newestAgain != newest, "result memo table pressure: a replaced newest entry was still served from the memo");
+    requireSameResult(*newest, *newestAgain, "result memo table pressure: rematerialized newest result");
+    const auto final = ResultMemoTotals();
+    require(final.entries == 1u && final.bytes == bytes && final.evictions == trimmed.evictions + 2u && final.evictedBytes == trimmed.evictedBytes + 2u * bytes, "result memo table pressure: repeated replacement did not preserve one entry's accounting");
+    SetResultMemoSourceBytes(originalBudget);
+    std::cout << "result memo table pressure: occupied-way replacement, multi-entry trimming and newest-result retention preserve byte accounting\n";
 }
 
 void verifyBufferAlignmentSpecialization() {
@@ -3288,6 +3349,19 @@ void verifyDefaultDirectory(const char* self) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-table-pressure") {
+            setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
+            setEnvironment("APS5_RESULT_MEMO_TABLE", "1");
+            require(std::getenv("APS5_NO_RESULT_MEMO") == nullptr, "the result memo table pressure test requires the result memo to be enabled");
+            verifyResultMemoTablePressure();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget") {
+            setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
+            require(std::getenv("APS5_NO_RESULT_MEMO") == nullptr, "the result memo budget test requires the result memo to be enabled");
+            verifyResultMemoBudget();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--housekeeping-safety") {
             const auto directory = ShaderDiskCache::EntryDirectory();
             require(!directory.empty(), "the housekeeping fixture cache is disabled");
