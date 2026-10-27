@@ -13,6 +13,9 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <optional>
+#include <set>
+#include <unordered_map>
 #include <memory>
 #include <vector>
 #include <stdexcept>
@@ -226,15 +229,12 @@ public:
 
     bool HandleWrite(std::uintptr_t address) {
         std::lock_guard lock(mutex);
-        const auto block = address & ~std::uintptr_t{ownedBlockBytes - 1};
-        const bool owned = ownedLive != 0 && address < ownedAddressLimit && (ownedWord(block) & 1u) != 0;
-        if (owned) disownBlock(block, true);
+        if (ownedLive != 0 && address < ownedAddressLimit && (ownedWord(address & ~std::uintptr_t{ownedBlockBytes - 1}) & 1u) != 0) ownedFaults.fetch_add(1, std::memory_order_relaxed);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
-        if (found == views.end() || !writable(found->second.protection)) return owned;
+        if (found == views.end() || !writable(found->second.protection)) return false;
         auto& view = found->second;
         const auto written = subpagesOf(base, address, address + 1);
-        if (owned && (view.armed & written) == 0) return true;
         if (view.resident) {
             const auto memory = query(address);
             return memory.State == MEM_COMMIT && writable(memory.Protect & 0xffu);
@@ -382,32 +382,10 @@ public:
         return true;
     }
 
-    // Owned blocks (the driver's owned proofs, APS5_NO_OWNED_PROOFS): 64 KiB blocks of guest memory
-    // write-protected so that every CPU change is counted when it happens. Each block has a word: bit 0
-    // is set while the block is armed, the rest counts the times it was disarmed. The word moves before
-    // the protection is lifted, so a CPU store can only land after it: on the store's own fault
-    // (HandleWrite, the store retried after it), and before every operation here that changes the
-    // block's mapping or protection or opens it to a host call (Commit, Reset, Map, SetProtection, Pin,
-    // BeginHostWrite and import, a resident run's demotion, eviction or resumed write tracking). So
-    // while OwnedUnchanged holds for the words ArmOwned returned, no CPU store reached the block after
-    // ArmOwned. GPU writes through a host import bypass the page tables and are not seen here.
-    // A block's pages may be resident direct memory with a single guest view, private commits (the
-    // guest's flexible and memory-pool memory; with OwnedPrivate, their own protection kept per 4 KiB
-    // page), read-write or read-only, and reserved placeholders (committing them goes through Commit
-    // or Map).
-    // A private page is written by an OS call only inside BeginHostWrite (the HostWrite contract every
-    // host writer of guest memory follows, as the macOS write watch, which protects every guest page,
-    // requires), so an OS call can never store into an armed page unseen: it is opened first, or it
-    // fails. Refused, arming nothing (OwnedRefusal, counted): shared or aliased views, pinned pages
-    // (guest stacks, which host code runs on) and imports being made, open host writes, inaccessible,
-    // guarded or write-copy pages or other mapping types, and any block while a guest
-    // protection change is in flight (between SetProtection and EndSetProtection the guest's own
-    // VirtualProtect may still land). Subpages whose write tracking Collect armed are read-only already
-    // and stay that mechanism's (see ownable).
     static constexpr std::size_t ownedBlockBytes = 0x10000;
     static constexpr unsigned OwnedPrivate = 1;
 
-    enum class OwnedRefusal : std::uint8_t { None, Outside, Shared, Pinned, HostWrite, InFlight, NotWritable, Private, Empty, Count };
+    enum class OwnedRefusal : std::uint8_t { None, Outside, Shared, Pinned, HostWrite, InFlight, NotWritable, Private, Empty, Unwatched, Count };
     static constexpr std::size_t OwnedRefusalCount = static_cast<std::size_t>(OwnedRefusal::Count);
 
     struct OwnedCounts {
@@ -419,12 +397,14 @@ public:
         std::uint64_t privateBlocks = 0;
         std::uint64_t unmappedBlocks = 0;
         std::uint64_t partialBlocks = 0;
+        std::uint64_t collected = 0;
+        std::uint64_t taken = 0;
+        std::uint64_t queries = 0;
+        std::uint64_t dirty = 0;
+        std::uint64_t locked = 0;
         std::array<std::uint64_t, OwnedRefusalCount> reasons{};
     };
 
-    // Arms every 64 KiB block overlapping [address, address + bytes) (count must be their number) and
-    // stores each block's armed word, or arms none and returns false when one cannot be armed. Blocks
-    // already armed keep their protection and word.
     bool ArmOwned(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags = 0) {
         if (bytes == 0 || bytes > ownedAddressLimit || address > ownedAddressLimit - bytes) return false;
         const auto first = address & ~std::uintptr_t{ownedBlockBytes - 1};
@@ -433,15 +413,27 @@ public:
         std::lock_guard lock(mutex);
         if (protectionsInFlight != 0) return NoteOwnedRefusal(OwnedRefusal::InFlight);
         std::vector<std::pair<std::uintptr_t, OwnedPlan>> plans;
+        std::vector<OwnedRun> runs;
         for (auto block = first; block < stop; block += ownedBlockBytes) {
-            if ((ownedWord(block) & 1u) != 0) continue;
+            if ((ownedWord(block) & 1u) != 0) {
+                if (!blockWritten(block)) continue;
+                disownBlock(block, ownedCollected);
+            }
             OwnedPlan plan;
             if (const auto refusal = ownable(block, (flags & OwnedPrivate) != 0, plan); refusal != OwnedRefusal::None) return NoteOwnedRefusal(refusal);
+            appendRuns(runs, block, plan.layout, block, block + ownedBlockBytes);
             plans.emplace_back(block, plan);
         }
+        for (const auto& run : runs) {
+            if (!queryWatch(run.begin, run.end).has_value()) return NoteOwnedRefusal(OwnedRefusal::Unwatched);
+        }
+        for (const auto& run : runs) takeWrites(run.begin, run.end);
         for (const auto& [block, plan] : plans) {
             auto& slot = ownedSlot(block);
-            if (!protectOwned(block, plan)) return NoteOwnedRefusal(OwnedRefusal::NotWritable);
+            {
+                std::lock_guard layouts(ownedMutex);
+                ownedLayouts[block] = plan.layout;
+            }
             slot.store(slot.load(std::memory_order_relaxed) + 1, std::memory_order_seq_cst);
             ++ownedLive;
             ownedArmedBlocks.fetch_add(1, std::memory_order_relaxed);
@@ -461,26 +453,27 @@ public:
         return false;
     }
 
-    // Whether every block of the range is still armed with the word ArmOwned stored for it. No lock:
-    // a word is read with one load per block.
-    bool OwnedUnchanged(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) const {
+    bool OwnedUnchanged(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
         if (bytes == 0 || bytes > ownedAddressLimit || address > ownedAddressLimit - bytes) return false;
         const auto first = address & ~std::uintptr_t{ownedBlockBytes - 1};
         const auto stop = (address + bytes + ownedBlockBytes - 1) & ~std::uintptr_t{ownedBlockBytes - 1};
         if ((stop - first) / ownedBlockBytes != count) return false;
-        std::size_t index = 0;
-        for (auto block = first; block < stop; block += ownedBlockBytes, ++index) {
-            const auto* leaf = ownedLeaves[block >> ownedLeafShift].load(std::memory_order_acquire);
-            if (leaf == nullptr) return false;
-            const auto word = leaf[(block / ownedBlockBytes) & (ownedLeafBlocks - 1)].load(std::memory_order_seq_cst);
-            if ((word & 1u) == 0 || word != words[index]) return false;
+        const auto before = ownedResets.load(std::memory_order_seq_cst);
+        if (!wordsHold(first, stop, words)) return false;
+        if ((before & 1u) == 0) {
+            const auto answer = ownedQuery(address, bytes, first, stop, words);
+            if (answer == OwnedAnswer::Written || answer == OwnedAnswer::Moved) return false;
+            if (answer == OwnedAnswer::Holds && ownedResets.load(std::memory_order_seq_cst) == before) return true;
         }
-        return true;
+        ownedLocked.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(mutex);
+        return ownedQuery(address, bytes, first, stop, words) == OwnedAnswer::Holds;
     }
 
     OwnedCounts TakeOwnedCounts() {
-        OwnedCounts counts{ownedArms.exchange(0, std::memory_order_relaxed), ownedArmedBlocks.exchange(0, std::memory_order_relaxed), ownedRefused.exchange(0, std::memory_order_relaxed), ownedFaults.exchange(0, std::memory_order_relaxed), ownedDisowned.exchange(0, std::memory_order_relaxed), ownedPrivateBlocks.exchange(0, std::memory_order_relaxed), ownedUnmappedBlocks.exchange(0, std::memory_order_relaxed), ownedPartialBlocks.exchange(0, std::memory_order_relaxed), {}};
-        for (std::size_t i = 0; i < OwnedRefusalCount; ++i) counts.reasons[i] = ownedReasons[i].exchange(0, std::memory_order_relaxed);
+        const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+        OwnedCounts counts{take(ownedArms), take(ownedArmedBlocks), take(ownedRefused), take(ownedFaults), take(ownedDisowned), take(ownedPrivateBlocks), take(ownedUnmappedBlocks), take(ownedPartialBlocks), take(ownedCollected), take(ownedTaken), take(ownedQueries), take(ownedDirty), take(ownedLocked), {}};
+        for (std::size_t i = 0; i < OwnedRefusalCount; ++i) counts.reasons[i] = take(ownedReasons[i]);
         return counts;
     }
 
@@ -629,10 +622,12 @@ public:
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
                 if (capacity == *count) return true;
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
-                ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, touched);
+                const auto room = std::min<ULONG_PTR>(capacity - *count, touched);
+                ULONG_PTR available = room;
                 DWORD granularity = 0;
+                const ResetWindow window(ownedResets, clear);
                 if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
-                *count += available;
+                *count += watchTaken(pages + *count, available, room, cursor, stop, clear);
                 if (*count == capacity) return true;
                 cursor = stop;
             }
@@ -741,8 +736,6 @@ private:
         std::shared_ptr<Physical> slot;
         std::size_t viewBytes = pageBytes;
         std::uint32_t hostImports = 0;
-        // Write-protected as part of an owned block (ArmOwned); its `armed` subpages stay Collect's.
-        bool owned = false;
     };
     struct Run {
         std::uintptr_t end;
@@ -762,9 +755,12 @@ private:
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
         if (run.fresh == 0 && collection != Collection::Fresh) {
-            ULONG_PTR reported = (stop - first + 4095) / 4096;
+            const ULONG_PTR room = (stop - first + 4095) / 4096;
+            ULONG_PTR reported = room;
             DWORD granularity = 0;
+            const ResetWindow window(ownedResets, clear);
             if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
+            reported = watchTaken(pages + *count, reported, room, first, stop, clear);
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
             *count += reported;
             return;
@@ -774,13 +770,29 @@ private:
             std::vector<void*> found((stop - first + 4095) / 4096);
             ULONG_PTR reported = found.size();
             DWORD granularity = 0;
+            const ResetWindow window(ownedResets, clear);
             if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
+            reported = watchTaken(found.data(), reported, found.size(), first, stop, clear);
             for (ULONG_PTR index = 0; index < reported; ++index) written.push_back(reinterpret_cast<std::uintptr_t>(found[index]));
         }
         auto next = written.begin();
         std::uintptr_t resetFrom = 0;
         const auto flushReset = [&](std::uintptr_t to) {
-            if (resetFrom != 0 && ResetWriteWatch(reinterpret_cast<void*>(resetFrom), to - resetFrom) != 0) fail("reset resident guest writes");
+            if (resetFrom == 0) return;
+            if (ownedLive == 0) {
+                if (ResetWriteWatch(reinterpret_cast<void*>(resetFrom), to - resetFrom) != 0) fail("reset resident guest writes");
+                forgetPending(resetFrom, to);
+                resetFrom = 0;
+                return;
+            }
+            const ResetWindow window(ownedResets, true);
+            thread_local std::vector<void*> taken;
+            taken.resize((to - resetFrom + 4095) / 4096);
+            ULONG_PTR reported = taken.size();
+            DWORD granularity = 0;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(resetFrom), to - resetFrom, taken.data(), &reported, &granularity) != 0) fail("reset resident guest writes");
+            for (ULONG_PTR i = 0; i < reported; ++i) disownWritten(reinterpret_cast<std::uintptr_t>(taken[i]));
+            forgetPending(resetFrom, to);
             resetFrom = 0;
         };
         for (auto at = first; at < stop; at += 4096) {
@@ -829,18 +841,17 @@ private:
 
     static constexpr std::size_t ownedPagesPerBlock = ownedBlockBytes / subpageBytes;
 
-    // What arming a block protects: its views (owned), and its private pages with the protection
-    // each had (0 for a page that is not one), restored when the block is disarmed. `starts` marks
-    // the pages that begin a queried region: a protection call cannot span two allocations.
-    struct OwnedPages {
-        std::array<DWORD, ownedPagesPerBlock> protection{};
-        std::uint32_t starts = 0;
-    };
+    using OwnedLayout = std::array<std::uintptr_t, ownedPagesPerBlock>;
     struct OwnedPlan {
-        OwnedPages pages;
+        OwnedLayout layout{};
         bool privatePages = false;
         bool mapped = false;
         bool unmapped = false;
+    };
+    struct OwnedRun {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        std::uintptr_t allocation;
     };
 
     static bool overlapsRange(const std::multimap<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t begin, std::uintptr_t end) {
@@ -858,25 +869,160 @@ private:
         }
     }
 
-    // Every 16 KiB page a single resident view that may be write-protected, else 4 KiB pages that
-    // are private commits (with `allowPrivate`) or reserved placeholders. Views and pages may be
-    // read-write or read-only (with or without execute). Placeholders need no protection: the CPU
-    // cannot store into an unmapped page, and every path that makes one present (Commit, Map and so
-    // Reset's placeholder splits) disarms the block first, so a block of placeholders only, or the
-    // unmapped part of a mixed one, is proved by its word alone. Pinned ranges (guest stacks, whose
-    // pages libkernel commits itself at thread exit) are refused whatever their kind. Subpages Collect armed (`armed`, read-only already) stay that mechanism's: an
-    // owned block's disarm restores only the others, and a store into an armed one still goes on to
-    // resume the run's writes (HandleWrite).
+    static void appendRuns(std::vector<OwnedRun>& runs, std::uintptr_t block, const OwnedLayout& layout, std::uintptr_t from, std::uintptr_t to) {
+        for (std::size_t page = 0; page < ownedPagesPerBlock; ++page) {
+            const auto at = block + page * subpageBytes;
+            if (at < from || at >= to || layout[page] == 0) continue;
+            if (!runs.empty() && runs.back().end == at && runs.back().allocation == layout[page]) runs.back().end = at + subpageBytes;
+            else runs.push_back({at, at + subpageBytes, layout[page]});
+        }
+    }
+
+    static std::optional<bool> queryWatch(std::uintptr_t begin, std::uintptr_t end) {
+        ULONG_PTR reported = 1;
+        void* page = nullptr;
+        DWORD granularity = 0;
+        if (GetWriteWatch(0, reinterpret_cast<void*>(begin), end - begin, &page, &reported, &granularity) != 0) return std::nullopt;
+        return reported != 0;
+    }
+
+    void takeWrites(std::uintptr_t begin, std::uintptr_t end) {
+        std::array<void*, 256> found;
+        for (auto cursor = begin; cursor < end;) {
+            ULONG_PTR reported = found.size();
+            DWORD granularity = 0;
+            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(cursor), end - cursor, found.data(), &reported, &granularity) != 0) fail("take owned guest writes");
+            for (ULONG_PTR i = 0; i < reported; ++i) {
+                const auto page = reinterpret_cast<std::uintptr_t>(found[i]);
+                ownedPending.insert(page);
+                forgetClean(page, page + subpageBytes);
+            }
+            ownedTaken.fetch_add(reported, std::memory_order_relaxed);
+            if (reported < found.size()) break;
+            cursor = reinterpret_cast<std::uintptr_t>(found[reported - 1]) + subpageBytes;
+        }
+    }
+
+    std::size_t watchTaken(void** pages, std::size_t reported, std::size_t room, std::uintptr_t first, std::uintptr_t stop, bool clear) {
+        if (clear && ownedLive != 0) {
+            for (std::size_t i = 0; i < reported; ++i) disownWritten(reinterpret_cast<std::uintptr_t>(pages[i]));
+        }
+        if (ownedPending.empty()) return reported;
+        const auto low = ownedPending.lower_bound(first & ~std::uintptr_t{subpageBytes - 1});
+        const auto high = ownedPending.lower_bound(stop);
+        if (low == high) return reported;
+        thread_local std::vector<std::uintptr_t> merged;
+        merged.clear();
+        std::size_t index = 0;
+        for (auto it = low; index < reported || it != high;) {
+            const auto next = index < reported ? reinterpret_cast<std::uintptr_t>(pages[index]) : UINTPTR_MAX;
+            const auto held = it != high ? *it : UINTPTR_MAX;
+            merged.push_back(std::min(next, held));
+            if (next <= held) ++index;
+            if (held <= next) ++it;
+        }
+        const auto kept = std::min(room, merged.size());
+        if (clear) {
+            for (std::size_t k = 0; k < merged.size(); ++k) {
+                if (k < kept) ownedPending.erase(merged[k]);
+                else ownedPending.insert(merged[k]);
+            }
+        }
+        for (std::size_t k = 0; k < kept; ++k) pages[k] = reinterpret_cast<void*>(merged[k]);
+        return kept;
+    }
+
+    bool blockWritten(std::uintptr_t block) {
+        const auto found = ownedLayouts.find(block);
+        if (found == ownedLayouts.end()) return true;
+        thread_local std::vector<OwnedRun> runs;
+        runs.clear();
+        appendRuns(runs, block, found->second, block, block + ownedBlockBytes);
+        for (const auto& run : runs) {
+            const auto written = queryWatch(run.begin, run.end);
+            if (!written.has_value() || *written) return true;
+        }
+        return false;
+    }
+
+    void forgetPending(std::uintptr_t start, std::uintptr_t end) {
+        if (ownedPending.empty()) return;
+        ownedPending.erase(ownedPending.lower_bound(start), ownedPending.lower_bound(end));
+    }
+
+    enum class OwnedAnswer : std::uint8_t { Holds, Written, Moved, Unsure };
+
+    OwnedAnswer ownedQuery(std::uintptr_t address, std::size_t bytes, std::uintptr_t first, std::uintptr_t stop, const std::uint64_t* words) {
+        thread_local std::vector<OwnedRun> runs;
+        runs.clear();
+        const auto from = address & ~std::uintptr_t{subpageBytes - 1};
+        const auto to = (address + bytes + subpageBytes - 1) & ~std::uintptr_t{subpageBytes - 1};
+        {
+            std::lock_guard layouts(ownedMutex);
+            for (auto block = first; block < stop; block += ownedBlockBytes) {
+                const auto found = ownedLayouts.find(block);
+                if (found == ownedLayouts.end()) return OwnedAnswer::Moved;
+                appendRuns(runs, block, found->second, from, to);
+            }
+        }
+        for (const auto& run : runs) {
+            ownedQueries.fetch_add(1, std::memory_order_relaxed);
+            const auto written = queryWatch(run.begin, run.end);
+            if (!written.has_value()) return wordsHold(first, stop, words) ? OwnedAnswer::Unsure : OwnedAnswer::Moved;
+            if (*written) {
+                ownedDirty.fetch_add(1, std::memory_order_relaxed);
+                return OwnedAnswer::Written;
+            }
+        }
+        return wordsHold(first, stop, words) ? OwnedAnswer::Holds : OwnedAnswer::Moved;
+    }
+
+    struct ResetWindow {
+        std::atomic<std::uint64_t>& resets;
+        bool open;
+        ResetWindow(std::atomic<std::uint64_t>& resets, bool clear) : resets(resets), open(clear) {
+            if (open) resets.fetch_add(1, std::memory_order_seq_cst);
+        }
+        ~ResetWindow() {
+            if (open) resets.fetch_add(1, std::memory_order_seq_cst);
+        }
+        ResetWindow(const ResetWindow&) = delete;
+        ResetWindow& operator=(const ResetWindow&) = delete;
+    };
+
+    bool wordsHold(std::uintptr_t first, std::uintptr_t stop, const std::uint64_t* words) const {
+        std::size_t index = 0;
+        for (auto block = first; block < stop; block += ownedBlockBytes, ++index) {
+            const auto* leaf = ownedLeaves[block >> ownedLeafShift].load(std::memory_order_acquire);
+            if (leaf == nullptr) return false;
+            const auto word = leaf[(block / ownedBlockBytes) & (ownedLeafBlocks - 1)].load(std::memory_order_seq_cst);
+            if ((word & 1u) == 0 || word != words[index]) return false;
+        }
+        return true;
+    }
+
     OwnedRefusal ownable(std::uintptr_t block, bool allowPrivate, OwnedPlan& plan) {
         const auto end = block + ownedBlockBytes;
+        std::uintptr_t regionBegin = 0;
+        std::uintptr_t regionEnd = 0;
+        std::uintptr_t regionAllocation = 0;
         for (auto at = block; at < end; at += pageBytes) {
             const auto found = views.find(at);
             if (found != views.end()) {
                 const auto& view = found->second;
                 if (!view.resident || view.page->aliases.size() != 1 || view.viewBytes != pageBytes) return OwnedRefusal::Shared;
+                if (!watchResident) return OwnedRefusal::Unwatched;
                 if (!ownedReadable(view.protection)) return OwnedRefusal::NotWritable;
                 if (view.hostWrites != 0) return OwnedRefusal::HostWrite;
                 if (view.hostImports != 0 || view.page->pins != 0) return OwnedRefusal::Pinned;
+                if (at < regionBegin || at + pageBytes > regionEnd) {
+                    const auto memory = query(at);
+                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return OwnedRefusal::NotWritable;
+                    regionBegin = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+                    regionEnd = regionBegin + memory.RegionSize;
+                    regionAllocation = reinterpret_cast<std::uintptr_t>(memory.AllocationBase);
+                }
+                for (auto page = at; page < at + pageBytes; page += subpageBytes) plan.layout[(page - block) / subpageBytes] = regionAllocation;
                 plan.mapped = true;
                 continue;
             }
@@ -886,8 +1032,7 @@ private:
                 if (memory.State == MEM_COMMIT) {
                     if (memory.Type != MEM_PRIVATE || (memory.Protect & ~0xffu) != 0 || !ownedReadable(memory.Protect)) return OwnedRefusal::NotWritable;
                     if (!allowPrivate) return OwnedRefusal::Private;
-                    for (auto page = cursor; page < stop; page += subpageBytes) plan.pages.protection[(page - block) / subpageBytes] = memory.Protect;
-                    plan.pages.starts |= std::uint32_t{1} << ((cursor - block) / subpageBytes);
+                    for (auto page = cursor; page < stop; page += subpageBytes) plan.layout[(page - block) / subpageBytes] = reinterpret_cast<std::uintptr_t>(memory.AllocationBase);
                     plan.privatePages = true;
                     plan.mapped = true;
                 } else if (memory.State == MEM_RESERVE) {
@@ -903,62 +1048,11 @@ private:
         return OwnedRefusal::None;
     }
 
-    // Read-only pages (GPU-read-only guest memory maps to them) need no protection change: a CPU
-    // store cannot land before a guest protection change, which disarms the block first.
     static bool ownedReadable(DWORD protection) {
         return protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_READONLY || protection == PAGE_EXECUTE_READ;
     }
 
-    static DWORD readOnlyOf(DWORD protection) {
-        return protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_READ ? PAGE_EXECUTE_READ : PAGE_READONLY;
-    }
-
-    // Applies `protection(page)` to the block's private pages that have one, in runs of equal value.
-    template <typename Protection>
-    static bool protectPrivate(std::uintptr_t block, const OwnedPages& pages, Protection protection) {
-        for (std::size_t page = 0; page < ownedPagesPerBlock;) {
-            if (pages.protection[page] == 0) {
-                ++page;
-                continue;
-            }
-            auto stop = page + 1;
-            while (stop < ownedPagesPerBlock && pages.protection[stop] == pages.protection[page] && (pages.starts >> stop & 1u) == 0) ++stop;
-            DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(block + page * subpageBytes), (stop - page) * subpageBytes, protection(pages.protection[page]), &previous)) return false;
-            page = stop;
-        }
-        return true;
-    }
-
-    bool protectOwned(std::uintptr_t block, const OwnedPlan& plan) {
-        std::vector<std::uintptr_t> done;
-        const auto undo = [&] {
-            for (const auto page : done) {
-                auto& view = views.at(page);
-                view.owned = false;
-                protectSubpages(page, static_cast<std::uint8_t>(allSubpages & ~view.armed), view.protection, "undo arming owned guest memory", view.viewBytes);
-            }
-            protectPrivate(block, plan.pages, [](DWORD protection) { return protection; });
-            return false;
-        };
-        for (auto at = block; at < block + ownedBlockBytes; at += pageBytes) {
-            const auto found = views.find(at);
-            if (found == views.end()) continue;
-            DWORD previous;
-            if (!VirtualProtect(reinterpret_cast<void*>(at), pageBytes, readOnlyOf(found->second.protection), &previous)) return undo();
-            found->second.owned = true;
-            done.push_back(at);
-        }
-        if (plan.privatePages) {
-            if (!protectPrivate(block, plan.pages, readOnlyOf)) return undo();
-            ownedPrivatePages[block] = plan.pages;
-        }
-        return true;
-    }
-
-    // Disarms an armed block: its word moves first, then its views and private pages get their own
-    // protection back.
-    void disownBlock(std::uintptr_t block, bool fault) {
+    void disownBlock(std::uintptr_t block, std::atomic<std::uint64_t>& reason) {
         auto* leaf = ownedLeaves[block >> ownedLeafShift].load(std::memory_order_relaxed);
         if (leaf == nullptr) return;
         auto& slot = leaf[(block / ownedBlockBytes) & (ownedLeafBlocks - 1)];
@@ -966,22 +1060,16 @@ private:
         if ((word & 1u) == 0) return;
         slot.store(word + 1, std::memory_order_seq_cst);
         --ownedLive;
-        (fault ? ownedFaults : ownedDisowned).fetch_add(1, std::memory_order_relaxed);
-        for (auto at = block; at < block + ownedBlockBytes; at += pageBytes) {
-            const auto found = views.find(at);
-            if (found == views.end() || !found->second.owned) continue;
-            auto& view = found->second;
-            view.owned = false;
-            protectSubpages(at, static_cast<std::uint8_t>(allSubpages & ~view.armed), view.protection, "disarm owned guest memory", view.viewBytes);
-        }
-        if (const auto found = ownedPrivatePages.find(block); found != ownedPrivatePages.end()) {
-            const auto pages = found->second;
-            ownedPrivatePages.erase(found);
-            if (!protectPrivate(block, pages, [](DWORD protection) { return protection; })) fail("disarm owned private guest memory");
-        }
+        reason.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard layouts(ownedMutex);
+        ownedLayouts.erase(block);
     }
 
-    void disownRange(std::uintptr_t start, std::uintptr_t end) {
+    void disownWritten(std::uintptr_t page) {
+        if (page < ownedAddressLimit) disownBlock(page & ~std::uintptr_t{ownedBlockBytes - 1}, ownedCollected);
+    }
+
+    void disownRange(std::uintptr_t start, std::uintptr_t end, std::atomic<std::uint64_t>* reason = nullptr) {
         if (ownedLive == 0 || end <= start) return;
         end = std::min(end, ownedAddressLimit);
         for (auto block = start & ~std::uintptr_t{ownedBlockBytes - 1}; block < end && ownedLive != 0;) {
@@ -989,7 +1077,7 @@ private:
                 block = ((block >> ownedLeafShift) + 1) << ownedLeafShift;
                 continue;
             }
-            disownBlock(block, false);
+            disownBlock(block, reason != nullptr ? *reason : ownedDisowned);
             block += ownedBlockBytes;
         }
     }
@@ -1049,6 +1137,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         disownRange(start, stop);
+        forgetPending(start, stop);
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
         const auto section = views.at(start).section;
@@ -1085,6 +1174,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         disownRange(start, stop);
+        forgetPending(start, stop);
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("open resident guest pages");
         std::shared_ptr<Saved> saved;
@@ -1244,6 +1334,7 @@ private:
         collectableRanges.clear();
         const auto end = address + bytes;
         disownRange(address, end);
+        forgetPending(address, end);
         forgetClean(address, end);
         breakRun(address);
         breakRun(end);
@@ -1369,7 +1460,15 @@ private:
     std::atomic<std::uint64_t> ownedUnmappedBlocks{0};
     std::atomic<std::uint64_t> ownedPartialBlocks{0};
     std::array<std::atomic<std::uint64_t>, OwnedRefusalCount> ownedReasons{};
-    std::map<std::uintptr_t, OwnedPages> ownedPrivatePages;
+    std::atomic<std::uint64_t> ownedCollected{0};
+    std::atomic<std::uint64_t> ownedTaken{0};
+    std::atomic<std::uint64_t> ownedQueries{0};
+    std::atomic<std::uint64_t> ownedDirty{0};
+    std::unordered_map<std::uintptr_t, OwnedLayout> ownedLayouts;
+    std::mutex ownedMutex;
+    std::atomic<std::uint64_t> ownedResets{0};
+    std::atomic<std::uint64_t> ownedLocked{0};
+    std::set<std::uintptr_t> ownedPending;
     std::multimap<std::uintptr_t, std::uintptr_t> pinnedRanges;
     std::multimap<std::uintptr_t, std::uintptr_t> hostAccess;
 #ifdef APS5_COUNT_MAPPING_QUERIES

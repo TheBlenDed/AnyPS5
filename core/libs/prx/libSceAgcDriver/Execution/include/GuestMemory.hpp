@@ -89,26 +89,9 @@ bool UntrackedLayoutWalks();
 std::uint64_t WalkUntrackedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t previous, std::span<std::uint8_t> stale, UntrackedBlocks* kinds = nullptr, const Commitment* before = nullptr, Commitment* now = nullptr);
 bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected, std::uint64_t generation, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* before, std::span<const std::uint8_t> pending, BlockMatch* match = nullptr);
 
-// Owned blocks (the owned proofs of untracked snapshots, APS5_NO_OWNED_PROOFS; Windows only, see
-// GuestArena::GuestArenaArmOwned_nid_no_patch): the 64 KiB blocks of a range (one word per
-// HashBlockCount block) are write-protected, so the first CPU store into one moves its word before
-// the store lands, as does every mapping or protection change and every host write opened over it.
-// ArmOwnedBlocks arms them all or none. A walk made after it that proves the range current at a
-// tracker generation `since` (WalkUntrackedBlocks, then the compare) stays valid while
-// OwnedProofHolds: every word unchanged (no CPU store since the arming) and no tracker stamp
-// (MarkWritten, a collect, a host-region store) or untracked hint newer than `since` over the range,
-// which is what the walk checks for the driver's and the GPU's writes. Recorded GPU writes not yet
-// stamped are the caller's to check (the write notes, as for the walk).
-// `allowPrivate`: private commits (flexible and memory-pool memory) may be armed too.
 bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words, bool allowPrivate = true);
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
-bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since);
-// Arms (all blocks armed), blocks newly armed (of them with private pages, with nothing mapped, partly
-// mapped: placeholders are proved by the word alone, see WindowsMappings::ownable), arms refused
-// (by reason: outside the arena or a host region, shared or aliased view, pinned or importing, host
-// write open, protection change in flight, not writable or another mapping type, private while not
-// allowed, nothing mapped), blocks disarmed by a CPU store, blocks disarmed by a mapping, protection
-// or host-write change, since the last call.
+bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since, bool wordsHeld = false);
 struct OwnedBlockCounts {
     std::uint64_t arms = 0;
     std::uint64_t armedBlocks = 0;
@@ -118,7 +101,12 @@ struct OwnedBlockCounts {
     std::uint64_t privateBlocks = 0;
     std::uint64_t unmappedBlocks = 0;
     std::uint64_t partialBlocks = 0;
-    std::array<std::uint64_t, 8> refusedBy{};
+    std::uint64_t collected = 0;
+    std::uint64_t taken = 0;
+    std::uint64_t queries = 0;
+    std::uint64_t dirty = 0;
+    std::uint64_t locked = 0;
+    std::array<std::uint64_t, 9> refusedBy{};
 };
 OwnedBlockCounts TakeOwnedBlockCounts();
 
