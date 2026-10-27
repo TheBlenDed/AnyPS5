@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
+#include "CompiledVariant.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -201,6 +203,88 @@ void Driver::capturePipelineRequest(std::uint64_t address, const ShaderRecompile
         std::fprintf(stderr, "[pipeline-requests] saved %s.req (%zu SPIR-V words, program 0x%llx)\n", stem, words, static_cast<unsigned long long>(address));
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[pipeline-requests] could not save the request of program 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
+    } catch (...) {
+    }
+}
+
+void CapturePreparedRequest(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle) noexcept {
+    static const char* directory = std::getenv("APS5_PREPARED_REQUESTS");
+    if (directory == nullptr || *directory == '\0') return;
+    try {
+        const auto limit = [](const char* name, std::size_t fallback) {
+            const char* text = std::getenv(name);
+            return text != nullptr && *text != '\0' ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : fallback;
+        };
+        static const std::size_t maximumCount = limit("APS5_PREPARED_REQUESTS_MAX_COUNT", 32);
+        static const std::size_t maximumBytes = limit("APS5_PREPARED_REQUESTS_MAX_BYTES", 32u * 1024u * 1024u);
+        static const std::size_t minimumWords = limit("APS5_PREPARED_REQUESTS_MIN_WORDS", 0);
+        static std::mutex mutex;
+        static std::set<std::string> saved;
+        static std::size_t attempts = 0;
+        static std::size_t reservedBytes = 0;
+        std::lock_guard lock(mutex);
+        if (attempts >= maximumCount || reservedBytes >= maximumBytes) return;
+        const auto& artifact = ShaderRecompiler::GetPreparedArtifact(handle);
+        if (artifact.spirv.size() < minimumWords) return;
+        const auto words = artifact.spirv.Words();
+        if (words.size_bytes() > maximumBytes - reservedBytes) return;
+        const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
+        if (text.size() > maximumBytes - reservedBytes - words.size_bytes() || saved.contains(text)) return;
+        saved.insert(text);
+        const auto sequence = ++attempts;
+        reservedBytes += text.size() + words.size_bytes();
+        char name[96];
+        std::snprintf(name, sizeof(name), "p_%04zu_%llx_s%u", sequence, static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage));
+        const std::filesystem::path folder(directory);
+        std::error_code status;
+        std::filesystem::create_directories(folder, status);
+        if (status) {
+            std::fprintf(stderr, "[prepared-requests] cannot create capture directory: %s\n", status.message().c_str());
+            return;
+        }
+        const auto staging = folder / (std::string(name) + ".tmp");
+        const auto module = folder / (std::string(name) + ".spv");
+        const auto destination = folder / (std::string(name) + ".req");
+        if (!std::filesystem::create_directory(staging, status)) {
+            std::fprintf(stderr, "[prepared-requests] cannot reserve capture staging directory\n");
+            return;
+        }
+        struct Cleanup {
+            std::filesystem::path staging;
+            std::filesystem::path module;
+            bool modulePublished = false;
+            bool requestPublished = false;
+            ~Cleanup() {
+                std::error_code ignored;
+                if (modulePublished && !requestPublished) std::filesystem::remove(module, ignored);
+                std::filesystem::remove_all(staging, ignored);
+            }
+        } cleanup{staging, module};
+        const auto write = [](const std::filesystem::path& path, const char* data, std::size_t bytes) {
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            file.write(data, static_cast<std::streamsize>(bytes));
+            file.close();
+            return static_cast<bool>(file);
+        };
+        if (!write(staging / "module", reinterpret_cast<const char*>(words.data()), words.size_bytes()) || !write(staging / "request", text.data(), text.size())) {
+            std::fprintf(stderr, "[prepared-requests] cannot finish capture files\n");
+            return;
+        }
+        std::filesystem::create_hard_link(staging / "module", module, status);
+        if (status) {
+            std::fprintf(stderr, "[prepared-requests] cannot publish captured SPIR-V: %s\n", status.message().c_str());
+            return;
+        }
+        cleanup.modulePublished = true;
+        std::filesystem::create_hard_link(staging / "request", destination, status);
+        if (status) {
+            std::fprintf(stderr, "[prepared-requests] cannot publish captured request: %s\n", status.message().c_str());
+            return;
+        }
+        cleanup.requestPublished = true;
+        std::fprintf(stderr, "[prepared-requests] saved %s.req (%zu SPIR-V words, stage %u, %zu/%zu bytes)\n", name, words.size(), static_cast<unsigned>(request.shader.stage), reservedBytes, maximumBytes);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[prepared-requests] could not save program 0x%llx: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
     } catch (...) {
     }
 }

@@ -26,6 +26,7 @@
 #include <cstring>
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -257,6 +258,78 @@ void Run(AgcDriver::VulkanDevice& device) {
     request.layout.pushConstantSizeBytes = 128;
     code[0] = 0xffffffffu;
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request)); }, "does not refer to registered code");
+}
+
+void SuccessfulPreparationCapture(AgcDriver::VulkanDevice& device, std::string_view mode) {
+    using namespace ShaderRecompiler;
+    const auto directory = std::filesystem::temp_directory_path() / ("anyps5-prepared-capture-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(std::filesystem::create_directory(directory), "cannot create prepared capture test directory");
+    struct Cleanup {
+        std::filesystem::path directory;
+        ~Cleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(directory, ignored);
+        }
+    } cleanup{directory};
+    const auto set = [](const char* name, const std::string& value) {
+#ifdef _WIN32
+        Require(_putenv_s(name, value.c_str()) == 0, "cannot configure prepared capture");
+#else
+        Require(setenv(name, value.c_str(), 1) == 0, "cannot configure prepared capture");
+#endif
+    };
+    const bool byteLimit = mode == "--successful-capture-bytes";
+    const bool unwritable = mode == "--successful-capture-unwritable";
+    auto destination = directory;
+    if (unwritable) {
+        std::ofstream blocked(directory / "blocked");
+        blocked << "not a directory";
+        blocked.close();
+        destination /= "blocked/requests";
+    }
+    set("APS5_PREPARED_REQUESTS", destination.string());
+    set("APS5_PREPARED_REQUESTS_MAX_COUNT", "2");
+    set("APS5_PREPARED_REQUESTS_MAX_BYTES", byteLimit ? "1" : "1048576");
+    const std::array<std::uint32_t, 1> code{0xbf810000u};
+    const std::array<std::uint32_t, 2> invalid{0xbe802004u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x20000u, invalid, 0, {}};
+    request.context.waveSize = 32;
+    request.context.compute = ShaderComputeStageInfo{{1, 1, 1}, 0, {false, false, false}, false, 0, {}};
+    request.target = device.ComputeTarget(32);
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::PrepareShaderWithDiagnostics(request)); }, "unsupported");
+    request.shader.code = code;
+    std::map<std::string, std::vector<std::uint32_t>> expected;
+    for (std::uint32_t index = 0; index < 3; ++index) {
+        request.shader.codeAddress = 0x20000u + index * 256u;
+        const auto handle = AgcDriver::DriverDetail::PrepareShaderWithDiagnostics(request);
+        const auto words = GetPreparedArtifact(*handle).spirv.Words();
+        Require(!words.empty(), "capture prevented successful shader preparation");
+        expected.emplace(RequestSerializer{}.Serialize(request), std::vector(words.begin(), words.end()));
+        if (index == 0) static_cast<void>(AgcDriver::DriverDetail::PrepareShaderWithDiagnostics(request));
+    }
+    std::size_t requests = 0;
+    std::size_t modules = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        Require(entry.path().extension() != ".tmp", "prepared capture leaked a staging directory");
+        if (entry.path().extension() == ".spv") ++modules;
+        if (entry.path().extension() != ".req") continue;
+        ++requests;
+        std::ifstream input(entry.path(), std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(input)), {});
+        Require(expected.contains(text), "prepared capture changed its successful request");
+        Require(RequestSerializer{}.Serialize(RequestSerializer{}.Deserialize(text).request) == text, "prepared capture did not deserialize exactly");
+        auto modulePath = entry.path();
+        modulePath.replace_extension(".spv");
+        std::ifstream module(modulePath, std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(module)), {});
+        const auto& words = expected.at(text);
+        Require(bytes.size() == words.size() * sizeof(std::uint32_t) && std::memcmp(bytes.data(), words.data(), bytes.size()) == 0, "prepared capture SPIR-V differs from the returned artifact");
+        expected.erase(text);
+    }
+    Require(requests == (byteLimit || unwritable ? 0u : 2u) && modules == requests, "prepared capture did not enforce its count, byte or publication bounds");
 }
 
 void FailureCapture(AgcDriver::VulkanDevice& device, bool terminalWriteFailure) {
@@ -1765,6 +1838,12 @@ void RelocatedHeaders() {
 int main(int argc, char** argv) {
     try {
         const std::string_view abiMode = argc == 2 ? argv[1] : "";
+        if (abiMode == "--successful-capture" || abiMode == "--successful-capture-bytes" || abiMode == "--successful-capture-unwritable") {
+            auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            SuccessfulPreparationCapture(*device, abiMode);
+            return 0;
+        }
         if (abiMode == "--registration-corpus") {
             auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;

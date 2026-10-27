@@ -166,6 +166,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     std::string dump;
     try {
         auto handle = ShaderRecompiler::PrepareShader(request, preparation);
+        CapturePreparedRequest(request, *handle);
         return handle;
     } catch (...) {
         failure = std::current_exception();

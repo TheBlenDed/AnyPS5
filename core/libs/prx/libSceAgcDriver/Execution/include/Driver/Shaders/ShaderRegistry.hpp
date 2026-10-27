@@ -219,6 +219,7 @@ std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t c
 bool VertexWorkgroupRequired(const QueueState& queue, const ShaderRegistry& registry);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation = nullptr);
+void CapturePreparedRequest(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle) noexcept;
 
 std::uint64_t NullPixelProgramAddress();
 ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device);
