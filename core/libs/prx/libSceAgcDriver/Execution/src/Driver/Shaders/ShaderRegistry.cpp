@@ -2561,9 +2561,10 @@ void Driver::RegisterShader(const Shader* shader) {
     } else {
         try {
             snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
-        } catch (const ShaderRefusal& refusal) {
-            // As a failed background preparation: its uses rethrow the refusal and are skipped.
-            APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration: %s", static_cast<unsigned long long>(snapshot.codeAddress), refusal.what());
+        } catch (const std::exception& error) {
+            APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration: %s", static_cast<unsigned long long>(snapshot.codeAddress), error.what());
+            snapshot.prepared->failure = std::current_exception();
+        } catch (...) {
             snapshot.prepared->failure = std::current_exception();
         }
         if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
