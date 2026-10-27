@@ -8,8 +8,46 @@
 
 using namespace ShaderRecompiler;
 
+void CheckLargeProgramOwnership() {
+    constexpr std::uint32_t Count = 16384u;
+    IrProgram program;
+    auto& block = program.CreateBlock();
+    program.SetEntryBlock(block);
+    program.BlockOrder().push_back(&block);
+    IrBuilder builder(program);
+    builder.SetInsertionPoint(block);
+    std::vector<IrValue*> retained;
+    for (std::uint32_t index = 0; index < Count; ++index) {
+        auto& value = builder.Constant(100000u + index);
+        if (index % 3u != 0u) continue;
+        retained.push_back(&value);
+        program.Metadata().dynamicReads.push_back(&value);
+    }
+    if (program.ReclaimUnusedValues() != Count - retained.size()) throw std::runtime_error("a large program reclaimed a live value or retained detached values");
+    for (std::uint32_t index = 0; index < Count; ++index) {
+        const auto& value = builder.Constant(200000u + index);
+        if (value.Id() < Count) throw std::runtime_error("a large program reused a reclaimed value ID");
+    }
+    for (std::size_t index = 0; index < retained.size(); ++index) {
+        if (retained[index]->Id() != index * 3u || retained[index]->ImmediateU32() != 100000u + index * 3u) throw std::runtime_error("growth after reclamation overwrote a live value");
+    }
+    IrProgram moved = std::move(program);
+    if (moved.ReclaimUnusedValues() != Count) throw std::runtime_error("moving a large program changed its live graph");
+    IrProgram assigned;
+    static_cast<void>(assigned.CreateValue(IrOpcode::IAdd32, IrType::U32));
+    assigned = std::move(moved);
+    if (assigned.ReclaimUnusedValues() != 0u) throw std::runtime_error("move assignment changed a large program's live graph");
+    std::size_t visited = 0;
+    for (const auto& value : assigned.Values()) {
+        if (visited >= retained.size() || value->Id() != retained[visited]->Id() || value->ImmediateU32() != 100000u + visited * 3u) throw std::runtime_error("a large program's values changed their creation order");
+        ++visited;
+    }
+    if (visited != retained.size()) throw std::runtime_error("a large program lost a retained value during a move");
+}
+
 int main() {
     try {
+        CheckLargeProgramOwnership();
         IrProgram program;
         auto& block = program.CreateBlock();
         program.SetEntryBlock(block);
