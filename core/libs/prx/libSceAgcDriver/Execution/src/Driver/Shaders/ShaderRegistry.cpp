@@ -2559,8 +2559,9 @@ void Driver::RegisterShader(const Shader* shader) {
         if (preparation != nullptr && (snapshot.type == 0 || snapshot.type == 1)) BuildRegisteredAbiKey(registered, *localDevice, preparation->abiKey);
         snapshot.prepared->pending = preparation != nullptr;
     } else {
+        const auto plan = PlanRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
         try {
-            snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true, &snapshot.prepared->deferred);
+            if (plan != nullptr) snapshot.prepared->entries = PrepareRegistered(*plan);
         } catch (const std::exception& error) {
             APS5_LOG_ERR("Shader 0x%llx could not be prepared at registration: %s", static_cast<unsigned long long>(snapshot.codeAddress), error.what());
             snapshot.prepared->failure = std::current_exception();

@@ -827,7 +827,11 @@ void RegisteredVertexWorkgroup(const ShaderRecompiler::SpirvTarget& target, bool
         ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "missing AGC user-data header");
         header.shader.user_data = &header.userData;
         if (target.subgroupSize < 64u && std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr && std::getenv("APS5_LAZY_SHADER_PREPARE") == nullptr) {
-            ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "v_readlane_b32 of lane 63 is outside");
+            AgcDriverRegisterShader_nid_postfix(&header.shader);
+            const auto registry = AgcDriver::DriverDetail::Driver::Get().RegisteredShaders();
+            const auto snapshot = AgcDriver::DriverDetail::RegisteredProgram(*registry, address, {2});
+            Require(snapshot != nullptr && snapshot->prepared->failure != nullptr, "synchronous registration did not retain its compilation failure");
+            ExpectFailure([&] { std::rethrow_exception(snapshot->prepared->failure); }, "v_readlane_b32 of lane 63 is outside");
         }
         std::cout << "registered NGG preparation deferral passed; subgroup=" << target.subgroupSize << '\n';
         return;
