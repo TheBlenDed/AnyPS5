@@ -45,6 +45,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 #include <io.h>
 #else
 #include <unistd.h>
@@ -835,6 +836,116 @@ void RegisteredVertexWorkgroup(const ShaderRecompiler::SpirvTarget& target, bool
     AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, primitive);
     AgcDriverResolveShaderAbi_nid_postfix(&header.shader, {}, primitive);
     std::cout << "registered NGG wave64 preparation passed; subgroup=" << target.subgroupSize << '\n';
+}
+
+void RegistrationCorpus(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::DriverDetail;
+    constexpr std::size_t Count = 24;
+    constexpr std::size_t Readers = 4;
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+        ShaderSpecialRegs specials{};
+    };
+    struct Fixture {
+        alignas(256) std::array<std::uint32_t, 3> code{};
+        Header header;
+    };
+    std::array<Fixture, Count + 1> fixtures;
+    for (std::size_t index = 0; index < fixtures.size(); ++index) {
+        auto& fixture = fixtures[index];
+        fixture.code = {0x7e0002ffu, static_cast<std::uint32_t>(index + 1), 0xbf810000u};
+        auto& header = fixture.header;
+        const auto address = reinterpret_cast<std::uintptr_t>(fixture.code.data());
+        header.shader.file_header = 0x34333231u;
+        header.shader.version = 0x18;
+        header.shader.header_size = sizeof(Header);
+        header.shader.shader_size = sizeof(fixture.code);
+        header.shader.code = fixture.code.data();
+        header.shader.sh_registers = header.registers.data();
+        header.shader.num_sh_registers = header.registers.size();
+        header.shader.specials = &header.specials;
+        header.specials.dispatch_modifier = 0x8000;
+        header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+    }
+    AgcDriverRegisterShader_nid_postfix(&fixtures.front().header.shader);
+    AwaitRegistrationPreparation();
+    const auto baseline = ShaderRecompiler::FrontEndBuilds();
+    const bool lazy = std::getenv("APS5_LAZY_SHADER_PREPARE") != nullptr;
+    ShaderRegistry corpus;
+    const auto report = [&](const char* phase, auto started) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count();
+        const auto memory = InspectRegisteredShaderMemory(corpus);
+        std::cout << "registration-corpus phase=" << phase << " lazy=" << lazy << " shaders=" << Count
+                  << " elapsed_us=" << elapsed << " front_end_builds=" << ShaderRecompiler::FrontEndBuilds() - baseline
+                  << " entries=" << memory.entryReferences << " artifacts=" << memory.artifacts
+                  << " logical_spirv_bytes=" << memory.logicalBytes << " heap_spirv_capacity_bytes=" << memory.rawCapacityBytes
+                  << " mapped_spirv_bytes=" << memory.cacheBytes << " code_capacity_bytes=" << memory.codeCapacityBytes
+                  << " header_capacity_bytes=" << memory.headerCapacityBytes;
+#ifdef _WIN32
+        PROCESS_MEMORY_COUNTERS_EX process{};
+        process.cb = sizeof(process);
+        const auto query = reinterpret_cast<BOOL(WINAPI*)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD)>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo"));
+        Require(query != nullptr && query(GetCurrentProcess(), reinterpret_cast<PPROCESS_MEMORY_COUNTERS>(&process), sizeof(process)), "cannot measure the registration benchmark process");
+        std::cout << " process_working_set_bytes=" << process.WorkingSetSize << " process_private_commit_bytes=" << process.PrivateUsage
+                  << " process_peak_working_set_bytes=" << process.PeakWorkingSetSize << " process_peak_commit_bytes=" << process.PeakPagefileUsage;
+#endif
+        std::cout << '\n';
+    };
+    auto started = std::chrono::steady_clock::now();
+    report("baseline", started);
+    for (std::size_t index = 1; index < fixtures.size(); ++index) AgcDriverRegisterShader_nid_postfix(&fixtures[index].header.shader);
+    AwaitRegistrationPreparation();
+    const auto registry = Driver::Get().RegisteredShaders();
+    Require(registry != nullptr, "registration benchmark published no registry");
+    std::vector<std::shared_ptr<const ShaderSnapshot>> snapshots;
+    for (std::size_t index = 1; index < fixtures.size(); ++index) {
+        auto& fixture = fixtures[index];
+        auto snapshot = RegisteredHeader(*registry, &fixture.header.shader);
+        Require(snapshot != nullptr && snapshot->registeredState != nullptr, "registration benchmark lost a source or registered context");
+        Require(std::ranges::equal(snapshot->code, fixture.code), "registration did not copy the source code");
+        const auto header = std::as_bytes(std::span(&fixture.header, 1));
+        Require(std::ranges::equal(snapshot->header, header), "registration did not copy the header context");
+        corpus[snapshot->codeAddress].push_back(snapshot);
+        snapshots.push_back(std::move(snapshot));
+    }
+    report("registered", started);
+    const auto registeredBuilds = ShaderRecompiler::FrontEndBuilds();
+    const auto registeredMemory = InspectRegisteredShaderMemory(corpus);
+    Require(lazy ? registeredBuilds == baseline && registeredMemory.entryReferences == 0 : registeredBuilds > baseline && registeredMemory.entryReferences >= Count, "registration corpus did not distinguish eager from deferred preparation");
+    for (std::size_t index = 1; index < fixtures.size(); ++index) {
+        fixtures[index].code.fill(0xffffffffu);
+        fixtures[index].header.registers.fill({0xffffffffu, 0xffffffffu});
+        fixtures[index].header.specials.dispatch_modifier = 0;
+        const auto& snapshot = *snapshots[index - 1];
+        Require(snapshot.code[1] == index + 1 && snapshot.registeredState->shader.at(0x207) == 1, "registered source or context changed with guest storage");
+    }
+    const auto use = [&](const ShaderSnapshot& snapshot) {
+        const auto compute = AgcDriver::Graphics::DecodeComputeStageInfo(snapshot.registeredState->shader, snapshot.header);
+        const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
+        const ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, snapshot.codeAddress, snapshot.code, snapshot.headerAddress, snapshot.header}, {32, 0, {}, compute, {}, {}, memory, RegisteredFloatMode(snapshot)}, device.ComputeTarget(32), {0, 0, 0, 128}};
+        static_cast<void>(InvocationFor(snapshot, 0, request));
+        return SourceHandleFor(snapshot, 0, request);
+    };
+    std::barrier begin(static_cast<std::ptrdiff_t>(Readers));
+    std::vector<std::future<std::shared_ptr<const ShaderRecompiler::SourceHandle>>> readers;
+    started = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < Readers; ++index) readers.push_back(std::async(std::launch::async, [&] {
+        begin.arrive_and_wait();
+        return use(*snapshots.front());
+    }));
+    const auto first = readers.front().get();
+    Require(first != nullptr && std::ranges::equal(ShaderRecompiler::GetPreparedCode(*first), snapshots.front()->code), "first use prepared changed guest code instead of the saved source");
+    for (std::size_t index = 1; index < readers.size(); ++index) Require(readers[index].get() == first, "concurrent first uses prepared distinct source handles");
+    report("concurrent-first-use", started);
+    const auto usedMemory = InspectRegisteredShaderMemory(corpus);
+    Require(lazy ? usedMemory.entryReferences == 1 && ShaderRecompiler::FrontEndBuilds() > registeredBuilds : usedMemory.entryReferences == registeredMemory.entryReferences && ShaderRecompiler::FrontEndBuilds() == registeredBuilds, "first use prepared unused corpus shaders or missed an eager artifact");
+    const auto firstBuilds = ShaderRecompiler::FrontEndBuilds();
+    started = std::chrono::steady_clock::now();
+    for (std::size_t index = 0; index < 32; ++index) Require(use(*snapshots.front()) == first, "repeated first use replaced its prepared handle");
+    Require(ShaderRecompiler::FrontEndBuilds() == firstBuilds && InspectRegisteredShaderMemory(corpus).entryReferences == usedMemory.entryReferences, "repeated use rebuilt or retained another artifact");
+    report("repeated-use", started);
+    AgcDriverShutdown_nid_postfix();
 }
 
 void LazyRegistration() {
@@ -1650,6 +1761,12 @@ void RelocatedHeaders() {
 int main(int argc, char** argv) {
     try {
         const std::string_view abiMode = argc == 2 ? argv[1] : "";
+        if (abiMode == "--registration-corpus") {
+            auto device = OpenVulkanTestDevice();
+            if (!device) return VulkanTestSkipped;
+            RegistrationCorpus(*device);
+            return 0;
+        }
         const bool abiDeferred = abiMode == "--abi-deferred-compute" || abiMode == "--abi-deferred-concurrent" || abiMode == "--abi-deferred-pixel" || abiMode == "--abi-deferred-stages" || abiMode == "--abi-deferred-rectangle" || abiMode == "--abi-deferred-undecodable-state" || abiMode == "--abi-deferred-registration-failure" || abiMode == "--abi-deferred-vertex-inputs" || abiMode == "--abi-deferred-rectangle-pairs";
         Require(argc == 1 || abiDeferred || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--deferred-aperture" || std::string_view(argv[1]) == "--skip-refused" || std::string_view(argv[1]) == "--preparation-failure" || std::string_view(argv[1]) == "--registered-workgroup" || std::string_view(argv[1]) == "--lazy")), "invalid test arguments");
         if (abiDeferred) {
