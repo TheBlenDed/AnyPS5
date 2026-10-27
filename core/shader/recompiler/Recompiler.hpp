@@ -761,6 +761,8 @@ inline std::uint64_t HashSpirvWords(std::span<const std::uint32_t> words, std::u
 // reference, or the per-dispatch copy this class removes comes back without a compiler hint.
 // ContentHash is computed once per shared holder, on first use, and dropped by a write.
 class SharedSpirv {
+    struct Holder;
+
 public:
     SharedSpirv() = default;
     SharedSpirv(std::vector<std::uint32_t> words) : holder(std::make_shared<Holder>(std::move(words), nullptr, std::span<const std::uint32_t>{})) {}
@@ -799,6 +801,26 @@ public:
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
     friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return std::ranges::equal(left.Words(), right.Words()); }
 
+    class Weak {
+    public:
+        [[nodiscard]] SharedSpirv Lock() const {
+            SharedSpirv spirv;
+            spirv.holder = holder.lock();
+            return spirv;
+        }
+        [[nodiscard]] bool Expired() const { return holder.expired(); }
+
+    private:
+        friend class SharedSpirv;
+        std::weak_ptr<Holder> holder;
+    };
+    [[nodiscard]] Weak Weaken() const {
+        Weak weak;
+        if (holder != nullptr) holder->published.store(true, std::memory_order_relaxed);
+        weak.holder = holder;
+        return weak;
+    }
+
 private:
     struct Holder {
         Holder(std::vector<std::uint32_t> words, std::shared_ptr<const void> owner, std::span<const std::uint32_t> view) : words(std::move(words)), owner(std::move(owner)), view(view) {}
@@ -806,13 +828,14 @@ private:
         std::vector<std::uint32_t> words;
         std::shared_ptr<const void> owner;
         std::span<const std::uint32_t> view;
+        std::atomic<bool> published{false};
         mutable std::atomic<std::uint64_t> hashLow{0};
         mutable std::atomic<std::uint64_t> hashHigh{0};
         mutable std::atomic<bool> hashed{false};
     };
 
     std::vector<std::uint32_t>& Mutable() {
-        if (holder == nullptr || holder.use_count() != 1 || holder->owner != nullptr) {
+        if (holder == nullptr || holder.use_count() != 1 || holder->owner != nullptr || holder->published.load(std::memory_order_relaxed)) {
             holder = std::make_shared<Holder>(Copy(), nullptr, std::span<const std::uint32_t>{});
         } else {
             holder->hashed.store(false, std::memory_order_relaxed);

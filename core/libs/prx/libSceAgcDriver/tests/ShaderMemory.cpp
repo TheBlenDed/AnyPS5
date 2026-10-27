@@ -34,6 +34,7 @@
 #include <set>
 #include <array>
 #include <cstddef>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -404,6 +405,143 @@ void verifyFrontendPair() {
         verifyResult(pixelReference, *MaterializeShader(pixel, *pixelCapture, *pixelHandle));
         verifyResult(zeroReference, *MaterializeShader(zero, *zeroCapture, *zeroHandle));
     }
+}
+
+void verifySpecializedModuleRelease() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 1> color{0x3f800000u};
+    const std::vector<std::uint32_t> code{0xbf800003u, 0x7e000200u, 0xf800180fu, 0u, 0xbf810000u};
+    auto pixel = FrontendRequest(code, color);
+    pixel.shader.stage = ShaderStage::Fragment;
+    pixel.context.compute.reset();
+    pixel.context.pixel = ShaderPixelStageInfo{};
+    pixel.context.pixel->wave32 = true;
+    pixel.context.pixel->targetOutputMode[0] = 9u;
+    pixel.context.waveSize = 32u;
+    pixel.useCache = true;
+    SharedSpirv::Weak released;
+    std::uint64_t specializationId = 0;
+    std::vector<std::uint32_t> words;
+    {
+        const auto first = Recompile(pixel);
+        require(first.specializationId != 0u, "specialized module release: the pixel fixture was not specialized");
+        require(!first.spirv.Mapped() && first.spirv.HeapBytes() >= first.spirv.size() * sizeof(std::uint32_t), "specialized module release: the fixture does not exercise private heap words");
+        released = first.spirv.Weaken();
+        specializationId = first.specializationId;
+        words = first.spirv.Copy();
+    }
+    require(released.Expired(), "specialized module release: the module caches kept the words of a module no result uses");
+    {
+        const auto again = Recompile(pixel);
+        require(again.specializationId == specializationId, "specialized module release: a module built again from its key got another specialization ID");
+        require(std::ranges::equal(again.spirv.Words(), words), "specialized module release: a module built again from its key has other words");
+        const auto shared = Recompile(pixel);
+        require(shared.spirv.data() == again.spirv.data(), "specialized module release: a second result of a live module copied its words");
+        released = again.spirv.Weaken();
+    }
+    require(released.Expired(), "specialized module release: a rebuilt module stayed alive after its results were released");
+    {
+        std::promise<void> start;
+        const auto ready = start.get_future().share();
+        std::array<std::future<RecompileResult>, 4> pending;
+        for (auto& future : pending) future = std::async(std::launch::async, [pixel, ready] { ready.wait(); return Recompile(pixel); });
+        start.set_value();
+        std::array<RecompileResult, 4> results;
+        for (std::size_t index = 0; index < results.size(); ++index) results[index] = pending[index].get();
+        for (const auto& result : results) {
+            require(result.specializationId == specializationId && std::ranges::equal(result.spirv.Words(), words), "specialized module release: concurrent rebuild changed the module or specialization ID");
+            require(result.spirv.data() == results.front().spirv.Words().data(), "specialized module release: concurrent results did not share their live words");
+        }
+        released = results.front().spirv.Weaken();
+    }
+    require(released.Expired(), "specialized module release: concurrent rebuild kept unused words alive");
+}
+
+void specializedReuseBench() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Iterations = 512;
+    std::array<std::uint32_t, 1> color{0x3f000000u};
+    const std::vector<std::uint32_t> code{0xbf800004u, 0x7e000200u, 0xf800180fu, 0u, 0xbf810000u};
+    auto pixel = FrontendRequest(code, color);
+    pixel.shader.stage = ShaderStage::Fragment;
+    pixel.context.compute.reset();
+    pixel.context.pixel = ShaderPixelStageInfo{};
+    pixel.context.pixel->wave32 = true;
+    pixel.context.pixel->targetOutputMode[0] = 9u;
+    pixel.context.waveSize = 32u;
+    pixel.useCache = true;
+    const auto handle = PrepareShader(pixel);
+    SrtRuntime runtime{};
+    runtime.userData = color;
+    runtime.shaderBase = pixel.shader.codeAddress;
+    const auto invoke = [&](std::uint32_t value, bool* memoHit) {
+        color[0] = value;
+        const auto capture = CaptureResources(pixel, runtime, *handle);
+        return Recompile(pixel, *capture, memoHit);
+    };
+    const auto checkRuntime = [&](const RecompileResult& result, std::uint32_t value) {
+        require(result.userDataRegisterReads == 1u && result.shaderDataUserWords.size() == 1u && result.shaderDataUserWords.front() == 0u, "specialized reuse bench: the fixture does not read runtime s0");
+        require(result.pushConstants.size() >= sizeof(value), "specialized reuse bench: the fixture has no runtime push data");
+        std::uint32_t observed = 0;
+        std::memcpy(&observed, result.pushConstants.data(), sizeof(observed));
+        require(observed == value, "specialized reuse bench: changed runtime s0 did not reach the shader's push data");
+    };
+    SpirvContentHash hash;
+    std::uint64_t specializationId = 0;
+    std::vector<std::uint32_t> words;
+    SharedSpirv::Weak previous;
+    {
+        const auto first = invoke(0x3f000001u, nullptr);
+        const auto second = invoke(0x3f000002u, nullptr);
+        checkRuntime(*first, 0x3f000001u);
+        checkRuntime(*second, 0x3f000002u);
+        require(first->pushConstants != second->pushConstants, "specialized reuse bench: distinct runtime inputs produced identical push data");
+        require(first->specializationId != 0u && first->specializationId == second->specializationId && first->spirv == second->spirv, "specialized reuse bench: runtime inputs changed the specialized module");
+        require(!first->spirv.Mapped(), "specialized reuse bench: the fixture does not exercise private specialized words");
+        hash = first->spirv.ContentHash();
+        specializationId = first->specializationId;
+        words = first->spirv.Copy();
+        previous = second->spirv.Weaken();
+    }
+    std::uint64_t expiredBeforeNext = 0;
+    std::uint64_t sameHash = 0;
+    std::uint64_t sameId = 0;
+    std::uint64_t sameWords = 0;
+    std::uint64_t memoHits = 0;
+    std::uint64_t resultHeapBytes = 0;
+    const auto before = ResultMemoTotals();
+    const auto start = std::chrono::steady_clock::now();
+    for (std::uint32_t index = 0; index < Iterations; ++index) {
+        expiredBeforeNext += previous.Expired() ? 1u : 0u;
+        bool memoHit = false;
+        const auto value = 0x3f100000u + index;
+        const auto result = invoke(value, &memoHit);
+        checkRuntime(*result, value);
+        sameHash += result->spirv.ContentHash() == hash ? 1u : 0u;
+        sameId += result->specializationId == specializationId ? 1u : 0u;
+        sameWords += std::ranges::equal(result->spirv.Words(), words) ? 1u : 0u;
+        memoHits += memoHit ? 1u : 0u;
+        resultHeapBytes = ResultHeapBytes(*result);
+        previous = result->spirv.Weaken();
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+    const auto after = ResultMemoTotals();
+    const auto heldWords = previous.Lock();
+    require(sameHash == Iterations && sameId == Iterations && sameWords == Iterations, "specialized reuse bench: the specialized module changed during runtime-data churn");
+    const bool memoEnabled = std::getenv("APS5_NO_RESULT_MEMO") == nullptr;
+    require(expiredBeforeNext == (memoEnabled ? 0u : Iterations), "specialized reuse bench: runtime-data churn did not preserve the expected specialized-word lifetime");
+    std::cout << "specialized_reuse_bench iterations=" << Iterations
+              << " elapsed_us=" << elapsed
+              << " same_hash=" << sameHash << " same_id=" << sameId << " same_words=" << sameWords
+              << " hash_low=" << hash.low << " hash_high=" << hash.high << " specialization_id=" << specializationId
+              << " weak_expired_before_next=" << expiredBeforeNext << " memo_hits=" << memoHits
+              << " memo_enabled=" << (memoEnabled ? 1 : 0)
+              << " memo_entries_before=" << before.entries << " memo_entries_after=" << after.entries
+              << " memo_result_bytes_before=" << before.bytes << " memo_result_bytes_after=" << after.bytes
+              << " memo_evictions=" << after.evictions - before.evictions
+              << " memo_source_budget_bytes=" << ResultMemoSourceBytes()
+              << " last_result_api_heap_bytes=" << resultHeapBytes
+              << " specialized_word_heap_bytes_after=" << heldWords.HeapBytes() << '\n';
 }
 
 ShaderRecompiler::RecompileRequest LayoutPairRequest(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, bool registration, std::uint32_t wordLimit) {
@@ -8839,6 +8977,15 @@ int main(int argc, char** argv) {
         setenv("ANYPS5_NO_SHADER_CACHE", "1", 1);
 #endif
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--specialized-reuse-bench") {
+            specializedReuseBench();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--specialized-module-release") {
+            verifySpecializedModuleRelease();
+            std::cout << "Unused specialized words are released and concurrent rebuilds preserve their identity\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--specialized-bda-abi") {
             verifySpecializedBufferAtomicBindings(true);
             std::cout << "Specialized programs retain the BDA ABI only while a fault buffer remains\n";
@@ -8952,6 +9099,7 @@ int main(int argc, char** argv) {
         verifyExecGuardedDescriptorSources();
         verifySrtTape();
         verifyTargetFeatureKey();
+        verifySpecializedModuleRelease();
         verifyImageTableKeys();
         verifyImageTables();
         verifyImageTableMaskedOffset();
