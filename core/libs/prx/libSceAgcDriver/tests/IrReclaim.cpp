@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace ShaderRecompiler;
@@ -45,9 +47,48 @@ void CheckLargeProgramOwnership() {
     if (visited != retained.size()) throw std::runtime_error("a large program lost a retained value during a move");
 }
 
+void CheckOperandStorage() {
+    IrProgram program;
+    auto& block = program.CreateBlock();
+    program.SetEntryBlock(block);
+    program.BlockOrder().push_back(&block);
+    IrBuilder builder(program);
+    builder.SetInsertionPoint(block);
+    std::vector<IrValue*> inputs;
+    for (std::uint32_t number = 0; number < 7u; ++number) inputs.push_back(&builder.Constant(300u + number));
+    auto& wide = builder.Emit(IrOpcode::ReferenceU32, IrType::Void, {inputs[0]});
+    for (std::size_t index = 1; index < inputs.size(); ++index) wide.AddArgument(inputs[index]);
+    if (wide.ArgumentCount() != inputs.size()) throw std::runtime_error("a value lost operands past its inline storage");
+    for (std::size_t index = 0; index < inputs.size(); ++index) {
+        if (wide.Argument(index) != inputs[index] || inputs[index]->UseCount() != 1u || inputs[index]->OperandUses().front().operand != index) throw std::runtime_error("an operand past the inline storage lost its value or its use");
+    }
+    wide.ReplaceArgument(5, inputs[0]);
+    if (wide.Argument(5) != inputs[0] || inputs[5]->HasUses() || inputs[0]->UseCount() != 2u) throw std::runtime_error("replacing an operand in grown storage left a stale use");
+    using Storage = std::remove_cvref_t<decltype(std::declval<IrValue>().Arguments())>;
+    Storage storage;
+    storage = std::vector<IrValue*>{inputs[0], inputs[1], inputs[2]};
+    storage.push_back(inputs[3]);
+    if (storage.size() != 4u || storage.at(3) != inputs[3]) throw std::runtime_error("growing a short operand list lost a value");
+    storage = std::vector<IrValue*>{inputs[1], inputs[2]};
+    storage.reserve(16u);
+    if (storage.size() != 2u || storage.front() != inputs[1] || storage.back() != inputs[2]) throw std::runtime_error("replacing and reserving operand storage changed its values");
+    storage.clear();
+    storage.push_back(inputs[4]);
+    storage = std::vector<IrValue*>{};
+    if (!storage.empty() || storage.begin() != storage.end()) throw std::runtime_error("assigning empty operands retained a value");
+    auto& detached = program.CreateValue(IrOpcode::ReferenceU32, IrType::Void);
+    detached.SetDetachedOperands({inputs[1], inputs[2], inputs[3], inputs[4], inputs[6]}, {});
+    if (detached.ArgumentCount() != 5u || detached.Argument(0) != inputs[1] || detached.Argument(4) != inputs[6]) throw std::runtime_error("detached operands past the inline storage were not kept in order");
+    if (program.ReclaimUnusedValues() != 2u) throw std::runtime_error("an unused value with grown operand storage or its dropped operand was not reclaimed");
+    for (std::size_t index = 0; index < inputs.size(); ++index) {
+        if (wide.Argument(index) != (index == 5u ? inputs[0] : inputs[index])) throw std::runtime_error("reclamation changed a live value's grown operands");
+    }
+}
+
 int main() {
     try {
         CheckLargeProgramOwnership();
+        CheckOperandStorage();
         IrProgram program;
         auto& block = program.CreateBlock();
         program.SetEntryBlock(block);
