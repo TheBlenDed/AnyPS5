@@ -64,7 +64,7 @@
 Build as usual ([build instructions](docs/dev/BUILD.md)), then run the game with:
 
 ```
-APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_MEMO=1
+APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
 APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
@@ -80,7 +80,6 @@ $yoteiSettings = @{
     APS5_SPANNED_WAVE = '1'
     APS5_BINDLESS_IMAGES = '1'
     APS5_BINDLESS_LAZY = '1'
-    APS5_NO_RESULT_MEMO = '1'
     APS5_STAGING_DIFF = '1'
     APS5_PIPELINE_INDIRECT = '1'
     APS5_NO_ADDRESS_DRAW_REUSE = '1'
@@ -98,6 +97,8 @@ $yoteiSettings.GetEnumerator() | ForEach-Object {
 ```
 
 This clears inherited `APS5_` experiments in that PowerShell process, including A/B toggles and forced lazy shader preparation. These switches belong to the experimental integration branch. In particular, lazy image tables can miss on first use; reaching a menu does not establish rendering correctness.
+
+On this fork, keep `APS5_NO_RESULT_MEMO` and `APS5_RESULT_MEMO_TABLE` unset to use the default exact result memo. Disabling it can repeatedly restore and optimize released specialized SPIR-V words. Keep `APS5_LAZY_SHADER_PREPARE` unset for preparation at shader registration; setting it to `0` still enables lazy preparation because the driver checks whether the variable exists. Registration-time preparation handles programs exposed by the title with sufficient state; later shader registrations and scene-dependent Vulkan pipelines can still need work during play. This changes when preparation happens, and does not by itself make compilation faster.
 
 - Recompiler changes select a separate shader-cache version automatically. The author reported about 50 minutes to the world on the first cold run of the 2026-10-24 build; this is not a startup-time guarantee for other builds or machines. Keep the cache between launches. A long pause with advancing shader or pipeline preparation is different from a deadlock.
 - `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
