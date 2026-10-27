@@ -4470,6 +4470,12 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
     Batch* newest = open != nullptr ? open.get() : newestInFlight(currentLane());
+    if (newest == nullptr) {
+        for (const auto& lane : lanes) {
+            if (lane != nullptr) newest = lane.get();
+        }
+        if (newest == nullptr && !inFlight.empty()) newest = inFlight.back().get();
+    }
     Require(newest != nullptr, "no batch to append a completion label to");
     Batch& batch = *newest;
     std::vector<std::byte> copy(bytes.begin(), bytes.end());
@@ -4509,7 +4515,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     // poller that sees the bump then finds the label without the GPU mutex.
     noteLabelOn(batch, address, bytes, stamp, queue, behindCompletion);
     noteWriteOn(batch, address, bytes.size(), true);
-    if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (activeRecorder == this && std::ranges::any_of(lanes, [&batch](const auto& lane) { return lane.get() == &batch; }) && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
 }
