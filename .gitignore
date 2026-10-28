@@ -109,3 +109,9 @@ cookies.txt
 
 .env
 .env.local
+
+.gigacode_vsc/
+.agents/skills/anyps5-development/
+!/opencode.json
+!/.opencode/model-pools.json
+!/.opencode/decision.json
