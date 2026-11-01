@@ -34,6 +34,8 @@ struct ShaderStages {
     float maxTessellationLevel = 64.0f;
 };
 
+inline constexpr std::uint16_t UnclampedBlendMask = 0xffffu;
+
 struct ColorTarget {
     std::uint64_t address;
     VkExtent2D extent;
