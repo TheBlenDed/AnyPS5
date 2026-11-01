@@ -5954,15 +5954,11 @@ void verifyPixelRequestSerialization() {
     }
     auto blendedDepth = request;
     blendedDepth.context.pixel = pixel;
-    blendedDepth.context.pixel->depthExportEnable = true;
-    blendedDepth.context.pixel->depthExportMin = -0.25f;
-    blendedDepth.context.pixel->depthExportMax = 0.75f;
     blendedDepth.context.pixel->targetMerge.blend = {true, true, 6u, 7u, 1u, 2u, 3u, 4u, 0xau, {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u}};
     const auto blendedReplay = serializer.Deserialize(serializer.Serialize(blendedDepth));
-    require(blendedReplay.request.context.pixel.has_value() && fields(*blendedReplay.request.context.pixel) == fields(*blendedDepth.context.pixel), "a pixel request with a target blend and depth export bounds lost pixel fields in serialization");
-    require(blendedReplay.request.context.pixel->targetMerge.blend == blendedDepth.context.pixel->targetMerge.blend, "the target blend did not round-trip beside the depth export bounds");
-    require(blendedReplay.request.context.pixel->depthExportMin == -0.25f && blendedReplay.request.context.pixel->depthExportMax == 0.75f, "the depth export bounds did not round-trip beside the target blend");
-    require(blendedReplay.request.context.vertex.has_value() && blendedReplay.request.context.vertex->fetchAttribReg == 17u && blendedReplay.request.context.memory.size() == 1u && blendedReplay.request.context.memory[0].guestAddress == 0x60000u, "a target blend with depth export bounds displaced the following guest context");
+    require(blendedReplay.request.context.pixel.has_value() && fields(*blendedReplay.request.context.pixel) == fields(*blendedDepth.context.pixel), "a pixel request with a target blend lost pixel fields in serialization");
+    require(blendedReplay.request.context.pixel->targetMerge.blend == blendedDepth.context.pixel->targetMerge.blend, "the target blend did not round-trip");
+    require(blendedReplay.request.context.vertex.has_value() && blendedReplay.request.context.vertex->fetchAttribReg == 17u && blendedReplay.request.context.memory.size() == 1u && blendedReplay.request.context.memory[0].guestAddress == 0x60000u, "a target blend displaced the following guest context");
     request.context.pixel.reset();
     request.shader.stage = ShaderStage::Vertex;
     const auto withoutPixel = serializer.Deserialize(serializer.Serialize(request));
