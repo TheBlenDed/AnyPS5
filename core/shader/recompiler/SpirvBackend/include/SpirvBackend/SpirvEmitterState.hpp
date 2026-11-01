@@ -273,6 +273,8 @@ struct SpirvEmitterState {
     std::uint32_t mergeWordVariable = 0;
     std::uint32_t mergeTexelVariable = 0;
     std::uint32_t mergePendingVariable = 0;
+    std::vector<std::uint32_t> mergeValueVariables;
+    std::vector<std::uint32_t> mergePendingVariables;
     std::uint32_t quadPixelUncovered = 0;
     std::uint32_t sampleMaskInputVariable = 0;
     std::uint32_t quadSampleCoverage = 0;
