@@ -233,6 +233,7 @@ void SummaryFields() {
         "\"resolution\":\"1920x1080\",\"window\":{\"spec\":\"frames 3:2\",\"first_present\":3,\"ms\":40.000},\"presents\":2,"
         "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
         "\"worker_busy_pct\":{\"queue worker 0x0\":35.000},"
+        "\"worker_packet_stages_ms_per_frame\":{\"queue worker 0x0\":{\"draw\":5.000}},"
         "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000,\"Driver.Packet.draw\":5.000,\"Driver.Present\":3.000,\"Driver.Present.inflight_wait\":2.000,\"Driver.Completion\":1.000},"
         "\"trace_dropped\":false,\"trace\":\"aps5-trace-abc-7.json.gz\"}\n";
     Check(line == expected, "summary line changed");
@@ -339,6 +340,7 @@ void IntervalSummaryFields() {
         "\"resolution\":\"1920x1080\",\"window\":{\"spec\":\"summary_every 30\",\"first_present\":120,\"ms\":40.000},\"interval_start_s\":30.500,\"interval_end_s\":60.250,\"presents\":2,"
         "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
         "\"worker_busy_pct\":{\"queue worker 0x0\":30.000},"
+        "\"worker_packet_stages_ms_per_frame\":{},"
         "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000},"
         "\"trace_dropped\":false,\"trace\":\"\"}\n";
     Check(line == expected, "interval summary line changed");

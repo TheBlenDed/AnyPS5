@@ -445,6 +445,7 @@ class TraceFormat {
 public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::array<std::string_view, 5> WorkerBusyScopes{"Driver.Packet", "Driver.Suspend", "Driver.EndSubmission", "Driver.Rewind", "Driver.Completion"};
+    static constexpr std::string_view WorkerPacketScope = "Driver.Packet";
     static constexpr std::string_view WorkerWaitScope = "Driver.WorkerWait";
     static constexpr std::string_view WorkerPrefix = "queue worker ";
     static constexpr std::size_t TopPhases = 8;
@@ -610,6 +611,7 @@ public:
             bool totalsFull = false;
         };
         std::vector<DroppedThread> droppedList;
+        std::map<std::string, std::map<std::string, Clock::duration>> workerPacketStages;
         for (const auto& thread : threads) {
             dropped = dropped || thread.dropped;
             if (thread.eventsLost != 0 || thread.totalsFull) {
@@ -626,10 +628,29 @@ public:
                 if (scope != WorkerWaitScope) phases[Name(total.scope, total.stage)] += total.length;
             }
             if (!thread.name.starts_with(WorkerPrefix)) continue;
+            for (const auto& total : thread.totals) {
+                if (total.scope == WorkerPacketScope && total.stage != nullptr) workerPacketStages[thread.name][total.stage] += total.length;
+            }
             if (!firstWorker) output += ',';
             firstWorker = false;
             AppendString(output, thread.name);
             output += ':' + number(span != Clock::duration{} ? 100.0 * static_cast<double>(busy.count()) / static_cast<double>(span.count()) : 0.0);
+        }
+        output += "},\"worker_packet_stages_ms_per_frame\":{";
+        bool firstWorkerStage = true;
+        for (const auto& [threadName, stages] : workerPacketStages) {
+            if (!firstWorkerStage) output += ',';
+            firstWorkerStage = false;
+            AppendString(output, threadName);
+            output += ":{";
+            bool firstStage = true;
+            for (const auto& [stage, length] : stages) {
+                if (!firstStage) output += ',';
+                firstStage = false;
+                AppendString(output, stage);
+                output += ':' + number(milliseconds(length) * perPresent);
+            }
+            output += '}';
         }
         output += "},\"top_phases_ms_per_frame\":{";
         std::vector<std::pair<std::string, Clock::duration>> top(phases.begin(), phases.end());
