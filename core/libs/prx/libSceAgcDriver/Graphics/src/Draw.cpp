@@ -3514,6 +3514,17 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         Require(binding.color.partialWriteMask == 0 || (reads == 1 && MultisampleTargetStorable(context, binding.color)), "the partial write of a multisampled packed color target does not store into the target's image");
         if (binding.color.partialWriteMask != 0) static_cast<void>(MultisampleTargetStorageView(context, TargetMergeSurface(binding.color)));
     }
+    if (!lean) {
+        for (std::size_t index = 0; index < targets.size(); ++index) {
+            if (targets[index].color.partialWriteMask == 0) continue;
+            std::fprintf(stderr, "[gpu] merged partial write at draw %llu: recordDraws=%d recorder=%d dumpLimit=%d reason=%s transitions=%d targets=%zu\n", static_cast<unsigned long long>(draw.indexAddress), recordDraws ? 1 : 0, recorder != nullptr ? 1 : 0, dumpLimit, SyncReasonNames[outcome.reason], drawTransitions ? 1 : 0, targets.size());
+            for (std::size_t other = 0; other < targets.size(); ++other) {
+                const auto& candidate = targets[other];
+                std::fprintf(stderr, "[gpu]   target %zu address=0x%llx format=%d extent=%ux%u samples=%u tile=%d partial=0x%x resident=%d proxied=%d\n", other, static_cast<unsigned long long>(candidate.color.address), static_cast<int>(candidate.color.format), candidate.color.extent.width, candidate.color.extent.height, static_cast<unsigned>(candidate.color.samples), static_cast<int>(candidate.color.tileMode), static_cast<unsigned>(candidate.color.partialWriteMask), candidate.resident != nullptr ? 1 : 0, candidate.proxied ? 1 : 0);
+            }
+            break;
+        }
+    }
     for (const auto& binding : targets) {
         if (binding.color.partialWriteMask == 0 || binding.multisampled) continue;
         Require(lean, std::string("a partial write of a packed color target is merged into its resident image by a recorded draw only, but this draw was not recorded: ") + SyncReasonNames[outcome.reason] + (drawTransitions ? ", transitions on" : ""));
