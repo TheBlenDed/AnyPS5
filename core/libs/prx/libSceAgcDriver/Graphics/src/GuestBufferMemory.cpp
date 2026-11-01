@@ -4468,6 +4468,16 @@ void GuestBufferMemory::AcquireRegistered() {
             copiedBytes += committed;
             const char* reason = !mirrorsEnabled() ? "mirrors disabled by APS5_NO_LEASE_MIRROR" : copied.sparse ? "unreadable pages" : !range->releasable ? "image mirror refused" : nullptr;
             copies.push_back({copied.begin, copied.end, committed, reason, reason == nullptr, overBudget});
+            {
+                static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                static std::atomic<std::uint64_t> reported{0};
+                if (profile && reported.fetch_add(1, std::memory_order_relaxed) < 200) {
+                    std::fprintf(stderr, "[copiedregion] 0x%llx+0x%llx writable=%d sparse=%d releasable=%d overBudget=%d reason=%s\n",
+                        static_cast<unsigned long long>(copied.begin), static_cast<unsigned long long>(copied.end - copied.begin),
+                        copied.writable ? 1 : 0, copied.sparse ? 1 : 0, range->releasable ? 1 : 0, overBudget ? 1 : 0,
+                        reason != nullptr ? reason : "import refused or mirror unavailable");
+                }
+            }
         }
         releaseImportedMirrors(context, imported);
         regionsSorted = sortedLookup;
@@ -7022,6 +7032,18 @@ bool GuestBufferMemory::HasCopiedWrites() const {
         if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) continue;
         // Writes into a read-only image mirror are never stored (its pages could not take them).
         if (region.mirror != nullptr && !region.mirror->writable) continue;
+        {
+            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            static std::atomic<std::uint64_t> reported{0};
+            if (profile && reported.fetch_add(1, std::memory_order_relaxed) < 200) {
+                std::fprintf(stderr, "[copiedwrite] 0x%llx+0x%llx in region 0x%llx+0x%llx direct=%d gpuCopy=%d copiedBack=%d mirror=%s writable=%d hostBacked=%d sparse=%d\n",
+                    static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin),
+                    static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin),
+                    region.direct != nullptr ? 1 : 0, region.gpuCopy ? 1 : 0, region.copiedBack ? 1 : 0,
+                    region.mirror != nullptr ? (region.mirror->writable ? "writable" : "readonly") : "none",
+                    region.writable ? 1 : 0, region.hostBacked ? 1 : 0, region.sparse ? 1 : 0);
+            }
+        }
         return true;
     }
     return false;

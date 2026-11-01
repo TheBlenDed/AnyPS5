@@ -3946,6 +3946,11 @@ void ShaderResources::noteReusable() {
     const bool candidate = profileTemplates && usesBda && drawBuild && bdaReadOnly && BdaTemplatesOn();
     const auto refuse = [&](TemplateOutcome outcome) {
         if (candidate) CountTemplateOutcome(outcome);
+        if (profileTemplates && !drawBuild) {
+            static std::atomic<std::uint64_t> seq{0};
+            const auto n = seq.fetch_add(1, std::memory_order_relaxed);
+            if (n < 256 || (n % 4096) == 0) std::fprintf(stderr, "[reusable-refuse] %s\n", TemplateOutcomeName(outcome));
+        }
     };
     bdaTemplate = false;
     sharedUses = false;

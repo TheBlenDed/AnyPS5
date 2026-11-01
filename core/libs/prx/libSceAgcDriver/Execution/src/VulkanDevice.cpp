@@ -6581,6 +6581,16 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
+    if (profile) {
+        const char* why = recipeOut == nullptr ? "recipeOut=null" : !DispatchRecipes() ? "recipes-off" : !cacheable ? "not-cacheable" : overlay != nullptr ? "overlay" : !resources->Reusable() ? "not-reusable" : resources->NeedsCompletion() ? "needs-completion" : objects == nullptr ? "objects=null" : !contentKey.empty() ? nullptr : "content-key-empty";
+        if (why != nullptr) {
+            static std::atomic<std::uint64_t> seq{0};
+            const auto n = seq.fetch_add(1, std::memory_order_relaxed);
+            if (n < 256 || (n % 4096) == 0) {
+                std::fprintf(stderr, "[norecipe] 0x%llx %s\n", static_cast<unsigned long long>(programAddress != 0 ? programAddress : shader.PipelineVariantId()), why);
+            }
+        }
+    }
     if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
