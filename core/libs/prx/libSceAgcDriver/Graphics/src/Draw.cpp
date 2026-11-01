@@ -3516,7 +3516,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     for (const auto& binding : targets) {
         if (binding.color.partialWriteMask == 0 || binding.multisampled) continue;
-        Require(lean && binding.resident != nullptr && !binding.proxied, "a partial write of a packed color target is merged into its resident image by a recorded draw only");
+        Require(lean, std::string("a partial write of a packed color target is merged into its resident image by a recorded draw only, but this draw was not recorded: ") + SyncReasonNames[outcome.reason] + (drawTransitions ? ", transitions on" : ""));
+        Require(binding.resident != nullptr, "a partial write of a packed color target is merged into its resident image by a recorded draw only, but the target has no resident image");
+        Require(!binding.proxied, "a partial write of a packed color target is merged into its resident image by a recorded draw only, but the target is proxied");
         const auto images = resources->StorageImages();
         Require(std::ranges::any_of(images, [&](const std::pair<VkImage, bool>& image) { return image.first == binding.resident->Image() && image.second; }), "the partial write of a packed color target does not store into the target's resident image");
     }
