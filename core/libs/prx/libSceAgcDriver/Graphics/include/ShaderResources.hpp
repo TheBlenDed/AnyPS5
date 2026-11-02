@@ -874,7 +874,7 @@ public:
 
 private:
     void erase(const Key& key);
-    void drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted);
+    void drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted, const char* reason);
     void noteMiss(const Key& key);
     void noteEvicted(const Key& key);
     void noteReturn(const Key& key);

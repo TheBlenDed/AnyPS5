@@ -5597,7 +5597,7 @@ void ResourceCache::noteMiss(const Key& key) {
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
-    if (const auto found = index.find(key); found != index.end()) drop(found->second, evicted);
+    if (const auto found = index.find(key); found != index.end()) drop(found->second, evicted, "replace");
     // A set binding a sampled texture the sampled cache let go would keep its image alive outside
     // the cache's budget: it serves its own use only. Checked under this mutex, after which an
     // eviction's RemoveTextures finds the entry (the eviction marks the texture first).
@@ -5628,7 +5628,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         while (victim != entries.begin() && victim->second->ReusesAddressSpace() != address) --victim;
         if (victim->second->ReusesAddressSpace() != address) break;
         noteEvicted(victim->first);
-        drop(victim, evicted);
+        drop(victim, evicted, address ? "address" : "capacity");
     }
     if (entries.front().second->TableElements() == 0) return;
     std::uint64_t tables = 0;
@@ -5641,7 +5641,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         }
         tables -= elements;
         const auto victim = it--;
-        drop(victim, evicted);
+        drop(victim, evicted, "table");
     }
 }
 
@@ -5672,7 +5672,7 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
-        drop(it++, evicted);
+        drop(it++, evicted, "image");
     }
 }
 
@@ -5685,7 +5685,7 @@ void ResourceCache::RemoveTextures(const std::unordered_set<const Texture*>& tex
     }
     std::sort(binding.begin(), binding.end(), [](const auto& first, const auto& second) { return std::less<>{}(&*first, &*second); });
     binding.erase(std::unique(binding.begin(), binding.end()), binding.end());
-    for (const auto entry : binding) drop(entry, evicted);
+    for (const auto entry : binding) drop(entry, evicted, "texture");
     if (!binding.empty()) SampledAtomics().droppedSets.fetch_add(binding.size(), std::memory_order_relaxed);
 }
 
@@ -5712,7 +5712,13 @@ void ResourceCache::indexTextures(decltype(entries)::iterator entry, bool add) {
     }
 }
 
-void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+void ResourceCache::drop(std::list<std::pair<Key, std::shared_ptr<ShaderResources>>>::iterator entry, std::vector<std::shared_ptr<ShaderResources>>* evicted, const char* reason) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        static std::atomic<std::uint64_t> seen{0};
+        const auto at = seen.fetch_add(1, std::memory_order_relaxed);
+        if (at < 512 || (at & 1023u) == 0) std::fprintf(stderr, "[tpl-evict] %s\n", reason);
+    }
     entry->second->PinTextures(false);
     if (entry->second->ReusesAddressSpace()) --addressEntries;
     indexTextures(entry, false);
@@ -5792,7 +5798,7 @@ std::uint64_t ResourceCache::TableElements() const {
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
-    drop(found->second, nullptr);
+    drop(found->second, nullptr, "erase");
 }
 
 ResourceCache& SharedResourceCache() {
