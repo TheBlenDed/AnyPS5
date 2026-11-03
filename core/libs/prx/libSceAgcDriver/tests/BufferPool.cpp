@@ -267,6 +267,49 @@ void VramIntegratedKeepsPool() {
     Expect(mock.budgetQueries == 5 && mock.frees == 0 && mock.liveBytes == 256 * MiB, "an integrated GPU's pool followed the device-local heap's budget");
 }
 
+void VramCrowdedGate() {
+    mock = MockDevice{};
+    mock.heapBudget = HeapBytes;
+    mock.otherUsage = HeapBytes / 2;
+    {
+        VramBudget vram(budgetContext());
+        vram.Refresh();
+        Expect(!vram.Crowded(), "a heap at half budget reported itself crowded");
+    }
+    mock.otherUsage = HeapBytes;
+    {
+        VramBudget vram(budgetContext());
+        vram.Refresh();
+        Expect(vram.Crowded(), "a heap used past its budget was not crowded");
+    }
+    mock.otherUsage = HeapBytes - 511 * MiB;
+    {
+        VramBudget vram(budgetContext());
+        vram.Refresh();
+        Expect(vram.Crowded(), "a heap leaving less than its headroom was not crowded");
+    }
+    mock.otherUsage = HeapBytes - 512 * MiB;
+    {
+        VramBudget vram(budgetContext());
+        vram.Refresh();
+        Expect(!vram.Crowded(), "a heap leaving exactly its headroom was crowded");
+    }
+    mock.heapBudget = 0;
+    mock.otherUsage = HeapBytes - 511 * MiB;
+    {
+        VramBudget vram(budgetContext());
+        vram.Refresh();
+        Expect(vram.Crowded(), "an unreported budget did not fall back to the heap size");
+    }
+    mock.heapBudget = HeapBytes;
+    mock.otherUsage = HeapBytes / 2;
+    {
+        VramBudget vram(budgetContext(true));
+        vram.Refresh();
+        Expect(!vram.Crowded(), "an integrated GPU without a device-local budget was crowded");
+    }
+}
+
 std::uint64_t diagnosticBudgetQueries = 0;
 
 VKAPI_ATTR void VKAPI_CALL mockDiagnosticMemoryProperties2(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
@@ -1392,6 +1435,7 @@ int main(int argc, char** argv) {
         VramOverTargetReleases();
         VramTrimsPool();
         VramIntegratedKeepsPool();
+        VramCrowdedGate();
         CacheReclaimRecovery();
         ImageCacheReclaim();
         ImageMemoryReuse();

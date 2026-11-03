@@ -5021,9 +5021,22 @@ std::uint64_t writtenShadowVramDenominator() {
     return denominator;
 }
 
+bool writtenShadowBudgetGate() {
+    static const bool enabled = std::getenv("APS5_WRITTEN_SHADOW_BUDGET_GATE") != nullptr;
+    return enabled;
+}
+
 bool writtenShadowAffordable(const Context& context) {
     auto& vram = GetBufferPool(context)->Vram();
-    return !vram.Enabled() || !vram.AtLeastFraction(1, writtenShadowVramDenominator());
+    static std::atomic<bool> announced{false};
+    if (!announced.exchange(true, std::memory_order_relaxed)) {
+        if (!vram.Enabled()) std::fprintf(stderr, "[wshadow] VRAM gate: none (no device-local heap budget); written shadow is always affordable\n");
+        else if (writtenShadowBudgetGate()) std::fprintf(stderr, "[wshadow] VRAM gate: budget-aware (APS5_WRITTEN_SHADOW_BUDGET_GATE); written shadow is affordable while the device-local heap keeps its headroom free\n");
+        else std::fprintf(stderr, "[wshadow] VRAM gate: denominator (APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR = %llu); written shadow is affordable below 1/%llu of the heap\n", static_cast<unsigned long long>(writtenShadowVramDenominator()), static_cast<unsigned long long>(writtenShadowVramDenominator()));
+    }
+    if (!vram.Enabled()) return true;
+    if (writtenShadowBudgetGate()) return !vram.Crowded();
+    return !vram.AtLeastFraction(1, writtenShadowVramDenominator());
 }
 
 std::uint64_t atomicStageMax() {

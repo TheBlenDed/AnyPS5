@@ -40,6 +40,11 @@ public:
     void Refresh();
     VkDeviceSize Excess();
     bool AtLeastFraction(VkDeviceSize numerator, VkDeviceSize denominator);
+    // True when the device-local heap's usage leaves less than its headroom (HeadroomFor) free
+    // against its VK_EXT_memory_budget budget, the budget clamped to the heap size and the heap
+    // size taken when the budget is unreported; false without a device-local heap or a budget. The
+    // reserved headroom, not a fraction of the heap, is what protects the remaining budget.
+    bool Crowded();
     void Released(VkDeviceSize bytes);
     VramReport Report() const;
 
