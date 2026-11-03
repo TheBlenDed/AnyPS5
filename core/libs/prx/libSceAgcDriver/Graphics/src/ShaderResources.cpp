@@ -1996,7 +1996,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             clearReuses.fetch_add(1, std::memory_order_relaxed);
         } else {
         std::vector<std::byte> snapshot(bytes);
+        const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         ReadTextureSurface(resource, *keys, snapshot);
+        if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotRead, readStart);
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
@@ -2005,7 +2007,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
         }
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
+        const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         entry.texture = createTexture(*context.detiler, resource, components, snapshot, depthCompare, spill);
+        if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotBuild, buildStart);
         ++cache.counts.made;
         ++cache.totals.made;
         cache.madeSurfaces.insert(address * 0x9e3779b97f4a7c15ull ^ guestBytes);
@@ -2016,8 +2020,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             cache.totals.spilledBytes += entry.texture->AllocationBytes();
         }
         if (*keys == DccKeys::Uncompressed) {
+            const auto hashStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
             GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotHash, hashStart);
         }
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);

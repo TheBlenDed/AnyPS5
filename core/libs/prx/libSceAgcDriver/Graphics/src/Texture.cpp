@@ -2425,7 +2425,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "snapshot read", "snapshot hash", "snapshot build"};
     return kind < Count ? names[kind] : "?";
 }
 
