@@ -421,7 +421,7 @@ void DefineModule(SpirvEmitterState& state) {
         if (merge && !pixel.psEarlyZ && pixel.mergeDepthStencilTests && WritesGuestMemory(state.program)) {
             throw std::runtime_error(mergeName + " merges inside the pixel shader after early depth and stencil tests, which a shader that writes guest memory (stores, atomics or GDS) under late tests cannot use: the pixels the tests reject would still write it");
         }
-        if ((pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.QuadMasked()) || merge) {
+        if ((pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.QuadMasked()) || (merge && (pixel.mergeDepthStencilTests || pixel.mergeDepthStencilWrites))) {
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeEarlyFragmentTests);
         }
         if (pixel.psOrderedPixelShader || merge) {

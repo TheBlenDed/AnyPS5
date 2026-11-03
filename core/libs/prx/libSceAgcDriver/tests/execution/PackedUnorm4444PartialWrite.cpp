@@ -424,24 +424,34 @@ void DepthRejection(AgcDriver::VulkanDevice& device, Block& block, const ColorTa
     ExpectWords(device, block, layout, expected, before, "an X merge at z 0.25 in front of every stored depth");
 }
 
+void ExpectKilled(AgcDriver::VulkanDevice& device, const Block& block, const ColorTargetLayout& layout, const std::vector<std::uint16_t>& before, std::uint32_t word, std::uint32_t wordMask, const std::string& what);
+
 void CountedKill(AgcDriver::VulkanDevice& device, Block& block, const ColorTargetLayout& layout, const AgcDriver::Graphics::ColorTarget& color) {
+    std::uint64_t base = 0;
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         auto* recorder = AgcDriver::Graphics::Recorder::Active();
         Require(recorder != nullptr, "the test device has no command recorder to count samples");
         recorder->CountSamples();
+        base = recorder->SamplesTotal();
     }
     const auto before = Fill(block, 501u);
     const std::array<float, 4> rgba{0.6f, 0.2f, 0.8f, 0.4f};
-    std::string refusal;
-    try {
-        DrawCase(device, color, 0x1u, 0xf000u, Float32Export, Float32Program(rgba, Kill::BeforeExport), {PositionInputs, LateKill});
-    } catch (const std::exception& error) {
-        refusal = error.what();
-    }
-    Require(refusal.find("while occlusion queries count samples") != std::string::npos, "a merge that kills under late tests drew while occlusion queries count samples" + (refusal.empty() ? std::string() : ": " + refusal));
+    const auto killedMask = DrawCase(device, color, 0x1u, 0xf000u, Float32Export, Float32Program(rgba, Kill::BeforeExport), {PositionInputs, LateKill});
+    ExpectKilled(device, block, layout, before, Packed(rgba), killedMask, "a late-test checkerboard-killed X merge while occlusion queries count samples");
     DrawCase(device, color, 0x1u, 0xf000u, Float32Export, Float32Program(rgba));
     ExpectSurface(device, block, layout, before, Packed(rgba), 0xf000u, "a merged X write that kills nothing while occlusion queries count samples");
+    std::uint64_t counted = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(recorder != nullptr, "the test device lost its command recorder before the sample count was read");
+        counted = recorder->SamplesTotal() - base;
+    }
+    constexpr std::uint64_t Killed = (ScissorWidth * Height) / 2u;
+    constexpr std::uint64_t Whole = ScissorWidth * Height;
+    Require(counted != 0, "the counted killing merge and its full write counted no samples");
+    if (device.graphicsContext().occlusionQueryPrecise) Require(counted == Killed + Whole, "an occlusion query counted " + std::to_string(counted) + " samples across a checkerboard-killing merge and a full write, not the " + std::to_string(Killed + Whole) + " of the surviving pixels plus the full write");
 }
 
 void ExpectKilled(AgcDriver::VulkanDevice& device, const Block& block, const ColorTargetLayout& layout, const std::vector<std::uint16_t>& before, std::uint32_t word, std::uint32_t wordMask, const std::string& what) {
@@ -522,7 +532,7 @@ int main() {
         SameDrawOverdraw(*device, block, layout, color, 0.8f, 0.2f, 402u);
         DepthRejection(*device, block, layout, color);
         CountedKill(*device, block, layout, color);
-        std::printf("4_4_4_4 unorm partial write tests passed: %zu masked draws, 3 back-to-back sequences, 4 checkerboard-killing draws, 2 same-draw overdraws of 16 layers, a depth-rejected merge and a refused killing merge while samples are counted, into a %ux%u tiled target, the killed, rejected and unscissored pixels kept\n", cases.size() + 1u, Width, Height);
+        std::printf("4_4_4_4 unorm partial write tests passed: %zu masked draws, 3 back-to-back sequences, 4 checkerboard-killing draws, 2 same-draw overdraws of 16 layers, a depth-rejected merge and a checkerboard-killing merge counted while samples are counted, into a %ux%u tiled target, the killed, rejected and unscissored pixels kept\n", cases.size() + 1u, Width, Height);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

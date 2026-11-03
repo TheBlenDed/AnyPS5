@@ -10651,7 +10651,7 @@ void unorm4_4_4_4TargetTests() {
                 writes += static_cast<spv::Op>(words[at] & 0xffffu) == spv::OpImageWrite ? 1u : 0u;
             }
             const auto what = std::string(registration ? "a registration" : "a specialized") + " 4_4_4_4 merge module";
-            Require(merged.registrationModule == registration && reads == 1u && writes == 1u && interlockShape(words) == "capability extension ordered begin end " && declaresEarlyFragmentTests(merging), what + " did not read and write the target once inside a pixel interlock after early tests: " + interlockShape(words));
+            Require(merged.registrationModule == registration && reads == 1u && writes == 1u && interlockShape(words) == "capability extension ordered begin end " && !declaresEarlyFragmentTests(merging), what + " did not read and write the target once inside a pixel interlock without early fragment tests, which a merge of a draw with no depth or stencil target does not need: " + interlockShape(words));
             Require(coherentImageRead(words), what + " does not read the target through a Coherent image variable");
             const auto bound = std::ranges::any_of(merged.bindings, [&](const ShaderRecompiler::DescriptorBinding& binding) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) return false;
@@ -10686,7 +10686,7 @@ void unorm4_4_4_4TargetTests() {
                 reads += static_cast<spv::Op>(words[at] & 0xffffu) == spv::OpImageRead ? 1u : 0u;
                 writes += static_cast<spv::Op>(words[at] & 0xffffu) == spv::OpImageWrite ? 1u : 0u;
             }
-            Require(reads == 1u && writes == 1u && interlockShape(words) == "capability extension ordered begin end " && declaresEarlyFragmentTests(killing), "a killing 4_4_4_4 merge module under late tests of a draw without depth or stencil writes did not merge inside a pixel interlock after early tests");
+            Require(reads == 1u && writes == 1u && interlockShape(words) == "capability extension ordered begin end " && !declaresEarlyFragmentTests(killing), "a killing 4_4_4_4 merge module under late tests of a draw without depth or stencil tests declared early fragment tests, which an occlusion query would count despite the kill");
         }
         killing.context.pixel->targetMerges.at(0).depthStencilWrites = true;
         expectFailure([&] { static_cast<void>(ShaderRecompiler::Recompile(killing)); }, "kills pixels under late tests of a draw writing depth or stencil");
