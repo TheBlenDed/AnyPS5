@@ -252,6 +252,28 @@ void fillContractTests() {
     for (std::size_t index = 0; index < partial.size(); ++index) Require(partial[index] == (index < 8u ? white[index % 4u] : std::byte{0}), "a clear fill over a partial trailing element did not zero the tail");
 }
 
+void readSurfaceWholeSpanTests() {
+    alignas(256) std::array<std::uint32_t, 256> texels{};
+    for (std::size_t index = 0; index < texels.size(); ++index) texels[index] = 0x10000000u + static_cast<std::uint32_t>(index);
+    alignas(64) std::array<std::uint8_t, sizeof(texels) / 256> keys{};
+    keys.fill(0x10);
+    GuestTextureResource resource{};
+    resource.baseAddress = reinterpret_cast<std::uint64_t>(texels.data());
+    resource.dccAddress = reinterpret_cast<std::uint64_t>(keys.data());
+    const std::size_t bytes = sizeof(texels);
+    const auto overGarbage = [&](std::uint32_t format, DccKeys dccKeys) {
+        resource.format = format;
+        std::vector<std::byte> garbage(bytes, std::byte{0xa5});
+        std::vector<std::byte> zeroed(bytes);
+        ReadTextureSurface(resource, dccKeys, garbage);
+        ReadTextureSurface(resource, dccKeys, zeroed);
+        return garbage == zeroed;
+    };
+    Require(overGarbage(74u, DccKeys::Uncompressed), "an uncompressed read must write every destination byte");
+    Require(overGarbage(56u, DccKeys::ClearSingle), "a comp-to-single read must write every destination byte");
+    Require(overGarbage(56u, DccKeys::Clear0000), "a clear-0000 read must write every destination byte");
+}
+
 }
 
 void RunTextureFormatTests() {
@@ -317,5 +339,6 @@ void RunTextureFormatTests() {
     singleDccKeysTests();
     packedFloatDccClearTests();
     fillContractTests();
+    readSurfaceWholeSpanTests();
     gcnBufferFormatTests();
 }

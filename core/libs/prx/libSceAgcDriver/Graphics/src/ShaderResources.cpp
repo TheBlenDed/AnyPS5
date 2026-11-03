@@ -1995,7 +1995,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             static std::atomic<std::uint64_t> clearReuses{0};
             clearReuses.fetch_add(1, std::memory_order_relaxed);
         } else {
-        std::vector<std::byte> snapshot(bytes);
+        static const bool uninitializedSnapshot = std::getenv("APS5_UNINITIALIZED_SNAPSHOT") != nullptr;
+        std::vector<std::byte> zeroed;
+        std::unique_ptr<std::byte[]> uninit;
+        std::span<std::byte> snapshot;
+        if (uninitializedSnapshot) {
+            uninit.reset(new std::byte[bytes]);
+            snapshot = std::span<std::byte>(uninit.get(), bytes);
+        } else {
+            zeroed.resize(bytes);
+            snapshot = std::span<std::byte>(zeroed.data(), zeroed.size());
+        }
         const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         ReadTextureSurface(resource, *keys, snapshot);
         if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotRead, readStart);
