@@ -125,6 +125,24 @@ struct OwnedProof {
     std::uint16_t skip = 0;
 };
 
+enum class OneOffProof : std::uint8_t { Stamped, CommittedPartial, UntrackedHinted, UntrackedUnhinted };
+
+OneOffProof oneOffProofFor(std::uint64_t generation, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& committed, const std::array<std::uint64_t, 4>& untracked) {
+    if (generation != 0) return OneOffProof::Stamped;
+    if (committed.has_value()) return OneOffProof::CommittedPartial;
+    return untracked[0] != 0 ? OneOffProof::UntrackedHinted : OneOffProof::UntrackedUnhinted;
+}
+
+LookupOutcomes::Kind oneOffHashKind(GuestMemory::UnchangedSinceWhy verdict, OneOffProof proof) {
+    if (verdict != GuestMemory::UnchangedSinceWhy::ZeroGeneration) return LookupOutcomes::OneOffHashOther;
+    switch (proof) {
+        case OneOffProof::CommittedPartial: return LookupOutcomes::OneOffHashCommittedPartial;
+        case OneOffProof::UntrackedHinted: return LookupOutcomes::OneOffHashUntrackedHinted;
+        case OneOffProof::UntrackedUnhinted: return LookupOutcomes::OneOffHashUntrackedUnhinted;
+        default: return LookupOutcomes::OneOffHashOther;
+    }
+}
+
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
@@ -198,6 +216,8 @@ struct TextureCache {
         std::uint64_t generation = 0;
         std::shared_ptr<Texture> kept;
         std::list<TextureKey>::iterator lru{};
+        OneOffProof proof = OneOffProof::Stamped;
+        GuestMemory::UntrackedWhy untrackedWhy = GuestMemory::UntrackedWhy::NotApplicable;
     };
     std::unordered_map<TextureKey, OneOff, TextureKeyHash> oneOffs;
     std::size_t oneOffsSwept = 0;
@@ -208,8 +228,27 @@ struct TextureCache {
     bool overflowTrimFailed = false;
     std::uint64_t overflowTrimRetired = 0;
     std::chrono::steady_clock::time_point overflowTrimAt{};
-    // Snapshots made and the distinct surfaces (address and size) they were made of, per report.
-    std::unordered_set<std::uint64_t> madeSurfaces;
+    // Snapshots made and the distinct surfaces (address and size) they were made of, per report,
+    // with each surface's cache hits, stale lookups and the stale lookups' cause: the surface stayed
+    // a view, its size or keys no longer matched, or its contents changed.
+    struct SurfaceChurn {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t hits = 0;
+        std::uint64_t stale = 0;
+        std::uint64_t made = 0;
+        std::uint64_t staleView = 0;
+        std::uint64_t staleBytes = 0;
+        std::uint64_t staleKeys = 0;
+        std::uint64_t staleChanged = 0;
+        std::uint64_t evicted = 0;
+        std::uint64_t madeAfterEvict = 0;
+    };
+    std::unordered_map<std::uint64_t, SurfaceChurn> madeSurfaces;
+    // Admission-evicted surface hashes not yet matched by a following make, a multiset bounded so it
+    // can only grow to a fixed number of surfaces no matter how long the run lasts. It survives the
+    // per-report clear of madeSurfaces, so a make just past a report boundary still counts.
+    std::unordered_map<std::uint64_t, std::uint32_t> evictedSurfaces;
     // makeRoom's last scan that found nothing to evict, repeated only once the recorder retired a
     // batch or 50 ms passed (a build binding thousands of textures would scan per texture).
     bool roomFailed = false;
@@ -484,6 +523,14 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
             break;
         } else {
             countEvicted(cache, *back, EvictionPath::Admission);
+            const auto evictedHash = back->address * 0x9e3779b97f4a7c15ull ^ back->bytes;
+            auto& evictedSurface = cache.madeSurfaces[evictedHash];
+            evictedSurface.address = back->address;
+            evictedSurface.bytes = back->bytes;
+            ++evictedSurface.evicted;
+            const auto pending = cache.evictedSurfaces.find(evictedHash);
+            if (pending != cache.evictedSurfaces.end()) ++pending->second;
+            else if (cache.evictedSurfaces.size() < 131072u) cache.evictedSurfaces.emplace(evictedHash, 1u);
             eraseTexture(cache, back);
         }
     }
@@ -539,14 +586,14 @@ void eraseOneOff(TextureCache& cache, std::unordered_map<TextureKey, TextureCach
     cache.oneOffs.erase(it);
 }
 
-void rememberOneOff(TextureCache& cache, const TextureKey& key, const std::shared_ptr<Texture>& texture, std::uint64_t bytes, std::vector<ContentHash::Hash128> hashes, DccKeys keys, std::uint64_t generation) {
+void rememberOneOff(TextureCache& cache, const TextureKey& key, const std::shared_ptr<Texture>& texture, std::uint64_t bytes, std::vector<ContentHash::Hash128> hashes, DccKeys keys, std::uint64_t generation, OneOffProof proof, GuestMemory::UntrackedWhy untrackedWhy) {
     if (cache.oneOffs.size() >= 2 * cache.oneOffsSwept + 1024) {
         std::erase_if(cache.oneOffs, [](const auto& entry) { return entry.second.kept == nullptr && entry.second.texture.expired(); });
         cache.oneOffsSwept = cache.oneOffs.size();
     }
     if (const auto found = cache.oneOffs.find(key); found != cache.oneOffs.end()) eraseOneOff(cache, found);
     auto& oneOff = cache.oneOffs[key];
-    oneOff = {texture, bytes, std::move(hashes), keys, generation, nullptr, {}};
+    oneOff = {texture, bytes, std::move(hashes), keys, generation, nullptr, {}, proof, untrackedWhy};
     if (texture->Spilled()) {
         oneOff.kept = texture;
         oneOff.lru = cache.overflowLru.insert(cache.overflowLru.begin(), key);
@@ -636,6 +683,13 @@ struct DropReleasedDependents {
     }
 };
 
+std::string TopSurfaceText(const TextureCache::SurfaceChurn* surface) {
+    if (surface == nullptr) return "none";
+    char text[256];
+    std::snprintf(text, sizeof(text), "0x%llx+0x%llx made %llu hit %llu stale %llu (view %llu bytes %llu keys %llu changed %llu) evicted %llu madeAfterEvict %llu", static_cast<unsigned long long>(surface->address), static_cast<unsigned long long>(surface->bytes), static_cast<unsigned long long>(surface->made), static_cast<unsigned long long>(surface->hits), static_cast<unsigned long long>(surface->stale), static_cast<unsigned long long>(surface->staleView), static_cast<unsigned long long>(surface->staleBytes), static_cast<unsigned long long>(surface->staleKeys), static_cast<unsigned long long>(surface->staleChanged), static_cast<unsigned long long>(surface->evicted), static_cast<unsigned long long>(surface->madeAfterEvict));
+    return text;
+}
+
 void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -652,8 +706,23 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     const auto sampled = SampledTextureMemory();
     const auto outside = sampled - std::min(sampled, cache.snapshotBytes);
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu textures cached, %llu used uncached (first use this frame, the least recently used entry used this frame or the last), %llu refused over the ceiling (%llu MiB), %llu evicted (%llu MiB), %llu in-use ones passed over, %llu found changed; %llu resource sets dropped with released textures, %llu not cached for binding one; %llu out-of-memory reclaims (%llu MiB); %llu snapshots placed in system memory past the share (%llu MiB), %llu one-off snapshots reused; %llu MiB in %zu entries, budget %llu MiB, ceiling %llu MiB; sampled images outside the cache %llu MiB (in recorded work and builds); storage budget %llu MiB, VRAM share of the texture caches %llu MiB; frame %llu\n", static_cast<unsigned long long>(counts.inserted), static_cast<unsigned long long>(counts.uncached), static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.refusedBytes >> 20u), static_cast<unsigned long long>(counts.evicted), static_cast<unsigned long long>(counts.evictedBytes >> 20u), static_cast<unsigned long long>(counts.passed), static_cast<unsigned long long>(counts.stale), static_cast<unsigned long long>(dropped - droppedBefore), static_cast<unsigned long long>(refusedSets - refusedSetsBefore), static_cast<unsigned long long>(reclaims - reclaimsBefore), static_cast<unsigned long long>((reclaimed - reclaimedBefore) >> 20u), static_cast<unsigned long long>(counts.spilled), static_cast<unsigned long long>(counts.spilledBytes >> 20u), static_cast<unsigned long long>(counts.oneOffReuses), static_cast<unsigned long long>(cache.bytes >> 20u), cache.entries.size(), static_cast<unsigned long long>(budgets.sampled >> 20u), static_cast<unsigned long long>(budgets.ceiling >> 20u), static_cast<unsigned long long>(outside >> 20u), static_cast<unsigned long long>(budgets.storage >> 20u), static_cast<unsigned long long>(budgets.target >> 20u), static_cast<unsigned long long>(Recorder::Presents()));
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu snapshots made of %zu distinct surfaces; %llu spilled snapshots reused, %llu kept ones dropped (%llu MiB), %llu batches waited for; overflow type %llu MiB of a %llu MiB budget, %llu MiB of it kept for reuse in %zu snapshots\n", static_cast<unsigned long long>(counts.made), cache.madeSurfaces.size(), static_cast<unsigned long long>(counts.spilledReuses), static_cast<unsigned long long>(counts.overflowDropped), static_cast<unsigned long long>(counts.overflowDroppedBytes >> 20u), static_cast<unsigned long long>(counts.overflowWaits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 20u), static_cast<unsigned long long>(budgets.overflow >> 20u), static_cast<unsigned long long>(cache.overflowKept >> 20u), cache.overflowLru.size());
-    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) evictions by path: admission %llu (%llu used this present or the last), share %llu (%llu), reclaim %llu (%llu); eviction frame %llu at present %llu\n", static_cast<unsigned long long>(counts.evictedBy[0]), static_cast<unsigned long long>(counts.evictedRecent[0]), static_cast<unsigned long long>(counts.evictedBy[1]), static_cast<unsigned long long>(counts.evictedRecent[1]), static_cast<unsigned long long>(counts.evictedBy[2]), static_cast<unsigned long long>(counts.evictedRecent[2]), static_cast<unsigned long long>(cache.frame), static_cast<unsigned long long>(Recorder::Presents()));
+    std::size_t distinctMade = 0;
+    std::uint64_t madeAfterEvictTotal = 0;
+    std::array<const TextureCache::SurfaceChurn*, 3> top{};
+    for (const auto& [key, surface] : cache.madeSurfaces) {
+        madeAfterEvictTotal += surface.madeAfterEvict;
+        if (surface.made == 0) continue;
+        ++distinctMade;
+        for (std::size_t i = 0; i < top.size(); ++i) {
+            if (top[i] == nullptr || surface.made > top[i]->made) {
+                for (std::size_t j = top.size() - 1; j > i; --j) top[j] = top[j - 1];
+                top[i] = &surface;
+                break;
+            }
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu snapshots made of %zu distinct surfaces; top re-snapshotted: [%s] [%s] [%s]; %llu spilled snapshots reused, %llu kept ones dropped (%llu MiB), %llu batches waited for; overflow type %llu MiB of a %llu MiB budget, %llu MiB of it kept for reuse in %zu snapshots\n", static_cast<unsigned long long>(counts.made), distinctMade, TopSurfaceText(top[0]).c_str(), TopSurfaceText(top[1]).c_str(), TopSurfaceText(top[2]).c_str(), static_cast<unsigned long long>(counts.spilledReuses), static_cast<unsigned long long>(counts.overflowDropped), static_cast<unsigned long long>(counts.overflowDroppedBytes >> 20u), static_cast<unsigned long long>(counts.overflowWaits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 20u), static_cast<unsigned long long>(budgets.overflow >> 20u), static_cast<unsigned long long>(cache.overflowKept >> 20u), cache.overflowLru.size());
+    AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) evictions by path: admission %llu (%llu used this present or the last), share %llu (%llu), reclaim %llu (%llu); eviction frame %llu at present %llu; snapshots made after an admission eviction of the same surface %llu\n", static_cast<unsigned long long>(counts.evictedBy[0]), static_cast<unsigned long long>(counts.evictedRecent[0]), static_cast<unsigned long long>(counts.evictedBy[1]), static_cast<unsigned long long>(counts.evictedRecent[1]), static_cast<unsigned long long>(counts.evictedBy[2]), static_cast<unsigned long long>(counts.evictedRecent[2]), static_cast<unsigned long long>(cache.frame), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(madeAfterEvictTotal));
     cache.madeSurfaces.clear();
     droppedBefore = dropped;
     refusedSetsBefore = refusedSets;
@@ -819,6 +888,36 @@ void noteSnapshotCompare(SnapshotCompare reason, bool equal, bool narrowed, cons
     AgcDriver::ProfilePrint_nid_no_patch("[texhash] snapshot compares (10 s) by reason:%s; %llu narrowed to written blocks; blocks hashed %llu (%.1f MiB), skipped %llu (%.1f MiB); untracked ranges' blocks: write-watched %llu, hinted %llu, outside the arena %llu, host region %llu, unwatched without hint %llu, walk refused %llu; partly readable %llu, layout changed %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.hashedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.hashedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, static_cast<unsigned long long>(counters.skippedBlocks.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.skippedBytes.exchange(0, std::memory_order_relaxed)) / 1048576.0, covered, hinted, outside, hostRegion, unhinted, refused, partial, layoutChanged);
 }
 
+struct OneOffFallbackCounters {
+    std::array<std::atomic<std::uint64_t>, 6> reasons{};
+    std::atomic<std::uint64_t> unchanged{0};
+    std::atomic<std::uint64_t> changed{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+OneOffFallbackCounters& OneOffFallbacks() {
+    static OneOffFallbackCounters counters;
+    return counters;
+}
+
+void noteOneOffFallback(GuestMemory::UnchangedSinceWhy verdict, bool unchanged) {
+    static constexpr std::array<const char*, 6> names{"unchanged", "invalid range", "not write-watched", "generation 0", "range not covered", "write-stamp changed"};
+    auto& counters = OneOffFallbacks();
+    counters.reasons[static_cast<std::size_t>(verdict)].fetch_add(1, std::memory_order_relaxed);
+    if (unchanged) counters.unchanged.fetch_add(1, std::memory_order_relaxed);
+    else counters.changed.fetch_add(1, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::string reasons;
+    for (std::size_t i = 1; i < names.size(); ++i) {
+        const auto count = counters.reasons[i].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        reasons += " " + std::string(names[i]) + " " + std::to_string(count);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[one-off] hash fallback (10 s) by reason:%s; unchanged %llu, changed %llu\n", reasons.c_str(), static_cast<unsigned long long>(counters.unchanged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.changed.exchange(0, std::memory_order_relaxed)));
+}
+
 const std::vector<std::uint8_t>& pendingBlocks(std::uint64_t address, std::size_t bytes, std::size_t count) {
     thread_local std::vector<std::uint8_t>* pendingSlot = nullptr;
     auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
@@ -838,13 +937,166 @@ const std::vector<std::uint8_t>& pendingBlocks(std::uint64_t address, std::size_
     return pending;
 }
 
-bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t since, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& before, SnapshotCompare reason) {
+struct OneOffProbeTiming {
+    std::uint64_t pendingNs = 0;
+    std::uint64_t flushNs = 0;
+    std::uint64_t compareNs = 0;
+};
+
+struct OneOffProbeIdentity {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::uint64_t count = 0;
+};
+
+struct OneOffProbeCounters {
+    std::uint64_t sequence = 0;
+    std::uint64_t attempts = 0;
+    std::uint64_t cadenceSkipped = 0;
+    std::uint64_t samples = 0;
+    std::uint64_t skipTooLarge = 0;
+    std::uint64_t skipSampleCap = 0;
+    std::uint64_t skipByteCap = 0;
+    std::uint64_t skipTimeBudget = 0;
+    std::uint64_t windowBytes = 0;
+    std::uint64_t windowWalkNs = 0;
+    std::uint64_t pendingNs = 0;
+    std::uint64_t flushNs = 0;
+    std::uint64_t compareNs = 0;
+    std::array<std::uint64_t, 6> classes{};
+    std::uint64_t overflow = 0;
+    std::int64_t lastReport = 0;
+    AgcDriver::Mutex mutex;
+    std::vector<OneOffProbeIdentity> identities;
+};
+
+OneOffProbeCounters& OneOffProbes() {
+    static OneOffProbeCounters counters;
+    return counters;
+}
+
+bool OneOffProbeEnabled() {
+    static const bool enabled = std::getenv("APS5_ONEOFF_PROBE") != nullptr;
+    return enabled;
+}
+
+constexpr std::uint64_t OneOffProbeRatio = 64;
+constexpr std::uint64_t OneOffProbeMaxSamples = 32;
+constexpr std::uint64_t OneOffProbeMaxWindowBytes = 64ull * 1024ull * 1024ull;
+constexpr std::uint64_t OneOffProbeMaxSampleBytes = 16ull * 1024ull * 1024ull;
+constexpr std::uint64_t OneOffProbeWalkBudgetNs = 5000000ull;
+
+void oneOffProbeReport(OneOffProbeCounters& counters, std::uint64_t elapsedMs) {
+    std::uint64_t repeated = 0;
+    for (const auto& identity : counters.identities) repeated += identity.count - 1;
+    AgcDriver::ProfilePrint_nid_no_patch("[oneoff-probe] (%.2f s): attempts %llu = cadence-skipped %llu + samples %llu + skips[too large %llu, sample cap %llu, byte cap %llu, time budget %llu]; pending blocks %.2f ms, flush %.2f ms, compare %.2f ms; extra walk %.2f ms over %llu bytes (%.2f MiB); classes covered %llu, hinted %llu, outside %llu, host region %llu, unhinted %llu, refused %llu; sampled identities distinct %zu, repeats %llu, overflow %llu\n", static_cast<double>(elapsedMs) / 1000.0, static_cast<unsigned long long>(counters.attempts), static_cast<unsigned long long>(counters.cadenceSkipped), static_cast<unsigned long long>(counters.samples), static_cast<unsigned long long>(counters.skipTooLarge), static_cast<unsigned long long>(counters.skipSampleCap), static_cast<unsigned long long>(counters.skipByteCap), static_cast<unsigned long long>(counters.skipTimeBudget), static_cast<double>(counters.pendingNs) / 1e6, static_cast<double>(counters.flushNs) / 1e6, static_cast<double>(counters.compareNs) / 1e6, static_cast<double>(counters.windowWalkNs) / 1e6, static_cast<unsigned long long>(counters.windowBytes), static_cast<double>(counters.windowBytes) / 1048576.0, static_cast<unsigned long long>(counters.classes[0]), static_cast<unsigned long long>(counters.classes[1]), static_cast<unsigned long long>(counters.classes[2]), static_cast<unsigned long long>(counters.classes[3]), static_cast<unsigned long long>(counters.classes[4]), static_cast<unsigned long long>(counters.classes[5]), counters.identities.size(), static_cast<unsigned long long>(repeated), static_cast<unsigned long long>(counters.overflow));
+    counters.attempts = 0;
+    counters.cadenceSkipped = 0;
+    counters.samples = 0;
+    counters.skipTooLarge = 0;
+    counters.skipSampleCap = 0;
+    counters.skipByteCap = 0;
+    counters.skipTimeBudget = 0;
+    counters.windowBytes = 0;
+    counters.windowWalkNs = 0;
+    counters.pendingNs = 0;
+    counters.flushNs = 0;
+    counters.compareNs = 0;
+    counters.classes.fill(0);
+    counters.identities.clear();
+    counters.overflow = 0;
+}
+
+void oneOffProbeTick() {
+    auto& counters = OneOffProbes();
+    const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<AgcDriver::Mutex> lock(counters.mutex);
+    if (counters.lastReport == 0) {
+        counters.lastReport = nowMs;
+        return;
+    }
+    const auto elapsed = nowMs - counters.lastReport;
+    if (elapsed < 10000) return;
+    counters.lastReport = nowMs;
+    oneOffProbeReport(counters, static_cast<std::uint64_t>(elapsed));
+}
+
+bool oneOffProbeBegin(std::size_t bytes) {
+    auto& counters = OneOffProbes();
+    std::lock_guard<AgcDriver::Mutex> lock(counters.mutex);
+    ++counters.attempts;
+    const auto sequence = counters.sequence++;
+    if (sequence % OneOffProbeRatio != 0) {
+        ++counters.cadenceSkipped;
+        return false;
+    }
+    if (bytes > OneOffProbeMaxSampleBytes) {
+        ++counters.skipTooLarge;
+        return false;
+    }
+    if (counters.samples >= OneOffProbeMaxSamples) {
+        ++counters.skipSampleCap;
+        return false;
+    }
+    if (counters.windowBytes + bytes > OneOffProbeMaxWindowBytes) {
+        ++counters.skipByteCap;
+        return false;
+    }
+    if (counters.windowWalkNs > OneOffProbeWalkBudgetNs) {
+        ++counters.skipTimeBudget;
+        return false;
+    }
+    ++counters.samples;
+    counters.windowBytes += bytes;
+    return true;
+}
+
+void oneOffProbeSample(std::uint64_t address, std::size_t bytes, const OneOffProbeTiming& timing) {
+    thread_local std::vector<std::uint8_t>* staleSlot = nullptr;
+    auto& stale = ShaderRecompiler::ThreadOwned(staleSlot);
+    stale.assign(GuestMemory::HashBlockCount(address, bytes), 1);
+    GuestMemory::UntrackedBlocks kinds;
+    const auto walkStart = std::chrono::steady_clock::now();
+    GuestMemory::WalkUntrackedBlocks(address, bytes, 0, stale, &kinds, nullptr, nullptr);
+    const auto walkNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStart).count());
+    auto& counters = OneOffProbes();
+    std::lock_guard<AgcDriver::Mutex> lock(counters.mutex);
+    counters.windowWalkNs += walkNs;
+    counters.pendingNs += timing.pendingNs;
+    counters.flushNs += timing.flushNs;
+    counters.compareNs += timing.compareNs;
+    counters.classes[0] += kinds.covered;
+    counters.classes[1] += kinds.hinted;
+    counters.classes[2] += kinds.outside;
+    counters.classes[3] += kinds.hostRegion;
+    counters.classes[4] += kinds.unhinted;
+    counters.classes[5] += kinds.refused;
+    for (auto& identity : counters.identities) {
+        if (identity.address == address && identity.bytes == bytes) {
+            ++identity.count;
+            return;
+        }
+    }
+    if (counters.identities.size() < 256) counters.identities.push_back({address, bytes, 1});
+    else ++counters.overflow;
+}
+
+bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t since, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& before, SnapshotCompare reason, OneOffProbeTiming* timing = nullptr) {
     const bool narrow = since != 0 && BlockRevalidateEnabled() && hashes.size() == GuestMemory::HashBlockCount(address, bytes);
+    const auto probeStart = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto& pending = pendingBlocks(address, bytes, narrow ? hashes.size() : 0);
+    const auto probePending = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
     GuestMemory::FlushGpuWrites(address, bytes);
+    const auto probeFlush = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     GuestMemory::BlockMatch match;
     const bool equal = narrow ? GuestMemory::CommittedBlocksMatchSince(address, bytes, hashes, since, before.has_value() ? &*before : nullptr, pending, &match) : GuestMemory::CommittedBlocksMatch(address, bytes, hashes);
+    if (timing != nullptr) {
+        const auto probeCompare = std::chrono::steady_clock::now();
+        timing->pendingNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(probePending - probeStart).count());
+        timing->flushNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(probeFlush - probePending).count());
+        timing->compareNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(probeCompare - probeFlush).count());
+    }
     if (!SnapshotComparesProfiled()) return equal;
     if (!narrow) match = {hashes.size(), 0, bytes, 0};
     noteSnapshotCompare(reason, equal, narrow, match, nullptr);
@@ -1334,13 +1586,25 @@ std::uint64_t storageBudget(const Context& context, std::uint64_t required = 0) 
 // key changed: a write-watch mark in the range, a driver store, a mapping change or a recorded GPU
 // write (as StorageTexture::compareUntracked). Taken before the snapshot is read or compared, so a
 // CPU store racing with that leaves a mark for the next key. Zero when the range has no hint.
-std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t bytes) {
-    if (GuestMemory::CollectEpoch() == 0) return {};
-    const auto hint = GuestMemory::UntrackedHint(address, bytes);
-    if (hint == 0) return {};
+std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t bytes, GuestMemory::UntrackedWhy& why) {
+    if (GuestMemory::CollectEpoch() == 0) {
+        why = GuestMemory::UntrackedWhy::EpochZero;
+        return {};
+    }
+    GuestMemory::UntrackedWhy hintWhy = GuestMemory::UntrackedWhy::NotApplicable;
+    const auto hint = GuestMemory::UntrackedHint(address, bytes, &hintWhy);
+    if (hint == 0) {
+        why = hintWhy;
+        return {};
+    }
     const auto* recorder = Recorder::Active();
     const std::array<std::uint64_t, 4> key{hint, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
-    return (key[2] & 1u) == 0 ? key : std::array<std::uint64_t, 4>{};
+    if ((key[2] & 1u) != 0) {
+        why = GuestMemory::UntrackedWhy::ForgetSerialOdd;
+        return {};
+    }
+    why = GuestMemory::UntrackedWhy::Hinted;
+    return key;
 }
 
 std::span<const std::uint32_t> firstLayerWords(std::span<const std::uint32_t> words, std::optional<ShaderRecompiler::DescriptorImageShape> shape, std::array<std::uint32_t, 8>& narrowed, bool report) {
@@ -1413,6 +1677,248 @@ void boundOverflow(const Context& context) {
         }
         keepUntilRetired(doomed);
     }
+}
+
+enum class LookupProbeKind : std::uint8_t {
+    CollectWrites,
+    BufferAllocZeroInit,
+    MakeRoom,
+    AdmitTexture,
+    HitCompare,
+    OneOffCompare,
+    Count,
+};
+
+const char* LookupProbeName(LookupProbeKind kind) {
+    static constexpr const char* names[static_cast<std::size_t>(LookupProbeKind::Count)] = {"CollectWrites", "buffer alloc/zero-init", "makeRoom", "admitTexture", "hit compare", "one-off compare"};
+    const auto index = static_cast<std::size_t>(kind);
+    return index < static_cast<std::size_t>(LookupProbeKind::Count) ? names[index] : "?";
+}
+
+enum class LookupProbeOutcome : std::uint8_t {
+    HitSnapshot,
+    MadeSnapshot,
+    Other,
+    Count,
+};
+
+const char* LookupProbeOutcomeName(LookupProbeOutcome outcome) {
+    static constexpr const char* names[static_cast<std::size_t>(LookupProbeOutcome::Count)] = {"snapshot hit", "made snapshot", "other"};
+    const auto index = static_cast<std::size_t>(outcome);
+    return index < static_cast<std::size_t>(LookupProbeOutcome::Count) ? names[index] : "?";
+}
+
+const char* UntrackedWhyName(GuestMemory::UntrackedWhy why) {
+    static constexpr const char* names[static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)] = {"n/a", "hinted", "epoch-zero", "invalid-range", "not-watched", "hint-empty", "hint-outside", "hint-unhinted", "hint-covered", "hint-host-region", "walk-refused", "newest-hint-zero", "forget-odd"};
+    const auto index = static_cast<std::size_t>(why);
+    return index < static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count) ? names[index] : "?";
+}
+
+bool LookupProbeEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_SNAPSHOT_LOOKUP_PROBE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+double LookupProbeReportInterval() {
+    static const double seconds = [] {
+        const char* value = std::getenv("APS5_SNAPSHOT_LOOKUP_PROBE_INTERVAL");
+        if (value == nullptr || value[0] == '\0') return 10.0;
+        char* end = nullptr;
+        const long long parsed = std::strtoll(value, &end, 10);
+        if (end == value || *end != '\0' || parsed < 0 || parsed > 3600) return 10.0;
+        return static_cast<double>(parsed);
+    }();
+    return seconds;
+}
+
+bool LookupProbeSelectTick() {
+    static std::atomic<std::uint64_t> tick{0};
+    return (tick.fetch_add(1, std::memory_order_relaxed) & 63ull) == 0ull;
+}
+
+struct LookupProbeAccumulator {
+    std::array<std::uint64_t, static_cast<std::size_t>(LookupProbeKind::Count)> counts{};
+    std::array<double, static_cast<std::size_t>(LookupProbeKind::Count)> wallMs{};
+    std::array<double, static_cast<std::size_t>(LookupProbeKind::Count)> waitMs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(LookupProbeOutcome::Count)> outcomeCounts{};
+    std::array<double, static_cast<std::size_t>(LookupProbeOutcome::Count)> outcomeWallMs{};
+    std::array<double, static_cast<std::size_t>(LookupProbeOutcome::Count)> outcomeWaitMs{};
+    std::uint64_t attempts = 0;
+    std::uint64_t selected = 0;
+    std::uint64_t requestedBytes = 0;
+    std::uint64_t hitSuccess = 0;
+    std::uint64_t hitFail = 0;
+    std::uint64_t oneOffSuccess = 0;
+    std::uint64_t oneOffFail = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)> oneOffReasonCounts{};
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)> oneOffReasonBytes{};
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)> oneOffReasonSuccess{};
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)> oneOffReasonFail{};
+    std::array<double, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)> oneOffReasonWallMs{};
+    std::array<double, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)> oneOffReasonWaitMs{};
+};
+
+LookupProbeAccumulator& ThreadLookupProbe() {
+    thread_local LookupProbeAccumulator probe;
+    return probe;
+}
+
+void LookupProbeAdd(LookupProbeKind kind, std::chrono::steady_clock::time_point start, double waitAtStart) {
+    auto& probe = ThreadLookupProbe();
+    const auto index = static_cast<std::size_t>(kind);
+    const auto now = std::chrono::steady_clock::now();
+    ++probe.counts[index];
+    probe.wallMs[index] += std::chrono::duration<double, std::milli>(now - start).count();
+    probe.waitMs[index] += std::max(0.0, Recorder::ThreadWaitedMs() - waitAtStart);
+}
+
+void LookupProbeAddOneOff(std::chrono::steady_clock::time_point start, double waitAtStart, std::size_t bytes, bool unchanged, std::size_t reason) {
+    auto& probe = ThreadLookupProbe();
+    const auto now = std::chrono::steady_clock::now();
+    const auto wall = std::chrono::duration<double, std::milli>(now - start).count();
+    const auto wait = std::max(0.0, Recorder::ThreadWaitedMs() - waitAtStart);
+    const auto kind = static_cast<std::size_t>(LookupProbeKind::OneOffCompare);
+    ++probe.counts[kind];
+    probe.wallMs[kind] += wall;
+    probe.waitMs[kind] += wait;
+    ++(unchanged ? probe.oneOffSuccess : probe.oneOffFail);
+    ++probe.oneOffReasonCounts[reason];
+    probe.oneOffReasonBytes[reason] += bytes;
+    probe.oneOffReasonWallMs[reason] += wall;
+    probe.oneOffReasonWaitMs[reason] += wait;
+    ++(unchanged ? probe.oneOffReasonSuccess[reason] : probe.oneOffReasonFail[reason]);
+}
+
+void LookupProbeEnd(LookupProbeOutcome outcome, std::chrono::steady_clock::time_point start, double waitAtStart) {
+    auto& probe = ThreadLookupProbe();
+    const auto index = static_cast<std::size_t>(outcome);
+    const auto now = std::chrono::steady_clock::now();
+    ++probe.outcomeCounts[index];
+    probe.outcomeWallMs[index] += std::chrono::duration<double, std::milli>(now - start).count();
+    probe.outcomeWaitMs[index] += std::max(0.0, Recorder::ThreadWaitedMs() - waitAtStart);
+}
+
+struct LookupProbeGuard {
+    LookupProbeOutcome outcome = LookupProbeOutcome::Other;
+    const bool active;
+    const std::chrono::steady_clock::time_point start;
+    const double waitAtStart;
+    LookupProbeGuard(bool isActive, std::chrono::steady_clock::time_point atStart, double waited) : active(isActive), start(atStart), waitAtStart(waited) {}
+    LookupProbeGuard(const LookupProbeGuard&) = delete;
+    LookupProbeGuard& operator=(const LookupProbeGuard&) = delete;
+    ~LookupProbeGuard() {
+        if (active) LookupProbeEnd(outcome, start, waitAtStart);
+    }
+};
+
+struct LookupProbeProfile {
+    AgcDriver::Mutex mutex;
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(LookupProbeKind::Count)>, 2> counts{};
+    std::array<std::array<double, static_cast<std::size_t>(LookupProbeKind::Count)>, 2> wallMs{};
+    std::array<std::array<double, static_cast<std::size_t>(LookupProbeKind::Count)>, 2> waitMs{};
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(LookupProbeOutcome::Count)>, 2> outcomeCounts{};
+    std::array<std::array<double, static_cast<std::size_t>(LookupProbeOutcome::Count)>, 2> outcomeWallMs{};
+    std::array<std::array<double, static_cast<std::size_t>(LookupProbeOutcome::Count)>, 2> outcomeWaitMs{};
+    std::array<std::uint64_t, 2> attempts{}, selected{}, requestedBytes{}, hitSuccess{}, hitFail{}, oneOffSuccess{}, oneOffFail{};
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)>, 2> oneOffReasonCounts{};
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)>, 2> oneOffReasonBytes{};
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)>, 2> oneOffReasonSuccess{};
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)>, 2> oneOffReasonFail{};
+    std::array<std::array<double, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)>, 2> oneOffReasonWallMs{};
+    std::array<std::array<double, static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count)>, 2> oneOffReasonWaitMs{};
+    std::chrono::steady_clock::time_point windowBegin = std::chrono::steady_clock::now();
+    std::uint64_t beginPresents = Recorder::Presents();
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+LookupProbeProfile& LookupProbes() {
+    static LookupProbeProfile profile;
+    return profile;
+}
+
+void noteLookupProbe(const LookupProbeAccumulator& before) {
+    if (!LookupProbeEnabled()) return;
+    const auto& after = ThreadLookupProbe();
+    const auto endPresents = Recorder::Presents();
+    const std::size_t side = GuestMemory::GpuLockThreadTag() == 0xffffffffu ? 0 : 1;
+    auto& profile = LookupProbes();
+    std::lock_guard lock(profile.mutex);
+    const auto kindCount = static_cast<std::size_t>(LookupProbeKind::Count);
+    const auto outcomeCount = static_cast<std::size_t>(LookupProbeOutcome::Count);
+    for (std::size_t kind = 0; kind < kindCount; ++kind) {
+        profile.counts[side][kind] += after.counts[kind] - before.counts[kind];
+        profile.wallMs[side][kind] += after.wallMs[kind] - before.wallMs[kind];
+        profile.waitMs[side][kind] += after.waitMs[kind] - before.waitMs[kind];
+    }
+    for (std::size_t outcome = 0; outcome < outcomeCount; ++outcome) {
+        profile.outcomeCounts[side][outcome] += after.outcomeCounts[outcome] - before.outcomeCounts[outcome];
+        profile.outcomeWallMs[side][outcome] += after.outcomeWallMs[outcome] - before.outcomeWallMs[outcome];
+        profile.outcomeWaitMs[side][outcome] += after.outcomeWaitMs[outcome] - before.outcomeWaitMs[outcome];
+    }
+    const auto reasonCount = static_cast<std::size_t>(GuestMemory::UntrackedWhy::Count);
+    for (std::size_t reason = 0; reason < reasonCount; ++reason) {
+        profile.oneOffReasonCounts[side][reason] += after.oneOffReasonCounts[reason] - before.oneOffReasonCounts[reason];
+        profile.oneOffReasonBytes[side][reason] += after.oneOffReasonBytes[reason] - before.oneOffReasonBytes[reason];
+        profile.oneOffReasonSuccess[side][reason] += after.oneOffReasonSuccess[reason] - before.oneOffReasonSuccess[reason];
+        profile.oneOffReasonFail[side][reason] += after.oneOffReasonFail[reason] - before.oneOffReasonFail[reason];
+        profile.oneOffReasonWallMs[side][reason] += after.oneOffReasonWallMs[reason] - before.oneOffReasonWallMs[reason];
+        profile.oneOffReasonWaitMs[side][reason] += after.oneOffReasonWaitMs[reason] - before.oneOffReasonWaitMs[reason];
+    }
+    profile.attempts[side] += after.attempts - before.attempts;
+    profile.selected[side] += after.selected - before.selected;
+    profile.requestedBytes[side] += after.requestedBytes - before.requestedBytes;
+    profile.hitSuccess[side] += after.hitSuccess - before.hitSuccess;
+    profile.hitFail[side] += after.hitFail - before.hitFail;
+    profile.oneOffSuccess[side] += after.oneOffSuccess - before.oneOffSuccess;
+    profile.oneOffFail[side] += after.oneOffFail - before.oneOffFail;
+    const auto now = std::chrono::steady_clock::now();
+    const auto intervalSeconds = LookupProbeReportInterval();
+    if (std::chrono::duration<double>(now - profile.lastReport).count() < intervalSeconds) return;
+    profile.lastReport = now;
+    const auto beginSeconds = std::chrono::duration<double>(profile.windowBegin.time_since_epoch()).count();
+    const auto endSeconds = std::chrono::duration<double>(now.time_since_epoch()).count();
+    static constexpr const char* sides[2] = {"untagged threads (draw committer, presenter)", "queue workers"};
+    for (std::size_t which = 0; which < 2; ++which) {
+        std::string report;
+        char text[128];
+        for (std::size_t kind = 0; kind < kindCount; ++kind) {
+            if (profile.counts[which][kind] == 0) continue;
+            std::snprintf(text, sizeof(text), " %s %llux%.1fms(wait%.1fms)", LookupProbeName(static_cast<LookupProbeKind>(kind)), static_cast<unsigned long long>(profile.counts[which][kind]), profile.wallMs[which][kind], profile.waitMs[which][kind]);
+            report += text;
+        }
+        std::string outcomes;
+        for (std::size_t outcome = 0; outcome < outcomeCount; ++outcome) {
+            if (profile.outcomeCounts[which][outcome] == 0) continue;
+            std::snprintf(text, sizeof(text), " %s %llux%.1fms(wait%.1fms)", LookupProbeOutcomeName(static_cast<LookupProbeOutcome>(outcome)), static_cast<unsigned long long>(profile.outcomeCounts[which][outcome]), profile.outcomeWallMs[which][outcome], profile.outcomeWaitMs[which][outcome]);
+            outcomes += text;
+        }
+        std::string reasons;
+        for (std::size_t reason = 0; reason < reasonCount; ++reason) {
+            if (profile.oneOffReasonCounts[which][reason] == 0) continue;
+            std::snprintf(text, sizeof(text), " %s %llux/%lluB %.1fms(wait%.1fms) ok/bad %llu/%llu", UntrackedWhyName(static_cast<GuestMemory::UntrackedWhy>(reason)), static_cast<unsigned long long>(profile.oneOffReasonCounts[which][reason]), static_cast<unsigned long long>(profile.oneOffReasonBytes[which][reason]), profile.oneOffReasonWallMs[which][reason], profile.oneOffReasonWaitMs[which][reason], static_cast<unsigned long long>(profile.oneOffReasonSuccess[which][reason]), static_cast<unsigned long long>(profile.oneOffReasonFail[which][reason]));
+            reasons += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[lookup-probe] (%.0f s) %s: %llu of %llu lookups sampled (%llu requested bytes); hit compare success/fail %llu/%llu; one-off success/fail %llu/%llu; window begin %.3f s end %.3f s (steady) presents %llu..%llu; per-outcome whole lookup:%s; one-off compare by creation reason:%s;%s\n", intervalSeconds, sides[which], static_cast<unsigned long long>(profile.selected[which]), static_cast<unsigned long long>(profile.attempts[which]), static_cast<unsigned long long>(profile.requestedBytes[which]), static_cast<unsigned long long>(profile.hitSuccess[which]), static_cast<unsigned long long>(profile.hitFail[which]), static_cast<unsigned long long>(profile.oneOffSuccess[which]), static_cast<unsigned long long>(profile.oneOffFail[which]), beginSeconds, endSeconds, static_cast<unsigned long long>(profile.beginPresents), static_cast<unsigned long long>(endPresents), outcomes.c_str(), reasons.c_str(), report.c_str());
+        profile.counts[which] = {};
+        profile.wallMs[which] = {};
+        profile.waitMs[which] = {};
+        profile.outcomeCounts[which] = {};
+        profile.outcomeWallMs[which] = {};
+        profile.outcomeWaitMs[which] = {};
+        profile.oneOffReasonCounts[which] = {};
+        profile.oneOffReasonBytes[which] = {};
+        profile.oneOffReasonSuccess[which] = {};
+        profile.oneOffReasonFail[which] = {};
+        profile.oneOffReasonWallMs[which] = {};
+        profile.oneOffReasonWaitMs[which] = {};
+        profile.attempts[which] = profile.selected[which] = profile.requestedBytes[which] = 0;
+        profile.hitSuccess[which] = profile.hitFail[which] = profile.oneOffSuccess[which] = profile.oneOffFail[which] = 0;
+    }
+    profile.windowBegin = now;
+    profile.beginPresents = endPresents;
 }
 
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
@@ -1494,6 +2000,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    const bool probe = LookupProbeEnabled();
+    const bool probeSel = probe && LookupProbeSelectTick();
+    if (probe) {
+        auto& probeAcc = ThreadLookupProbe();
+        ++probeAcc.attempts;
+        if (probeSel) {
+            ++probeAcc.selected;
+            probeAcc.requestedBytes += bytes;
+        }
+    }
+    LookupProbeGuard probeGuard{probeSel, probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}, probeSel ? Recorder::ThreadWaitedMs() : 0.0};
     static_cast<void>(FlushDepthPlanes(address, bytes));
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
@@ -1570,7 +2087,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // UnchangedSince (here and on a cache hit) looks at them: the checks only compare stamped blocks,
     // so a write the game made since the last walk is invisible until a collect stamps its page. The
     // walk is memoized per packet, so a texture viewed from a storage image repeats it for free.
+    const auto cwStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto cwWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
     auto generation = GuestMemory::CollectWrites(address, bytes);
+    if (probeSel) LookupProbeAdd(LookupProbeKind::CollectWrites, cwStart, cwWait);
     if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->GenerationFor(address, bytes))) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
         refreshForView(*source, resource);
@@ -1701,7 +2221,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             committed = std::move(ranges);
         }
     }
-    const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
+    GuestMemory::UntrackedWhy untrackedWhy = GuestMemory::UntrackedWhy::NotApplicable;
+    const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes, untrackedWhy) : std::array<std::uint64_t, 4>{};
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     const DropReleasedDependents dropAfterUnlock;
@@ -1738,6 +2259,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
                 reportTextureCounters();
+                auto& surface = cache.madeSurfaces[address * 0x9e3779b97f4a7c15ull ^ guestBytes];
+                surface.address = address;
+                surface.bytes = guestBytes;
+                ++surface.hits;
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
@@ -1755,8 +2280,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                     }
                     return untracked[0] == 0 ? SnapshotCompare::Untracked : SnapshotCompare::HintMoved;
                 }();
-                if (!collected && *keys == DccKeys::Uncompressed) return untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, it->blockLayout, reason, it->owned);
-                return snapshotStillMatches(address, bytes, it->hashes, collected ? it->generation : 0, it->committed, reason);
+                const auto hcStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const auto hcWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
+                const bool result = (!collected && *keys == DccKeys::Uncompressed) ? untrackedStillMatches(address, bytes, it->hashes, it->blockSince, it->blockGuard, it->blockLayout, reason, it->owned) : snapshotStillMatches(address, bytes, it->hashes, collected ? it->generation : 0, it->committed, reason);
+                if (probeSel) {
+                    LookupProbeAdd(LookupProbeKind::HitCompare, hcStart, hcWait);
+                    auto& probeAcc = ThreadLookupProbe();
+                    ++(result ? probeAcc.hitSuccess : probeAcc.hitFail);
+                }
+                return result;
             };
             const auto unchanged = [&] {
                 if (it->committed != committed) return false;
@@ -1862,9 +2394,24 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr, false, it->committed.has_value() ? snapshotGeneration : 0, it->committed});
                 reportTextureCounters();
+                auto& surface = cache.madeSurfaces[address * 0x9e3779b97f4a7c15ull ^ guestBytes];
+                surface.address = address;
+                surface.bytes = guestBytes;
+                ++surface.hits;
+                probeGuard.outcome = LookupProbeOutcome::HitSnapshot;
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
             }
+        }
+        {
+            auto& surface = cache.madeSurfaces[address * 0x9e3779b97f4a7c15ull ^ guestBytes];
+            surface.address = address;
+            surface.bytes = guestBytes;
+            ++surface.stale;
+            if (it->source != nullptr) ++surface.staleView;
+            else if (it->bytes != guestBytes) ++surface.staleBytes;
+            else if (keys.has_value() && it->keys != *keys) ++surface.staleKeys;
+            else ++surface.staleChanged;
         }
         eraseTexture(cache, it);
         ++cache.counts.stale;
@@ -1892,8 +2439,29 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             auto& oneOff = found->second;
             auto texture = oneOff.texture.lock();
             const auto current = [&] {
-                if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, bytes, oneOff.generation)) return true;
-                return snapshotStillMatches(address, bytes, oneOff.hashes, generation != 0 ? oneOff.generation : 0, std::nullopt, SnapshotCompare::OneOff);
+                const auto validateStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                if (OneOffProbeEnabled()) oneOffProbeTick();
+                if (*keys != DccKeys::Uncompressed) {
+                    if (profile) LookupOutcomes::Add(LookupOutcomes::OneOffDcc, validateStart);
+                    return true;
+                }
+                const auto verdict = GuestMemory::ClassifyUnchangedSince(address, bytes, oneOff.generation);
+                if (verdict == GuestMemory::UnchangedSinceWhy::Unchanged) {
+                    if (profile) LookupOutcomes::Add(LookupOutcomes::OneOffStamp, validateStart);
+                    return true;
+                }
+                OneOffProbeTiming probeTiming;
+                const bool probeSampled = verdict == GuestMemory::UnchangedSinceWhy::ZeroGeneration && OneOffProbeEnabled() && oneOffProbeBegin(bytes);
+                const auto ocStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const auto ocWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
+                const bool unchanged = snapshotStillMatches(address, bytes, oneOff.hashes, generation != 0 ? oneOff.generation : 0, std::nullopt, SnapshotCompare::OneOff, probeSampled ? &probeTiming : nullptr);
+                if (probeSel) LookupProbeAddOneOff(ocStart, ocWait, bytes, unchanged, static_cast<std::size_t>(oneOff.untrackedWhy));
+                if (probeSampled) oneOffProbeSample(address, bytes, probeTiming);
+                if (profile) {
+                    LookupOutcomes::Add(oneOffHashKind(verdict, oneOff.proof), validateStart);
+                    noteOneOffFallback(verdict, unchanged);
+                }
+                return unchanged;
             };
             if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current()) {
                 ++cache.counts.oneOffReuses;
@@ -1906,16 +2474,30 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 texture->NoteUse(useSerial());
                 CachedTexture entry{key, address, guestBytes, std::move(oneOff.hashes), texture, *keys, generation};
                 entry.accounted = texture->AllocationBytes();
-                if (!texture->Spilled() && admitTexture(cache, key, entry.accounted, budgets)) {
+                const auto admitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const auto atoStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const auto atoWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
+                const auto spilled = texture->Spilled();
+                const bool promoted = !spilled && admitTexture(cache, key, entry.accounted, budgets);
+                if (probeSel && !spilled) LookupProbeAdd(LookupProbeKind::AdmitTexture, atoStart, atoWait);
+                if (profile) LookupOutcomes::Add(promoted ? LookupOutcomes::OneOffPromoted : LookupOutcomes::OneOffRefused, admitStart);
+                if (promoted) {
                     eraseOneOff(cache, found);
                     insert(std::move(entry), texture);
                 } else {
                     oneOff.hashes = std::move(entry.hashes);
                     oneOff.generation = generation;
+                    oneOff.proof = oneOffProofFor(generation, committed, untracked);
+                    oneOff.untrackedWhy = untrackedWhy;
                 }
                 logLookup({texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportCacheCounts(cache, budgets);
                 reportTextureCounters();
+                auto& surface = cache.madeSurfaces[address * 0x9e3779b97f4a7c15ull ^ guestBytes];
+                surface.address = address;
+                surface.bytes = guestBytes;
+                ++surface.hits;
+                probeGuard.outcome = LookupProbeOutcome::HitSnapshot;
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return texture;
             }
@@ -1999,6 +2581,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         std::vector<std::byte> zeroed;
         std::unique_ptr<std::byte[]> uninit;
         std::span<std::byte> snapshot;
+        const auto bailStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto bailWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
         if (uninitializedSnapshot) {
             uninit.reset(new std::byte[bytes]);
             snapshot = std::span<std::byte>(uninit.get(), bytes);
@@ -2006,6 +2590,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             zeroed.resize(bytes);
             snapshot = std::span<std::byte>(zeroed.data(), zeroed.size());
         }
+        if (probeSel) LookupProbeAdd(LookupProbeKind::BufferAllocZeroInit, bailStart, bailWait);
         const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         ReadTextureSurface(resource, *keys, snapshot);
         if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotRead, readStart);
@@ -2016,13 +2601,30 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
         }
-        const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
+        const bool spill = [&] {
+            if (!SpillEnabled()) return false;
+            const auto mrStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto mrWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
+            const bool ok = makeRoom(cache, bytes, budgets);
+            if (probeSel) LookupProbeAdd(LookupProbeKind::MakeRoom, mrStart, mrWait);
+            return !ok;
+        }();
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         entry.texture = createTexture(*context.detiler, resource, components, snapshot, depthCompare, spill);
         if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotBuild, buildStart);
         ++cache.counts.made;
         ++cache.totals.made;
-        cache.madeSurfaces.insert(address * 0x9e3779b97f4a7c15ull ^ guestBytes);
+        auto& surface = cache.madeSurfaces[address * 0x9e3779b97f4a7c15ull ^ guestBytes];
+        surface.address = address;
+        surface.bytes = guestBytes;
+        ++surface.made;
+        const auto makeHash = address * 0x9e3779b97f4a7c15ull ^ guestBytes;
+        const auto pending = cache.evictedSurfaces.find(makeHash);
+        if (pending != cache.evictedSurfaces.end()) {
+            ++surface.madeAfterEvict;
+            if (pending->second > 1u) --pending->second;
+            else cache.evictedSurfaces.erase(pending);
+        }
         if (entry.texture->Spilled()) {
             ++cache.counts.spilled;
             ++cache.totals.spilled;
@@ -2045,12 +2647,18 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     auto texture = entry.texture;
     texture->NoteUse(useSerial());
-    if (texture->Spilled() || !admitTexture(cache, key, entry.accounted, budgets)) {
+    const bool spilled = texture->Spilled();
+    const auto atmStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto atmWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
+    const bool admitted = !spilled && admitTexture(cache, key, entry.accounted, budgets);
+    if (probeSel && !spilled) LookupProbeAdd(LookupProbeKind::AdmitTexture, atmStart, atmWait);
+    if (spilled || !admitted) {
         texture->SetSampledCacheState(Texture::CacheState::Released);
-        if (source == nullptr) rememberOneOff(cache, key, texture, guestBytes, std::move(entry.hashes), *keys, generation);
+        if (source == nullptr) rememberOneOff(cache, key, texture, guestBytes, std::move(entry.hashes), *keys, generation, oneOffProofFor(generation, committed, untracked), untrackedWhy);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budgets);
         reportTextureCounters();
+        probeGuard.outcome = source == nullptr ? LookupProbeOutcome::MadeSnapshot : LookupProbeOutcome::Other;
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
         return texture;
     }
@@ -2058,6 +2666,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     insert(std::move(entry), texture);
     reportCacheCounts(cache, budgets);
     reportTextureCounters();
+    probeGuard.outcome = source == nullptr ? LookupProbeOutcome::MadeSnapshot : LookupProbeOutcome::Other;
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
     return texture;
 }
@@ -3694,6 +4303,8 @@ void ShaderResources::buildComplete() {
         // storage elements of one mip chain share the previous element's image.
         const bool imagesProfiled = BuildProfiled();
         const auto outcomesBefore = imagesProfiled ? ThreadLookupOutcomes() : LookupOutcomes{};
+        const bool probeActive = LookupProbeEnabled();
+        const LookupProbeAccumulator probeBefore = probeActive ? ThreadLookupProbe() : LookupProbeAccumulator{};
         const auto deferredCount = deferredImages.size();
         auto imagesMark = imagesProfiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto lapImages = [&] {
@@ -3728,6 +4339,7 @@ void ShaderResources::buildComplete() {
             if (storageWritten[index] && storageTextures[index] != nullptr && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) depthWrites.push_back(storageTextures[index]);
         }
         if (depthWrites.size() > 1) ValidateStorageDepthWrites(context, depthWrites);
+        if (probeActive) noteLookupProbe(probeBefore);
         if (imagesProfiled) noteCompleteImages(outcomesBefore, deferredCount, deferredMs, storageTablesMs, imageTablesMs, lapImages());
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
@@ -7226,6 +7838,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
+    std::size_t movedBytes = 0;
     if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return moved;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
@@ -7264,10 +7877,12 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+                if (bytes > maxDrawSnapshotBytes - movedBytes) return std::nullopt;
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
                 if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
+                movedBytes += bytes;
             }
         }
     }

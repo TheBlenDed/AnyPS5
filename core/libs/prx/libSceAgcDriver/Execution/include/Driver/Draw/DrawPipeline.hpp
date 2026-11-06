@@ -203,6 +203,7 @@ private:
     std::uint64_t committerIdles = 0;
     std::uint64_t committerIdleNs = 0;
     std::uint64_t committerWakeNs = 0;
+    std::uint64_t sojournNs = 0;
     std::uint64_t writeScans = 0;
     std::uint64_t writeScanSamples = 0;
     std::uint64_t writeScanItems = 0;

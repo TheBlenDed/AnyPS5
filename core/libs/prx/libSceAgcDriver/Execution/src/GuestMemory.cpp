@@ -1061,12 +1061,31 @@ struct WriteTracker {
         }
     }
 
-    bool hinted(std::uint64_t first, std::uint64_t stop) const {
-        if (first >= stop || first < base || stop > base + size) return false;
-        for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) {
-            if (hintOf(block) == 0 || coverage.Covers(blockBegin(block), static_cast<std::size_t>(std::min<std::uint64_t>(WriteBlockBytes, base + size - blockBegin(block))))) return false;
+    bool hinted(std::uint64_t first, std::uint64_t stop, UntrackedWhy* why = nullptr) const {
+        if (first >= stop) {
+            if (why != nullptr) *why = UntrackedWhy::HintEmpty;
+            return false;
         }
-        return !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
+        if (first < base || stop > base + size) {
+            if (why != nullptr) *why = UntrackedWhy::HintOutside;
+            return false;
+        }
+        for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) {
+            if (hintOf(block) == 0) {
+                if (why != nullptr) *why = UntrackedWhy::HintUnhinted;
+                return false;
+            }
+            if (coverage.Covers(blockBegin(block), static_cast<std::size_t>(std::min<std::uint64_t>(WriteBlockBytes, base + size - blockBegin(block))))) {
+                if (why != nullptr) *why = UntrackedWhy::HintCovered;
+                return false;
+            }
+        }
+        if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first))) {
+            if (why != nullptr) *why = UntrackedWhy::HintHostRegion;
+            return false;
+        }
+        if (why != nullptr) *why = UntrackedWhy::Hinted;
+        return true;
     }
 
     std::uint32_t newestHint(std::uint64_t first, std::uint64_t stop) const {
@@ -1991,13 +2010,19 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
-bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+UnchangedSinceWhy ClassifyUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return UnchangedSinceWhy::InvalidRange;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
-    return tracker.rangeUnchanged(address, bytes, generation);
+    if (!tracker.watched) return UnchangedSinceWhy::NotWatched;
+    if (generation == 0) return UnchangedSinceWhy::ZeroGeneration;
+    if (!tracker.covers(address, bytes)) return UnchangedSinceWhy::NotCovered;
+    return tracker.rangeUnchanged(address, bytes, generation) ? UnchangedSinceWhy::Unchanged : UnchangedSinceWhy::StampChanged;
+}
+
+bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    return ClassifyUnchangedSince(address, bytes, generation) == UnchangedSinceWhy::Unchanged;
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
@@ -2268,9 +2293,12 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
 }
 #endif
 
-std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
+std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes, UntrackedWhy* why) {
 #ifdef _WIN32
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) {
+        if (why != nullptr) *why = UntrackedWhy::InvalidRange;
+        return 0;
+    }
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
@@ -2278,7 +2306,11 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || !tracker.hinted(first, stop)) return 0;
+    if (!tracker.watched) {
+        if (why != nullptr) *why = UntrackedWhy::NotWatched;
+        return 0;
+    }
+    if (!tracker.hinted(first, stop, why)) return 0;
     const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemo.entries.begin(), threadHintMemo.entries.end(), [&](const WriteTracker::Memo& entry) {
@@ -2288,13 +2320,19 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
     } else {
         const TimedAccess timed(CounterCollect, bytes);
-        if (!walkHints(tracker, first, stop)) return 0;
+        if (!walkHints(tracker, first, stop)) {
+            if (why != nullptr) *why = UntrackedWhy::WalkRefused;
+            return 0;
+        }
         if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched, mapping};
     }
-    return tracker.newestHint(first, stop);
+    const auto hint = tracker.newestHint(first, stop);
+    if (why != nullptr) *why = hint == 0 ? UntrackedWhy::NewestHintZero : UntrackedWhy::Hinted;
+    return hint;
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
+    static_cast<void>(why);
     return 0;
 #endif
 }

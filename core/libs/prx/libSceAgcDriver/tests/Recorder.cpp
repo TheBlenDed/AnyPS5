@@ -3673,6 +3673,11 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         const auto reads = memory.InPlaceReads();
         Require(reads.size() == 1 && reads[0].first == element && reads[0].second == element + elementBytes, "an imported region is not an in-place read");
         Require(memory.Writes().empty(), "a readable element counts as written");
+        const std::array<std::pair<std::uint64_t, std::size_t>, 7> probes{{{element, 1}, {element + elementBytes - 1, 1}, {element + elementBytes, 64}, {element - 64, 64}, {element - 64, 65}, {address, bytes}, {element + 16, 16}}};
+        for (const auto& [probe, probeBytes] : probes) {
+            const bool listed = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return probe < range.second && range.first < probe + probeBytes; });
+            Require(memory.InPlaceReadsOverlap(probe, probeBytes) == listed, "the in-place read overlap walk disagrees with the listed reads");
+        }
     }
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;
@@ -3912,6 +3917,9 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         ShaderResources resources(context, compute, {}, false, dispatchThreads);
         const auto reads = resources.InPlaceReads();
+        for (const auto& [begin, end] : reads) {
+            Require(resources.ReadsOverlap(begin, 1) && resources.ReadsOverlap(end - 1, 1) && !resources.ReadsOverlap(end, 1), "a build's read overlap disagrees with its listed reads");
+        }
         const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return range.first <= element && range.second >= element + elementBytes; });
         resources.MarkGpuWrites(recorder);
         recorder.Sync();
@@ -4010,6 +4018,85 @@ void stagingDiffTests(const Device& device, Recorder& recorder) {
     }
     HostImportFor(context, address, bytes);
     std::cout << "staging copy-back tests passed (" << (diff ? "diff" : "whole copies") << ")\n";
+}
+
+void stagingDiffLifecycleTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: staging diff lifecycle not tested\n";
+        return;
+    }
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    if (alignment < 8 || alignment > 256) {
+        std::cout << "storage buffer offset alignment " << alignment << ": staging diff lifecycle misalignment not reproducible\n";
+        return;
+    }
+    constexpr std::size_t bytes = 4u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the test block refused: staging diff lifecycle not tested\n";
+        return;
+    }
+    constexpr std::uint32_t offset = 4096 + 4;
+    const auto element = address + offset;
+    Require((element - import->base) % alignment != 0 && (element - import->base) % 4 == 0, "the lifecycle element is not a DWORD-aligned view off the storage buffer offset alignment");
+    constexpr std::size_t elementBytes = 256u << 10u;
+    constexpr std::size_t first = offset / 4;
+    Recorder recorder(context);
+    GuestBufferMemory memory(context);
+    Require(Recorder::Active() == nullptr, "a recorder is active before the background upload prepare");
+    memory.AllowDeviceStaging();
+    memory.AddWritable(element, elementBytes, false, true);
+    memory.UploadPrepare(false);
+    Require(memory.CopiedBytes() != 0, "the background prepare did not allocate a copy buffer for the misaligned element");
+    recorder.Activate();
+    memory.UploadFinish(false);
+    Require(memory.HasGpuCopies(), "the active finish did not reuse the background host buffer for a GPU copy");
+    auto* words = static_cast<std::uint32_t*>(block);
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    std::uint32_t adjustment = 0;
+    const auto view = memory.Descriptor(element, elementBytes, adjustment);
+    recorder.Sync();
+    for (std::size_t index = 4096; index < 4112; ++index) words[first + index] = 0x33333333u;
+    for (std::size_t index = 128; index < 132; ++index) words[first + index] = 0x88888888u;
+    words[first + 200] = 0x44444444u;
+    const auto shadow = [&](std::size_t index) { return view.offset + adjustment + std::uint64_t{index} * 4u; };
+    auto commands = recorder.Commands();
+    fill(commands, view.buffer, shadow(64), 64, 0x22222222u);
+    fill(commands, view.buffer, shadow(128), 64, 0x11111111u);
+    fill(commands, view.buffer, shadow(200), 4, 0x55555555u);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    memory.RecordCopyBacks(recorder);
+    recorder.Sync();
+    std::size_t wrong = 0;
+    for (std::size_t index = 0; index < bytes / 4u; ++index) {
+        auto expected = 0x11111111u;
+        const auto at = index >= first ? index - first : bytes;
+        if (at >= 64 && at < 80) expected = 0x22222222u;
+        else if (at == 200) expected = 0x55555555u;
+        else if (at >= 128 && at < 132) expected = 0x11111111u;
+        else if (at >= 4096 && at < 4112) expected = 0x11111111u;
+        if (words[index] != expected && wrong++ < 8) std::cout << "staging diff lifecycle dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
+    }
+    Require(wrong == 0, "a non-addressable host buffer copy-back left the wrong guest bytes");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << "staging diff lifecycle fallback tests passed (non-addressable host buffer)\n";
 }
 
 // BDA overlays (GuestBufferMemory::resolveOverlays): a written element of an address-based build
@@ -5556,6 +5643,45 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         Require(bindings != nullptr, "read-only draw bindings were not prepared for cumulative test");
         Require(bindings->snapshots.size() == 1, "cumulative cap permitted both inputs to snapshot");
         Require(bindings->snapshots[0].address == firstAddress, "the earlier binding in the layout was not prioritised for the snapshot budget");
+        snapshotRecorder.Sync();
+    }
+    const auto movedProgram = [](const ShaderRecompiler::RecompileResult& built, std::uint64_t shift) {
+        auto moved = built;
+        for (auto& binding : moved.bindings) {
+            const auto base = (static_cast<std::uint64_t>(binding.guestDescriptor[1] & 0xffffu) << 32u | binding.guestDescriptor[0]) + shift;
+            binding.guestDescriptor[0] = static_cast<std::uint32_t>(base);
+            binding.guestDescriptor[1] = (binding.guestDescriptor[1] & ~0xffffu) | (static_cast<std::uint32_t>(base >> 32u) & 0xffffu);
+        }
+        return moved;
+    };
+    {
+        auto snapshotContext = context;
+        DescriptorCache cache(snapshotContext);
+        snapshotContext.descriptorCache = &cache;
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderRecompiler::RecompileResult smallProgram;
+        smallProgram.bindings.push_back(smallBinding);
+        const CompiledShader smallCompute{ShaderRecompiler::ShaderStage::Compute, &smallProgram, 0};
+        ShaderResources smallResources(snapshotContext, smallCompute);
+        const auto smallMovedProgram = movedProgram(smallProgram, 8192);
+        const std::array smallMoved{CompiledShader{ShaderRecompiler::ShaderStage::Compute, &smallMovedProgram, 0}};
+        const auto smallMove = smallResources.MovedReadOnlyBuffers(smallMoved, snapshotRecorder);
+        Require(smallMove.has_value() && smallMove->size() == 1 && smallMove->front().address == smallAddress + 8192, "a moved input below the draw snapshot cap was not moved");
+        const auto smallBindings = smallResources.PrepareDrawBindings(snapshotRecorder, *smallMove);
+        Require(smallBindings != nullptr && smallBindings->snapshots.size() == 1 && smallBindings->snapshots[0].address == smallAddress + 8192, "a moved input below the draw snapshot cap was not snapshotted at its new address");
+        ShaderRecompiler::RecompileResult largeProgram;
+        largeProgram.bindings.push_back(largeBinding);
+        largeProgram.bindings.back().binding = 0;
+        const CompiledShader largeCompute{ShaderRecompiler::ShaderStage::Compute, &largeProgram, 0};
+        ShaderResources largeResources(snapshotContext, largeCompute);
+        const auto largeMovedProgram = movedProgram(largeProgram, 0u - static_cast<std::uint64_t>(1024 * 1024 + 4096));
+        const std::array largeMoved{CompiledShader{ShaderRecompiler::ShaderStage::Compute, &largeMovedProgram, 0}};
+        Require(!largeResources.MovedReadOnlyBuffers(largeMoved, snapshotRecorder).has_value(), "a moved input exceeding the draw snapshot cap was moved and would be snapshotted");
+        ShaderResources cumulativeResources(snapshotContext, cumulativeCompute);
+        const auto cumulativeMovedProgram = movedProgram(cumulativeProgram, 4096);
+        const std::array cumulativeMoved{CompiledShader{ShaderRecompiler::ShaderStage::Compute, &cumulativeMovedProgram, 0}};
+        Require(!cumulativeResources.MovedReadOnlyBuffers(cumulativeMoved, snapshotRecorder).has_value(), "moved inputs exceeding the draw snapshot cap together were moved and would be snapshotted");
         snapshotRecorder.Sync();
     }
     recorder.Activate();
@@ -12835,6 +12961,10 @@ int main(int argc, char** argv) {
         }
 #endif
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
+        if (argc == 2 && std::string_view(argv[1]) == "--staging-diff-lifecycle-only") {
+            stagingDiffLifecycleTests(device);
+            return 0;
+        }
         Recorder recorder(device.GetContext());
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--command-reuse-only") {
@@ -12944,6 +13074,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--read-list-only") {
             readListTests(device, recorder);
             std::cout << "Read list tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resource-read-only") {
+            resourceReadTests(device, recorder);
+            std::cout << "Resource read tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--deferred-failure-report-only") {

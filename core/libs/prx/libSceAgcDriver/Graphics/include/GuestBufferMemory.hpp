@@ -477,6 +477,7 @@ public:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
     };
     std::optional<SplitReads> SplitInPlaceReads() const;
+    bool InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> SpaceRegions() const;

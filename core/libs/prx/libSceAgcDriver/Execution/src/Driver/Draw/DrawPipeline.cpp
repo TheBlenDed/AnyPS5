@@ -488,6 +488,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     }
     drainOpcodes = {};
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
+    const auto perSojourn = commits == 0 ? 0.0 : static_cast<double>(sojournNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
     const auto decodeDrainCount = decodeDrains.load(std::memory_order_relaxed);
@@ -517,9 +518,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(scans, sizeof(scans), "; write scans %llu over %.1f items, %.1f ranges, %.1f distinct", static_cast<unsigned long long>(writeScans), perSample(writeScanItems), perSample(writeScanRanges), perSample(writeScanDistinct));
     drainText += scans;
     writeScans = writeScanSamples = writeScanItems = writeScanRanges = writeScanDistinct = 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes; avg enqueue->commit %.1f us;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), perSojourn, reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     roomWaits = roomWakeNs = drainWaits = drainWakeNs = committerIdles = committerIdleNs = committerWakeNs = 0;
+    sojournNs = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -582,6 +584,7 @@ void DrawPipeline::run() {
             if (failed) ++commitErrors;
             if (fatal != nullptr && failure == nullptr) failure = fatal;
             lastPopNs = lastFinishNs = nowNs();
+            sojournNs += static_cast<std::uint64_t>(std::max<std::int64_t>(0, lastFinishNs - done.pushedNs));
             outstanding.fetch_sub(1, std::memory_order_release);
             if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
             if (preparerWaiting) prepareWake.notify_one();

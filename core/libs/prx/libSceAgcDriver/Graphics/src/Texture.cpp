@@ -104,6 +104,68 @@ TextureProfile& Profile() {
     return profile;
 }
 
+struct SnapshotSetupProfile {
+    AgcDriver::Mutex mutex;
+    std::uint64_t count = 0;
+    std::uint64_t copiedBytes = 0;
+    std::uint64_t imageSetupNs = 0;
+    std::uint64_t stagingAllocNs = 0;
+    std::uint64_t stagingCopyNs = 0;
+    std::uint64_t deviceBuffersNs = 0;
+    std::uint64_t setupSpanNs = 0;
+};
+
+SnapshotSetupProfile& SnapshotSetup() {
+    static SnapshotSetupProfile profile;
+    return profile;
+}
+
+std::uint64_t AsNanoseconds(std::chrono::steady_clock::duration elapsed) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+}
+
+void PublishSnapshotSetup(std::uint64_t imageSetupNs, std::uint64_t stagingAllocNs, std::uint64_t stagingCopyNs, std::uint64_t deviceBuffersNs, std::uint64_t setupSpanNs, std::uint64_t copiedBytes) {
+    auto& profile = SnapshotSetup();
+    struct Held {
+        std::uint64_t count;
+        std::uint64_t copiedBytes;
+        std::uint64_t imageSetupNs;
+        std::uint64_t stagingAllocNs;
+        std::uint64_t stagingCopyNs;
+        std::uint64_t deviceBuffersNs;
+        std::uint64_t setupSpanNs;
+    };
+    Held held{};
+    bool report = false;
+    {
+        std::lock_guard lock(profile.mutex);
+        profile.imageSetupNs += imageSetupNs;
+        profile.stagingAllocNs += stagingAllocNs;
+        profile.stagingCopyNs += stagingCopyNs;
+        profile.deviceBuffersNs += deviceBuffersNs;
+        profile.setupSpanNs += setupSpanNs;
+        profile.copiedBytes += copiedBytes;
+        ++profile.count;
+        if (profile.count % 200 == 0) {
+            held = {profile.count, profile.copiedBytes, profile.imageSetupNs, profile.stagingAllocNs, profile.stagingCopyNs, profile.deviceBuffersNs, profile.setupSpanNs};
+            report = true;
+        }
+    }
+    if (report) {
+        const double perNs = 1.0e-6;
+        const double imageSetupMs = static_cast<double>(held.imageSetupNs) * perNs;
+        const double stagingAllocMs = static_cast<double>(held.stagingAllocNs) * perNs;
+        const double stagingCopyMs = static_cast<double>(held.stagingCopyNs) * perNs;
+        const double deviceBuffersMs = static_cast<double>(held.deviceBuffersNs) * perNs;
+        const double setupSpanMs = static_cast<double>(held.setupSpanNs) * perNs;
+        std::fprintf(stderr, "[texture-setup] %llu snapshot setups, %llu bytes copied: image-setup %.3f ms, staging-buffer %.3f ms, staging-copy %.3f ms, device-buffers %.3f ms, unaccounted %.3f ms (setup span %.3f ms)\n",
+            static_cast<unsigned long long>(held.count),
+            static_cast<unsigned long long>(held.copiedBytes),
+            imageSetupMs, stagingAllocMs, stagingCopyMs, deviceBuffersMs,
+            setupSpanMs - imageSetupMs - stagingAllocMs - stagingCopyMs - deviceBuffersMs, setupSpanMs);
+    }
+}
+
 void keepStorageTexture(Recorder& recorder, std::shared_ptr<StorageTexture> texture) {
     if (texture == nullptr) return;
     if (!texture->Cached()) recorder.KeepBytes(texture.get(), static_cast<std::size_t>(texture->BudgetBytes()));
@@ -520,6 +582,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
+    const auto setupBegin = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::uint64_t imageSetupNs = 0, stagingAllocNs = 0, stagingCopyNs = 0, deviceBuffersNs = 0, setupSpanNs = 0, copiedBytes = 0;
     try {
         const auto colorFormat = SampledTextureFormat(context, descriptor.format);
         const bool srgbExpand = !depthCompare && SrgbExpandsToRgba8(context, descriptor.format);
@@ -636,6 +700,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             image = expanded.image;
             allocationBytes = expanded.bytes;
         }
+        if (profile) imageSetupNs = AsNanoseconds(std::chrono::steady_clock::now() - setupBegin);
 
         {
             // Debug aid: APS5_DUMP_TEXTURE=<hex addresses, comma separated> saves the detiled first mip
@@ -652,10 +717,21 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
             const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
+            const auto stagingBegin = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            const auto copyBegin = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            const auto devicesBegin = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            if (profile) {
+                const auto devicesEnd = std::chrono::steady_clock::now();
+                stagingAllocNs = AsNanoseconds(copyBegin - stagingBegin);
+                stagingCopyNs = AsNanoseconds(devicesBegin - copyBegin);
+                deviceBuffersNs = AsNanoseconds(devicesEnd - devicesBegin);
+                setupSpanNs = AsNanoseconds(devicesEnd - setupBegin);
+                copiedBytes = static_cast<std::uint64_t>(snapshot.size());
+            }
             if (profile) Profile().allocate += timer.lap();
             if (profile) Profile().read += timer.lap();
 
@@ -826,6 +902,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         countedBytes = allocationBytes;
         (inHostMemory ? SampledHostMemoryCounter() : SampledMemoryCounter()).fetch_add(countedBytes, std::memory_order_relaxed);
         if (spilled && !inHostMemory) SampledOverflowMemoryCounter().fetch_add(countedBytes, std::memory_order_relaxed);
+        if (profile) PublishSnapshotSetup(imageSetupNs, stagingAllocNs, stagingCopyNs, deviceBuffersNs, setupSpanNs, copiedBytes);
     } catch (...) {
         release();
         throw;
@@ -2425,7 +2502,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "snapshot read", "snapshot hash", "snapshot build"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "snapshot read", "snapshot hash", "snapshot build", "one-off dcc", "one-off stamp", "one-off hash committed-partial", "one-off hash untracked-hinted", "one-off hash untracked-unhinted", "one-off hash other", "one-off promoted", "one-off refused"};
     return kind < Count ? names[kind] : "?";
 }
 

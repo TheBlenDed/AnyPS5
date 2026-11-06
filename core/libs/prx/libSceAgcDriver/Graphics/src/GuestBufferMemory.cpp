@@ -6422,13 +6422,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         for (auto* region : copies) {
             region->diffUse = false;
             if (!active) continue;
-            if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
+            if (!region->deviceLocal || region->buffer == nullptr || !region->buffer->Addressable() || region->copySourceAddress == 0) {
                 region->pristine.reset();
                 continue;
             }
             const auto bytes = static_cast<std::size_t>(region->end - region->begin);
             if (region->pristine == nullptr) region->pristine = stagingBuffer(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-            if (region->pristine == nullptr || region->pristine->DeviceAddress() == 0) {
+            if (region->pristine == nullptr || !region->pristine->Addressable()) {
                 region->pristine.reset();
                 continue;
             }
@@ -6567,7 +6567,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyBack, from);
             auto whole = from;
             auto wholeEnd = to;
-            if (diff && region.diffUse && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
+            if (diff && region.diffUse && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->Addressable() && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
                 const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
                 const auto alignedTo = to & ~std::uint64_t{3};
                 if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max()) {
@@ -7448,6 +7448,14 @@ std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceRead
         if (region.direct != nullptr) split.own.emplace_back(region.begin, region.end);
     }
     return split;
+}
+
+bool GuestBufferMemory::InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (!uploaded || committed) return false;
+    const auto end = address + bytes;
+    const auto overlaps = [&](const auto& region, std::uint64_t regionEnd) { return region.direct != nullptr && address < regionEnd && region.begin < end; };
+    if (space != nullptr && std::any_of(space->base.begin(), space->base.end(), [&](const auto& region) { return overlaps(region, region.end); })) return true;
+    return std::any_of(regions.begin(), regions.end(), [&](const auto& region) { return overlaps(region, inPlaceEnd(region)); });
 }
 
 void GuestBufferMemory::DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& result) const {

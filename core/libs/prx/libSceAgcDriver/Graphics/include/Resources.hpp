@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include <span>
+#include <source_location>
 
 namespace AgcDriver::Graphics {
 
@@ -14,7 +15,8 @@ public:
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     VkBuffer Handle() const;
-    VkDeviceAddress DeviceAddress() const;
+    VkDeviceAddress DeviceAddress(std::source_location location = std::source_location::current()) const;
+    bool Addressable() const { return deviceAddress != 0; }
     VkMemoryPropertyFlags Properties() const { return properties; }
     // Host-visible buffers only: a device-local one (properties without HOST_VISIBLE, the staging
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
