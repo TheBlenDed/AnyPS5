@@ -1731,6 +1731,43 @@ void recoveryTests(Context context, const std::string& mode) {
     std::printf("%s image allocation recovered after %u injected failures: %llu bytes released\n", label, recovery.failures, static_cast<unsigned long long>(recovery.released));
 }
 
+void setupReportTests(const Context& context) {
+    constexpr std::size_t Count = 420;
+    void* memory = nullptr;
+#ifdef _WIN32
+    memory = VirtualAlloc(nullptr, Count * SurfaceBytes + RegistrationGapBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    memory = std::aligned_alloc(65536, Count * SurfaceBytes + RegistrationGapBytes);
+#endif
+    Require(memory != nullptr, "cannot allocate the setup-report guest block");
+    std::memset(memory, 0x5a, Count * SurfaceBytes);
+    GuestAllocations::Mutation().Add(memory, Count * SurfaceBytes, true, true, true);
+    ClearCachedTextures(context.device);
+    std::size_t snapshots = 0;
+    for (std::size_t surface = 0; surface < Count; ++surface) {
+        const auto address = reinterpret_cast<std::uint64_t>(memory) + surface * SurfaceBytes;
+        auto texture = Sampled(context, address);
+        Require(texture != nullptr, "the setup-report surface " + std::to_string(surface) + " did not resolve to a texture");
+        Require(!texture->ViewsStorageImage(), "the setup-report surface " + std::to_string(surface) + " resolved to a storage-image view, not a snapshot");
+        Require(texture->AllocationBytes() != 0, "the setup-report snapshot " + std::to_string(surface) + " has no image allocation");
+        ++snapshots;
+    }
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    auto first = Sampled(context, address);
+    std::memset(reinterpret_cast<void*>(address), 0xa1, SurfaceBytes);
+    auto changed = Sampled(context, address);
+    Require(changed != first, "the setup-report snapshot did not reread its guest bytes after a change");
+    Require(Sampled(context, address) == changed, "the setup-report snapshot after a change was made again");
+    ClearCachedTextures(context.device);
+    GuestAllocations::Mutation().Remove(memory);
+#ifdef _WIN32
+    VirtualFree(memory, 0, MEM_RELEASE);
+#else
+    std::free(memory);
+#endif
+    std::printf("setup-report passed: %zu distinct snapshot-input textures constructed\n", snapshots);
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -1746,6 +1783,7 @@ int main(int argc, char** argv) {
         const bool lifetime = mode == "overflow-lifetime";
         const bool disableStorageImageMultisample = mode == "without-storage-image-multisample";
         const bool recover = mode == "recover-sampled" || mode == "recover-storage" || mode == "recover-srgb" || mode == "recover-repack";
+        const bool setupReport = mode == "setup-report";
 #ifdef _WIN32
         if (!memory) _putenv_s("APS5_TEXTURE_CACHE_MIB", recover ? "16" : "1");
         if (std::getenv("APS5_TEMPLATE_AUDIT_MS") == nullptr) _putenv_s("APS5_TEMPLATE_AUDIT_MS", "250");
@@ -1821,6 +1859,11 @@ int main(int argc, char** argv) {
         if (recover) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             recoveryTests(context, mode);
+            return 0;
+        }
+        if (setupReport) {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            setupReportTests(context);
             return 0;
         }
         {
