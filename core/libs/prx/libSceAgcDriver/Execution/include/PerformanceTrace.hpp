@@ -446,6 +446,7 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::array<std::string_view, 5> WorkerBusyScopes{"Driver.Packet", "Driver.Suspend", "Driver.EndSubmission", "Driver.Rewind", "Driver.Completion"};
     static constexpr std::string_view WorkerPacketScope = "Driver.Packet";
+    static constexpr std::string_view WorkerDrawScope = "Driver.Draw";
     static constexpr std::string_view WorkerWaitScope = "Driver.WorkerWait";
     static constexpr std::string_view WorkerPrefix = "queue worker ";
     static constexpr std::size_t TopPhases = 8;
@@ -612,6 +613,11 @@ public:
         };
         std::vector<DroppedThread> droppedList;
         std::map<std::string, std::map<std::string, Clock::duration>> workerPacketStages;
+        struct WorkerDraw {
+            Clock::duration total{};
+            std::map<std::string, Clock::duration> stages;
+        };
+        std::map<std::string, WorkerDraw> workerDriverDraw;
         for (const auto& thread : threads) {
             dropped = dropped || thread.dropped;
             if (thread.eventsLost != 0 || thread.totalsFull) {
@@ -630,6 +636,10 @@ public:
             if (!thread.name.starts_with(WorkerPrefix)) continue;
             for (const auto& total : thread.totals) {
                 if (total.scope == WorkerPacketScope && total.stage != nullptr) workerPacketStages[thread.name][total.stage] += total.length;
+                if (total.scope == WorkerDrawScope) {
+                    if (total.stage == nullptr) workerDriverDraw[thread.name].total += total.length;
+                    else workerDriverDraw[thread.name].stages[total.stage] += total.length;
+                }
             }
             if (!firstWorker) output += ',';
             firstWorker = false;
@@ -650,6 +660,26 @@ public:
                 AppendString(output, stage);
                 output += ':' + number(milliseconds(length) * perPresent);
             }
+            output += '}';
+        }
+        output += "},\"worker_driver_draw_ms_per_present\":{";
+        bool firstDrawWorker = true;
+        for (const auto& [name, draw] : workerDriverDraw) {
+            if (!firstDrawWorker) output += ',';
+            firstDrawWorker = false;
+            AppendString(output, name);
+            output += ":{\"total_ms_per_present\":" + number(milliseconds(draw.total) * perPresent);
+            output += ",\"stages\":{";
+            bool firstDrawStage = true;
+            Clock::duration staged{};
+            for (const auto& [stage, length] : draw.stages) {
+                if (!firstDrawStage) output += ',';
+                firstDrawStage = false;
+                AppendString(output, stage);
+                output += ':' + number(milliseconds(length) * perPresent);
+                staged += length;
+            }
+            output += "},\"unattributed_ms_per_present\":" + number(milliseconds(draw.total - staged) * perPresent);
             output += '}';
         }
         output += "},\"top_phases_ms_per_frame\":{";

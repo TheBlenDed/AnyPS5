@@ -234,6 +234,7 @@ void SummaryFields() {
         "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
         "\"worker_busy_pct\":{\"queue worker 0x0\":35.000},"
         "\"worker_packet_stages_ms_per_frame\":{\"queue worker 0x0\":{\"draw\":5.000}},"
+        "\"worker_driver_draw_ms_per_present\":{},"
         "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000,\"Driver.Packet.draw\":5.000,\"Driver.Present\":3.000,\"Driver.Present.inflight_wait\":2.000,\"Driver.Completion\":1.000},"
         "\"trace_dropped\":false,\"trace\":\"aps5-trace-abc-7.json.gz\"}\n";
     Check(line == expected, "summary line changed");
@@ -258,6 +259,37 @@ void SummaryFields() {
     const auto merged = TraceFormat::Summary(summary, shared, presents);
     Check(merged.find("\"trace_dropped_threads\":{\"shader prepare\":{\"events_full_after_s\":0.010,\"events_lost\":12,\"totals_full\":true}},\"trace\":") != std::string::npos, "threads with one name were not merged into one entry");
     Check(merged.find("shader prepare") == merged.rfind("shader prepare"), "threads with one name were listed twice");
+}
+
+void DriverDrawSummary() {
+    const auto origin = Clock::now();
+    AgcDriver::TraceSummary summary;
+    summary.commit = "abc";
+    summary.dirty = false;
+    summary.window = "summary_every 30";
+    summary.firstPresent = 50;
+    summary.trace = "";
+    const std::vector<TraceThread::Snapshot> threads{
+        {"queue worker 0x0", {}, {
+            {"Driver.Packet", nullptr, milliseconds(30), 5},
+            {"Driver.Packet", "draw", milliseconds(20), 3},
+            {"Driver.Draw", nullptr, milliseconds(16), 2},
+            {"Driver.Draw", "prepare", milliseconds(6), 2},
+            {"Driver.Draw", "device_setup", milliseconds(4), 2},
+            {"Driver.Draw", "draw_enqueued", milliseconds(8), 2},
+        }, false},
+        {"presenter", {}, {{"Driver.Draw", nullptr, milliseconds(9), 1}, {"Driver.Draw", "prepare", milliseconds(9), 1}}, false},
+        {"committer", {}, {{"Driver.Draw", nullptr, milliseconds(4), 1}}, false},
+        {"queue worker 0x52", {}, {{"Driver.Draw", nullptr, milliseconds(10), 1}, {"Driver.Draw", "prepare", milliseconds(10), 1}}, false},
+    };
+    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(20), origin + milliseconds(60)};
+    const auto line = TraceFormat::Summary(summary, threads, presents);
+    Check(line.find("\"worker_packet_stages_ms_per_frame\":{\"queue worker 0x0\":{\"draw\":10.000}}") != std::string::npos, "the Driver.Draw children were not kept out of the packet-stage budget");
+    Check(line.find("\"worker_driver_draw_ms_per_present\":{\"queue worker 0x0\":{\"total_ms_per_present\":8.000,\"stages\":{\"device_setup\":2.000,\"draw_enqueued\":4.000,\"prepare\":3.000},\"unattributed_ms_per_present\":-1.000},\"queue worker 0x52\":{\"total_ms_per_present\":5.000,\"stages\":{\"prepare\":5.000},\"unattributed_ms_per_present\":0.000}}") != std::string::npos, "the per-worker Driver.Draw object, stage map, or signed residual is wrong");
+    const auto drawBlock = line.substr(line.find("\"worker_driver_draw_ms_per_present\":"));
+    Check(drawBlock.find("\"presenter\"") == std::string::npos && drawBlock.find("\"committer\"") == std::string::npos, "a non-worker thread leaked into the Driver.Draw object");
+    const auto empty = TraceFormat::Summary(summary, threads, {});
+    Check(empty.find("\"total_ms_per_present\":0.000,\"stages\":{\"device_setup\":0.000,\"draw_enqueued\":0.000,\"prepare\":0.000}") != std::string::npos, "zero presents did not zero the Driver.Draw totals");
 }
 
 void GpuClock() {
@@ -341,6 +373,7 @@ void IntervalSummaryFields() {
         "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
         "\"worker_busy_pct\":{\"queue worker 0x0\":30.000},"
         "\"worker_packet_stages_ms_per_frame\":{},"
+        "\"worker_driver_draw_ms_per_present\":{},"
         "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000},"
         "\"trace_dropped\":false,\"trace\":\"\"}\n";
     Check(line == expected, "interval summary line changed");
@@ -596,6 +629,7 @@ int main() {
         EventsShape();
         BatchIds();
         SummaryFields();
+        DriverDrawSummary();
         GpuClock();
         IntervalDue();
         SummaryOnlyThread();
