@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#if defined(__SSE2__) || defined(_M_X64)
+#if defined(__GNUC__) && defined(__x86_64__)
+#include <immintrin.h>
+#elif defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
 #endif
 
@@ -134,11 +136,52 @@ inline std::uint64_t Merge(const std::uint64_t (&lanes)[8], const unsigned char*
     return Avalanche(result);
 }
 
+#if defined(__GNUC__) && defined(__x86_64__)
+__attribute__((target("avx2"))) inline Hash128 OfAvx2(const unsigned char* input, std::size_t bytes) noexcept {
+    const auto* secret = Secret.data();
+    __m256i a = _mm256_set_epi64x(static_cast<long long>(Prime64_3), static_cast<long long>(Prime64_2), static_cast<long long>(Prime64_1), static_cast<long long>(Prime32_3));
+    __m256i b = _mm256_set_epi64x(static_cast<long long>(Prime32_1), static_cast<long long>(Prime64_5), static_cast<long long>(Prime32_2), static_cast<long long>(Prime64_4));
+    const auto accumulate = [&] (const unsigned char* p, const unsigned char* k) __attribute__((target("avx2"))) {
+        const __m256i d0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        const __m256i d1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+        const __m256i m0 = _mm256_xor_si256(d0, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k)));
+        const __m256i m1 = _mm256_xor_si256(d1, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k + 32)));
+        a = _mm256_add_epi64(a, _mm256_add_epi64(_mm256_shuffle_epi32(d0, _MM_SHUFFLE(1, 0, 3, 2)), _mm256_mul_epu32(m0, _mm256_srli_epi64(m0, 32))));
+        b = _mm256_add_epi64(b, _mm256_add_epi64(_mm256_shuffle_epi32(d1, _MM_SHUFFLE(1, 0, 3, 2)), _mm256_mul_epu32(m1, _mm256_srli_epi64(m1, 32))));
+    };
+    const auto scramble = [&] (__m256i value, const unsigned char* k) __attribute__((target("avx2"))) {
+        value = _mm256_xor_si256(value, _mm256_srli_epi64(value, 47));
+        value = _mm256_xor_si256(value, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k)));
+        const __m256i prime = _mm256_set1_epi32(static_cast<int>(Prime32_1));
+        return _mm256_add_epi64(_mm256_mul_epu32(value, prime), _mm256_slli_epi64(_mm256_mul_epu32(_mm256_srli_epi64(value, 32), prime), 32));
+    };
+    const std::size_t blocks = (bytes - 1) / BlockBytes;
+    for (std::size_t block = 0; block < blocks; ++block) {
+        const auto* at = input + block * BlockBytes;
+        for (std::size_t stripe = 0; stripe < StripesPerBlock; ++stripe) accumulate(at + stripe * StripeBytes, secret + stripe * 8);
+        a = scramble(a, secret + SecretBytes - StripeBytes);
+        b = scramble(b, secret + SecretBytes - StripeBytes + 32);
+    }
+    const std::size_t stripes = ((bytes - 1) - blocks * BlockBytes) / StripeBytes;
+    const auto* tail = input + blocks * BlockBytes;
+    for (std::size_t stripe = 0; stripe < stripes; ++stripe) accumulate(tail + stripe * StripeBytes, secret + stripe * 8);
+    accumulate(input + bytes - StripeBytes, secret + SecretBytes - StripeBytes - 7);
+    std::uint64_t lanes[8];
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(lanes), a);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(lanes + 4), b);
+    const auto size = static_cast<std::uint64_t>(bytes);
+    return {Merge(lanes, secret + 11, size * Prime64_1), Merge(lanes, secret + SecretBytes - StripeBytes - 11, ~(size * Prime64_2))};
+}
+#endif
+
 }
 
 // Hash of `bytes` bytes at `data` (the length is part of the hash).
 inline Hash128 Of(const void* data, std::size_t bytes) noexcept {
     using namespace Detail;
+#if defined(__GNUC__) && defined(__x86_64__)
+    if (bytes >= BlockBytes && __builtin_cpu_supports("avx2")) return OfAvx2(static_cast<const unsigned char*>(data), bytes);
+#endif
     const auto* secret = Secret.data();
     const auto* input = static_cast<const unsigned char*>(data);
     unsigned char padded[StripeBytes];
