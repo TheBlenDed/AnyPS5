@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitterOverlap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -410,7 +411,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
+        CommitterOverlap::Get().ProducerEnter();
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
+        CommitterOverlap::Get().ProducerExit();
         --idleWaiters;
         resumeAt = 0;
         fullWaitNs += elapsedNs(start);
@@ -434,6 +437,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (!thread.joinable()) {
         thread = std::thread([this] {
             GuestMemory::MarkProofThread();
+            CommitterOverlap::Get().EnterCommitterThread();
             run();
         });
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);
@@ -447,7 +451,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         if (preparerWaiting) prepareWake.notify_one();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats) return;
+    if (!profile && !stats && !CommitterOverlap::Enabled()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
@@ -519,6 +523,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     drainText += scans;
     writeScans = writeScanSamples = writeScanItems = writeScanRanges = writeScanDistinct = 0;
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes; avg enqueue->commit %.1f us;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), perSojourn, reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
+    if (CommitterOverlap::Enabled()) {
+        const auto overlap = CommitterOverlap::Get().take();
+        std::uint64_t overlapSum = 0;
+        for (const auto value : overlap.stateNs) overlapSum += value;
+        const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+        const auto concurrent = fullWaitNs > overlap.unionNs ? fullWaitNs - overlap.unionNs : 0;
+        AgcDriver::ProfilePrint_nid_no_patch("[draw-overlap] (10 s): %llu room-wait begins, %llu ends, %u open; producer-blocked union %.3f ms vs %.3f ms per-waiter (%.3f ms concurrent overlap); committer while blocked: between %.3f, idle %.3f, gpu_wait %.3f, draw_resources %.3f, draw_record %.3f, dispatch %.3f ms (sum %.3f ms)\n", static_cast<unsigned long long>(overlap.begins), static_cast<unsigned long long>(overlap.ends), static_cast<unsigned>(overlap.waiters), ms(overlap.unionNs), ms(fullWaitNs), ms(concurrent), ms(overlap.stateNs[CommitterOverlap::Between]), ms(overlap.stateNs[CommitterOverlap::Idle]), ms(overlap.stateNs[CommitterOverlap::GpuWait]), ms(overlap.stateNs[CommitterOverlap::DrawResources]), ms(overlap.stateNs[CommitterOverlap::DrawRecord]), ms(overlap.stateNs[CommitterOverlap::Dispatch]), ms(overlapSum));
+    }
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     roomWaits = roomWakeNs = drainWaits = drainWakeNs = committerIdles = committerIdleNs = committerWakeNs = 0;
     sojournNs = 0;
@@ -537,7 +549,9 @@ void DrawPipeline::run() {
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
+            CommitterOverlap::Get().SetState(CommitterOverlap::Idle);
             wake.wait(lock, [&] { return !items.empty() || closing; });
+            CommitterOverlap::Get().SetState(CommitterOverlap::Between);
             committerWaiting = false;
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
@@ -555,6 +569,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
+            if (commit != nullptr && !isDraw) CommitterOverlap::Get().SetState(CommitterOverlap::Dispatch);
             if (commit != nullptr) (*commit)();
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
@@ -566,6 +581,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
+        CommitterOverlap::Get().SetState(CommitterOverlap::Between);
         const auto spent = elapsedNs(start);
         traceWait("DrawPipeline", "commit", start);
         if (fatal != nullptr && !stopped) {
