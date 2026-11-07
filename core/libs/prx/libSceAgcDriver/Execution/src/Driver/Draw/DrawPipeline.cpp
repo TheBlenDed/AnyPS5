@@ -541,6 +541,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
+    StartCommitterOverlapSampler();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;

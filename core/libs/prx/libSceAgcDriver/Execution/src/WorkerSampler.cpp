@@ -5,7 +5,9 @@
 #include <cstring>
 #ifdef _WIN32
 #include "prx/libSceAgcDriver/Execution/include/StackWalk.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitterOverlap.hpp"
 #include <windows.h>
+#include <dbghelp.h>
 #include <tlhelp32.h>
 #include <algorithm>
 #include <array>
@@ -29,6 +31,7 @@ namespace {
 std::jthread processSamplerThread;
 std::jthread workerSamplerThread;
 std::jthread committerSamplerThread;
+std::jthread committerOverlapSamplerThread;
 
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
@@ -72,7 +75,8 @@ struct Sampler {
         return RtlLookupFunctionEntry(pc, &imageBase, nullptr) != nullptr || (module != nullptr && module->Covers(pc - 1));
     }
 
-    DwarfFrames::Step stepDwarf(CONTEXT& context, bool leaf) {
+    template <typename Read>
+    DwarfFrames::Step stepDwarf(CONTEXT& context, bool leaf, const Read& read) {
         const auto* module = moduleOf(context.Rip - (leaf ? 0 : 1));
         if (module == nullptr) {
             MEMORY_BASIC_INFORMATION memory{};
@@ -80,7 +84,7 @@ struct Sampler {
             return DwarfFrames::Step::Failed;
         }
         DwarfFrames::Registers registers{context.Rax, context.Rdx, context.Rcx, context.Rbx, context.Rsi, context.Rdi, context.Rbp, context.Rsp, context.R8, context.R9, context.R10, context.R11, context.R12, context.R13, context.R14, context.R15, context.Rip};
-        const auto step = module->Unwind(registers, leaf, [&](std::uint64_t address, std::uint64_t& value) { return readStack(address, value); });
+        const auto step = module->Unwind(registers, leaf, [&](std::uint64_t address, std::uint64_t& value) { return read(address, value); });
         if (step != DwarfFrames::Step::Stepped) return step;
         DWORD64* columns[] = {&context.Rax, &context.Rdx, &context.Rcx, &context.Rbx, &context.Rsi, &context.Rdi, &context.Rbp, &context.Rsp, &context.R8, &context.R9, &context.R10, &context.R11, &context.R12, &context.R13, &context.R14, &context.R15, &context.Rip};
         for (std::size_t column = 0; column < registers.size(); ++column) *columns[column] = registers[column];
@@ -100,7 +104,7 @@ struct Sampler {
                 continue;
             }
             if (!dwarf) break;
-            const auto step = stepDwarf(context, count == 1);
+            const auto step = stepDwarf(context, count == 1, [this](std::uint64_t address, std::uint64_t& value) { return readStack(address, value); });
             if (step == DwarfFrames::Step::Stepped) continue;
             std::uint64_t returnAddress = 0;
             if (step == DwarfFrames::Step::Failed || count != 1 || !readStack(context.Rsp, returnAddress) || !hasUnwindData(returnAddress)) break;
@@ -277,6 +281,214 @@ struct ProcessSampler {
     }
 };
 
+struct ResumeGuard {
+    HANDLE thread = nullptr;
+    bool active = false;
+    explicit ResumeGuard(HANDLE handle) : thread(handle), active(true) {}
+    ~ResumeGuard() {
+        if (active) ResumeThread(thread);
+    }
+    void dismiss() { active = false; }
+};
+
+struct CapturedStack {
+    std::uint64_t base;
+    std::span<const std::byte> bytes;
+
+    bool Read(std::uint64_t address, void* destination, std::size_t size) const {
+        if (address < base || size > bytes.size() || address - base > bytes.size() - size) return false;
+        std::memcpy(destination, bytes.data() + (address - base), size);
+        return true;
+    }
+};
+
+thread_local const CapturedStack* activeStack = nullptr;
+
+BOOL CALLBACK readCapturedStack(HANDLE process, DWORD64 address, PVOID destination, DWORD size, LPDWORD read) {
+    *read = 0;
+    if (activeStack->Read(address, destination, size)) {
+        *read = size;
+        return TRUE;
+    }
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) == 0 || memory.Type != MEM_IMAGE || memory.State != MEM_COMMIT) return FALSE;
+    const auto region = reinterpret_cast<std::uint64_t>(memory.BaseAddress);
+    if (size > memory.RegionSize || address - region > memory.RegionSize - size) return FALSE;
+    SIZE_T copied = 0;
+    const BOOL ok = ReadProcessMemory(process, reinterpret_cast<const void*>(address), destination, size, &copied);
+    *read = static_cast<DWORD>(copied);
+    return ok;
+}
+
+PVOID CALLBACK sampledFunctionEntry(HANDLE, DWORD64 pc) {
+    DWORD64 base = 0;
+    return RtlLookupFunctionEntry(pc, &base, nullptr);
+}
+
+DWORD64 CALLBACK sampledModuleBase(HANDLE, DWORD64 pc) {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(pc), &module)) return 0;
+    return reinterpret_cast<DWORD64>(module);
+}
+
+decltype(&StackWalk64) capturedStackWalker() {
+    static const auto function = [] {
+        const auto module = LoadLibraryExW(L"dbghelp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return module != nullptr ? reinterpret_cast<decltype(&StackWalk64)>(GetProcAddress(module, "StackWalk64")) : nullptr;
+    }();
+    return function;
+}
+
+struct OverlapSampler {
+    static constexpr int PeriodMs = 5;
+    static constexpr std::size_t StackBytes = 16 * 1024;
+    static constexpr std::size_t MaxFrames = 24;
+    static constexpr std::int64_t BucketNs = 500'000'000;
+    static constexpr std::uint64_t CaptureCap = 200'000;
+
+    struct Bucket {
+        CollapsedStacks stacks;
+        std::uint64_t samples = 0;
+    };
+
+    Sampler sampler;
+    std::string path;
+    std::array<std::byte, StackBytes> stack;
+    std::map<std::uint64_t, Bucket> buckets;
+    std::map<std::uint64_t, std::uint64_t> counts;
+    std::uint64_t polls = 0;
+    std::uint64_t covered = 0;
+    std::uint64_t missed = 0;
+    std::uint64_t captured = 0;
+    std::uint64_t dropped = 0;
+    std::uint64_t rejected = 0;
+    std::uint64_t failed = 0;
+
+    void tick() {
+        const auto gate = DriverDetail::CommitterOverlap::Get().OverlapGateValue();
+        ++polls;
+        if ((gate & 1u) == 0u) {
+            ++missed;
+            return;
+        }
+        ++covered;
+        if (captured >= CaptureCap) {
+            ++dropped;
+            return;
+        }
+        const auto time = std::chrono::steady_clock::now();
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_FULL;
+        SIZE_T copied = 0;
+        if (SuspendThread(sampler.target) == static_cast<DWORD>(-1)) {
+            ++failed;
+            return;
+        }
+        ResumeGuard guard{sampler.target};
+        const auto capturedGate = DriverDetail::CommitterOverlap::Get().OverlapGateValue();
+        const bool haveContext = capturedGate == gate && GetThreadContext(sampler.target, &context) != 0;
+        const auto base = context.Rsp;
+        if (haveContext && base >= sampler.stackLow && base < sampler.stackHigh) {
+            const auto bytes = std::min<std::uint64_t>(stack.size(), sampler.stackHigh - base);
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(base), stack.data(), bytes, &copied)) copied = 0;
+        }
+        const auto afterCapture = DriverDetail::CommitterOverlap::Get().OverlapGateValue();
+        const DWORD resumed = ResumeThread(sampler.target);
+        if (resumed == static_cast<DWORD>(-1)) {
+            ++failed;
+            return;
+        }
+        guard.dismiss();
+        if (capturedGate != gate || afterCapture != gate) {
+            ++rejected;
+            return;
+        }
+        if (!haveContext || context.Rip == 0) {
+            ++failed;
+            return;
+        }
+        const CapturedStack snapshot{base, {stack.data(), copied}};
+        std::array<std::uint64_t, MaxFrames> frames;
+        frames[0] = context.Rip;
+        std::size_t count = 1;
+        bool truncated = true;
+        const auto nativeWalk = capturedStackWalker();
+        if (copied != 0 && nativeWalk != nullptr) {
+            CONTEXT native = context;
+            STACKFRAME64 frame{};
+            frame.AddrPC = {native.Rip, 0, AddrModeFlat};
+            frame.AddrFrame = {native.Rbp, 0, AddrModeFlat};
+            frame.AddrStack = {native.Rsp, 0, AddrModeFlat};
+            activeStack = &snapshot;
+            for (std::size_t i = 0; i < MaxFrames && count < frames.size(); ++i) {
+                if (!nativeWalk(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), sampler.target, &frame, &native, readCapturedStack, sampledFunctionEntry, sampledModuleBase, nullptr)) break;
+                if (frame.AddrPC.Offset == 0) {
+                    truncated = false;
+                    break;
+                }
+                if (i != 0 || frame.AddrPC.Offset != frames[0]) frames[count++] = frame.AddrPC.Offset;
+                if (frame.AddrReturn.Offset == 0) {
+                    truncated = false;
+                    break;
+                }
+            }
+            activeStack = nullptr;
+        }
+        if (copied != 0 && count == 1 && truncated) {
+            const auto read = [&](std::uint64_t address, std::uint64_t& value) {
+                return snapshot.Read(address, &value, sizeof(value));
+            };
+            while (count < frames.size()) {
+                auto step = sampler.stepDwarf(context, count == 1, read);
+                if (sampler.pendingModule != 0) {
+                    sampler.indexModule();
+                    step = sampler.stepDwarf(context, count == 1, read);
+                }
+                if (step != DwarfFrames::Step::Stepped) break;
+                if (context.Rip == 0) {
+                    truncated = false;
+                    break;
+                }
+                frames[count++] = context.Rip;
+            }
+        }
+        const auto key = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count() / BucketNs);
+        auto& bucket = buckets[key];
+        bucket.stacks.Add({frames.data(), count}, truncated);
+        ++bucket.samples;
+        for (std::size_t i = 0; i < count; ++i) ++counts[frames[i]];
+        ++captured;
+    }
+
+    void write() {
+        std::FILE* file = std::fopen(path.c_str(), "a");
+        if (file == nullptr) {
+            for (const auto& [key, bucket] : buckets) dropped += bucket.samples;
+            buckets.clear();
+            counts.clear();
+            return;
+        }
+        std::uint64_t truncated = 0;
+        for (const auto& [key, bucket] : buckets) truncated += bucket.stacks.Truncated();
+        std::fprintf(file, "# overlap polls=%llu covered=%llu missed=%llu captured=%llu dropped=%llu rejected=%llu failed=%llu cadence_ms=%d bucket_ms=%lld truncated=%llu\n",
+            static_cast<unsigned long long>(polls), static_cast<unsigned long long>(covered), static_cast<unsigned long long>(missed),
+            static_cast<unsigned long long>(captured), static_cast<unsigned long long>(dropped), static_cast<unsigned long long>(rejected),
+            static_cast<unsigned long long>(failed), PeriodMs, static_cast<long long>(BucketNs / 1'000'000), static_cast<unsigned long long>(truncated));
+        std::map<std::uint64_t, std::string> names;
+        std::map<std::uint64_t, std::string> loaded;
+        for (const auto& [address, count] : counts) names.emplace(address, Sampler::frameName(address, loaded));
+        Sampler::writeModules(file, loaded);
+        for (const auto& [key, bucket] : buckets) {
+            std::fprintf(file, "# bucket %llu begin_ns %lld samples %llu\n", static_cast<unsigned long long>(key), static_cast<long long>(key * BucketNs), static_cast<unsigned long long>(bucket.samples));
+            const auto text = bucket.stacks.Format([&](std::uint64_t address) { return names.at(address); });
+            std::fwrite(text.data(), 1, text.size(), file);
+        }
+        std::fclose(file);
+        buckets.clear();
+        counts.clear();
+    }
+};
+
 void StartProcessSampler() {
     const char* path = std::getenv("APS5_SAMPLE_THREADS");
     if (path == nullptr) return;
@@ -326,6 +538,32 @@ void StartCallingThreadSampler(const char* path, std::jthread& slot) {
 
 }
 
+void StartCommitterOverlapSampler() {
+    const char* path = std::getenv("APS5_SAMPLE_OVERLAP");
+    if (path == nullptr || *path == '\0' || !DriverDetail::CommitterOverlap::Enabled()) return;
+    auto overlap = std::make_unique<OverlapSampler>();
+    overlap->path = path;
+    const auto* block = reinterpret_cast<const NT_TIB*>(NtCurrentTeb());
+    MEMORY_BASIC_INFORMATION stack{};
+    if (VirtualQuery(block->StackLimit, &stack, sizeof(stack)) != 0) {
+        overlap->sampler.stackLow = reinterpret_cast<std::uint64_t>(stack.AllocationBase);
+        overlap->sampler.stackHigh = reinterpret_cast<std::uint64_t>(block->StackBase);
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &overlap->sampler.target, THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, 0)) return;
+    committerOverlapSamplerThread = std::jthread([overlap = std::move(overlap)](std::stop_token token) {
+        auto flushed = std::chrono::steady_clock::now();
+        while (!token.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(OverlapSampler::PeriodMs));
+            overlap->tick();
+            if (std::chrono::steady_clock::now() - flushed > std::chrono::seconds(20)) {
+                overlap->write();
+                flushed = std::chrono::steady_clock::now();
+            }
+        }
+        overlap->write();
+    });
+}
+
 void StartWorkerSampler() {
     StartProcessSampler();
     StartCallingThreadSampler(std::getenv("APS5_SAMPLE_WORKER"), workerSamplerThread);
@@ -339,13 +577,16 @@ void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
     committerSamplerThread.request_stop();
+    committerOverlapSamplerThread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
     if (committerSamplerThread.joinable()) committerSamplerThread.join();
+    if (committerOverlapSamplerThread.joinable()) committerOverlapSamplerThread.join();
 }
 #else
 void StartWorkerSampler() {}
 void StartCommitterSampler() {}
+void StartCommitterOverlapSampler() {}
 void StopWorkerSampler() {}
 #endif
 

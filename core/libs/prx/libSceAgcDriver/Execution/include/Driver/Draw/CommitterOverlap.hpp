@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_COMMITTEROVERLAP_HPP
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -41,12 +42,15 @@ public:
 
     void EnterCommitterThread() { committerThreadFlag() = true; }
 
+    std::uint32_t OverlapGateValue() const { return gate.load(std::memory_order_acquire); }
+
     State SetState(State next) {
         if (!Enabled() || !committerThreadFlag()) return Count;
         std::lock_guard lock(mutex);
         account(nowNs());
         const auto previous = state;
         state = next;
+        refreshGateLocked();
         return previous;
     }
 
@@ -56,6 +60,7 @@ public:
         account(nowNs());
         ++waiters;
         ++begins;
+        refreshGateLocked();
     }
 
     void ProducerExit() {
@@ -64,6 +69,7 @@ public:
         account(nowNs());
         if (waiters != 0) --waiters;
         ++ends;
+        refreshGateLocked();
     }
 
     Snapshot take() {
@@ -122,7 +128,15 @@ private:
         lastNs = now;
     }
 
+    void refreshGateLocked() {
+        const bool on = waiters != 0 && state == DeferredImages;
+        const std::uint32_t word = gate.load(std::memory_order_relaxed);
+        if (static_cast<bool>(word & 1u) == on) return;
+        gate.store(((word + 2u) & ~1u) | (on ? 1u : 0u), std::memory_order_release);
+    }
+
     std::mutex mutex;
+    std::atomic<std::uint32_t> gate = 0;
     State state = Between;
     std::uint32_t waiters = 0;
     std::int64_t lastNs = 0;
