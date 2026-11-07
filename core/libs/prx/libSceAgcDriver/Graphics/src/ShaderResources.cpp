@@ -2510,6 +2510,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         const CacheHold reclaimable(sampledCacheReclaimable);
         return std::make_shared<Texture>(context, std::forward<decltype(args)>(args)...);
     };
+    auto snapStart = start;
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -2531,6 +2532,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.accounted = (source->Cached() ? 0u : heldBytes(*source)) + (entry.texture->IsDepthCopy() ? entry.texture->AllocationBytes() : 0u);
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
+        if (profile) snapStart = LookupOutcomes::Add(LookupOutcomes::SampledBeforeSnapshot, snapStart);
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         const bool pending = *keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes);
         if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
@@ -2538,6 +2540,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             entry.blockGuard = untrackedGuard(address, bytes);
             entry.blockSince = (entry.blockGuard[0] & 1u) == 0 ? untrackedBaseline(address, bytes, entry.blockLayout) : 0;
         }
+        if (profile) snapStart = LookupOutcomes::Add(LookupOutcomes::SampledUntrackedWalk, snapStart);
         if (traceAddress != 0 && traceAddress == address) {
             static int tracedSnapshots = 0;
             if (tracedSnapshots++ < 40) {
@@ -2644,6 +2647,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             if (clearSnapshots.size() > 8) clearSnapshots.pop_back();
         }
         }
+        if (profile) snapStart = LookupOutcomes::Add(LookupOutcomes::SampledSnapshotBody, snapStart);
     }
     auto texture = entry.texture;
     texture->NoteUse(useSerial());
@@ -2659,6 +2663,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         reportCacheCounts(cache, budgets);
         reportTextureCounters();
         probeGuard.outcome = source == nullptr ? LookupProbeOutcome::MadeSnapshot : LookupProbeOutcome::Other;
+        if (profile && source == nullptr) LookupOutcomes::Add(LookupOutcomes::SampledAdmitRetain, snapStart);
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
         return texture;
     }
@@ -2667,6 +2672,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     reportCacheCounts(cache, budgets);
     reportTextureCounters();
     probeGuard.outcome = source == nullptr ? LookupProbeOutcome::MadeSnapshot : LookupProbeOutcome::Other;
+    if (profile && source == nullptr) LookupOutcomes::Add(LookupOutcomes::SampledAdmitRetain, snapStart);
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
     return texture;
 }
@@ -3617,6 +3623,8 @@ struct CompleteImageProfile {
     std::array<std::array<double, LookupOutcomes::Count>, 2> ms{};
     std::array<std::uint64_t, 2> builds{}, deferred{};
     std::array<double, 2> deferredMs{}, storageTablesMs{}, imageTablesMs{}, depthMs{};
+    std::chrono::steady_clock::time_point windowBegin = std::chrono::steady_clock::now();
+    std::uint64_t beginPresents = Recorder::Presents();
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -3643,7 +3651,10 @@ void noteCompleteImages(const LookupOutcomes& before, std::size_t deferred, doub
     const auto now = std::chrono::steady_clock::now();
     if (now - profile.lastReport < std::chrono::seconds(10)) return;
     profile.lastReport = now;
-    static constexpr const char* sides[2] = {"untagged threads (draw committer, presenter)", "queue workers"};
+    const auto endPresents = Recorder::Presents();
+    const auto beginSeconds = std::chrono::duration<double>(profile.windowBegin.time_since_epoch()).count();
+    const auto endSeconds = std::chrono::duration<double>(now.time_since_epoch()).count();
+    static constexpr const char* sides[2] = {"untagged threads (shared: draw committer, presenter, and other non-queue threads)", "queue workers"};
     for (std::size_t which = 0; which < 2; ++which) {
         std::string report;
         char text[160];
@@ -3652,12 +3663,14 @@ void noteCompleteImages(const LookupOutcomes& before, std::size_t deferred, doub
             std::snprintf(text, sizeof(text), " %s %llux%.1fms", LookupOutcomes::Name(static_cast<LookupOutcomes::Kind>(kind)), static_cast<unsigned long long>(profile.counts[which][kind]), profile.ms[which][kind]);
             report += text;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[complete-images] (10 s) %s: %llu stage-B builds; deferred image bindings %llu in %.1f ms, storage image tables %.1f ms, image tables %.1f ms, depth-write check %.1f ms; lookups by outcome (count x ms, the refresh/upload/scan/flush rows lie inside the sampled and storage rows):%s\n", sides[which], static_cast<unsigned long long>(profile.builds[which]), static_cast<unsigned long long>(profile.deferred[which]), profile.deferredMs[which], profile.storageTablesMs[which], profile.imageTablesMs[which], profile.depthMs[which], report.c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("[complete-images] window begin %.3f s end %.3f s (steady) presents %llu..%llu; %s: %llu stage-B builds; deferred image bindings %llu in %.1f ms, storage image tables %.1f ms, image tables %.1f ms, depth-write check %.1f ms; lookups by outcome (count x ms; the before/untracked-walk/body/admit rows partition 'sampled made snapshot' and the snapshot read/hash/build rows lie inside 'sampled snapshot body'):%s\n", beginSeconds, endSeconds, static_cast<unsigned long long>(profile.beginPresents), static_cast<unsigned long long>(endPresents), sides[which], static_cast<unsigned long long>(profile.builds[which]), static_cast<unsigned long long>(profile.deferred[which]), profile.deferredMs[which], profile.storageTablesMs[which], profile.imageTablesMs[which], profile.depthMs[which], report.c_str());
         profile.counts[which] = {};
         profile.ms[which] = {};
         profile.builds[which] = profile.deferred[which] = 0;
         profile.deferredMs[which] = profile.storageTablesMs[which] = profile.imageTablesMs[which] = profile.depthMs[which] = 0;
     }
+    profile.windowBegin = now;
+    profile.beginPresents = endPresents;
 }
 
 // APS5_PROFILE_DRAW: guest buffer elements bound by descriptor (addGuestBuffer) and how many the

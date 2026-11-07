@@ -2502,7 +2502,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "snapshot read", "snapshot hash", "snapshot build", "one-off dcc", "one-off stamp", "one-off hash committed-partial", "one-off hash untracked-hinted", "one-off hash untracked-unhinted", "one-off hash other", "one-off promoted", "one-off refused"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "sampled before snapshot branch", "sampled untracked walk", "sampled snapshot body", "sampled admit/retain", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "snapshot read", "snapshot hash", "snapshot build", "one-off dcc", "one-off stamp", "one-off hash committed-partial", "one-off hash untracked-hinted", "one-off hash untracked-unhinted", "one-off hash other", "one-off promoted", "one-off refused"};
     return kind < Count ? names[kind] : "?";
 }
 
