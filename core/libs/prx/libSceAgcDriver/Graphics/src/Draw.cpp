@@ -1363,7 +1363,6 @@ struct DrawTimer {
     std::array<double, PhaseCount> us{};
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
-        if (which == PhaseRecord && DriverDetail::CommitterOverlap::Enabled()) DriverDetail::CommitterOverlap::Get().SetState(DriverDetail::CommitterOverlap::DrawRecord);
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
@@ -2314,6 +2313,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     if (ResourceKeyDiffEnabled() && recordable) NoteResourceKeyDiff(context, state, draw, shaders, indexBytes, trimKey, resolved.cacheable, resolved.resources != nullptr, resolved.contentKey);
     timer.phase(PhaseLookup);
+    if (DriverDetail::CommitterOverlap::Enabled()) DriverDetail::CommitterOverlap::Get().SetState(DriverDetail::CommitterOverlap::DrawResources);
     if (resolved.resources == nullptr) {
         // S1: stage A made ahead of the draw, when nothing it read can have moved since (the stamps
         // were taken before it); else the build runs here as before.
@@ -2345,6 +2345,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         Splits().servedByCache.fetch_add(1, std::memory_order_relaxed);
         prepared->resources.reset();
     }
+    if (DriverDetail::CommitterOverlap::Enabled()) DriverDetail::CommitterOverlap::Get().SetState(DriverDetail::CommitterOverlap::DrawOther);
     timer.phase(PhaseResources);
     if (timer.profile && SplitDrawBuild()) reportSplits();
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");

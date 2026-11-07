@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitterOverlap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -4329,7 +4330,10 @@ void ShaderResources::buildComplete() {
         };
         previousSampled = {};
         for (auto& source : samplerSources) source.singleLevelImage = source.mipmappedImage = false;
-        for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));
+        {
+            const AgcDriver::DriverDetail::CommitterOverlapScope overlap(AgcDriver::DriverDetail::CommitterOverlap::DeferredImages);
+            for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));
+        }
         previousSampled = {};
         deferredImages.clear();
         applyAnisoOverride();

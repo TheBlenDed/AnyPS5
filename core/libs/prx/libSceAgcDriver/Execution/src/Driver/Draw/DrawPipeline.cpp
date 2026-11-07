@@ -411,9 +411,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
-        CommitterOverlap::Get().ProducerEnter();
+        if (CommitterOverlap::Enabled()) CommitterOverlap::Get().ProducerEnter();
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
-        CommitterOverlap::Get().ProducerExit();
+        if (CommitterOverlap::Enabled()) CommitterOverlap::Get().ProducerExit();
         --idleWaiters;
         resumeAt = 0;
         fullWaitNs += elapsedNs(start);
@@ -437,7 +437,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (!thread.joinable()) {
         thread = std::thread([this] {
             GuestMemory::MarkProofThread();
-            CommitterOverlap::Get().EnterCommitterThread();
+            if (CommitterOverlap::Enabled()) CommitterOverlap::Get().EnterCommitterThread();
             run();
         });
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);
@@ -528,8 +528,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::uint64_t overlapSum = 0;
         for (const auto value : overlap.stateNs) overlapSum += value;
         const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
-        const auto concurrent = fullWaitNs > overlap.unionNs ? fullWaitNs - overlap.unionNs : 0;
-        AgcDriver::ProfilePrint_nid_no_patch("[draw-overlap] (10 s): %llu room-wait begins, %llu ends, %u open; producer-blocked union %.3f ms vs %.3f ms per-waiter (%.3f ms concurrent overlap); committer while blocked: between %.3f, idle %.3f, gpu_wait %.3f, draw_resources %.3f, draw_record %.3f, dispatch %.3f ms (sum %.3f ms)\n", static_cast<unsigned long long>(overlap.begins), static_cast<unsigned long long>(overlap.ends), static_cast<unsigned>(overlap.waiters), ms(overlap.unionNs), ms(fullWaitNs), ms(concurrent), ms(overlap.stateNs[CommitterOverlap::Between]), ms(overlap.stateNs[CommitterOverlap::Idle]), ms(overlap.stateNs[CommitterOverlap::GpuWait]), ms(overlap.stateNs[CommitterOverlap::DrawResources]), ms(overlap.stateNs[CommitterOverlap::DrawRecord]), ms(overlap.stateNs[CommitterOverlap::Dispatch]), ms(overlapSum));
+        AgcDriver::ProfilePrint_nid_no_patch("[draw-overlap] steady_ns %lld..%lld: %llu room-wait begins, %llu ends, open %u..%u; union %.3f ms, per-waiter %.3f ms; committer while blocked: between %.3f, idle %.3f, gpu_mutex %.3f, draw_resources_other %.3f, draw_other %.3f, dispatch_or_other %.3f, deferred_images %.3f ms (sum %.3f ms)\n", static_cast<long long>(overlap.beginNs), static_cast<long long>(overlap.endNs), static_cast<unsigned long long>(overlap.begins), static_cast<unsigned long long>(overlap.ends), static_cast<unsigned>(overlap.initialWaiters), static_cast<unsigned>(overlap.waiters), ms(overlap.unionNs), ms(overlap.waiterNs), ms(overlap.stateNs[CommitterOverlap::Between]), ms(overlap.stateNs[CommitterOverlap::Idle]), ms(overlap.stateNs[CommitterOverlap::GpuWait]), ms(overlap.stateNs[CommitterOverlap::DrawResources]), ms(overlap.stateNs[CommitterOverlap::DrawOther]), ms(overlap.stateNs[CommitterOverlap::DispatchOrOther]), ms(overlap.stateNs[CommitterOverlap::DeferredImages]), ms(overlapSum));
     }
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     roomWaits = roomWakeNs = drainWaits = drainWakeNs = committerIdles = committerIdleNs = committerWakeNs = 0;
@@ -549,9 +548,9 @@ void DrawPipeline::run() {
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
-            CommitterOverlap::Get().SetState(CommitterOverlap::Idle);
+            if (CommitterOverlap::Enabled()) CommitterOverlap::Get().SetState(CommitterOverlap::Idle);
             wake.wait(lock, [&] { return !items.empty() || closing; });
-            CommitterOverlap::Get().SetState(CommitterOverlap::Between);
+            if (CommitterOverlap::Enabled()) CommitterOverlap::Get().SetState(CommitterOverlap::Between);
             committerWaiting = false;
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
@@ -569,7 +568,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
-            if (commit != nullptr && !isDraw) CommitterOverlap::Get().SetState(CommitterOverlap::Dispatch);
+            if (commit != nullptr && CommitterOverlap::Enabled()) CommitterOverlap::Get().SetState(isDraw ? CommitterOverlap::DrawOther : CommitterOverlap::DispatchOrOther);
             if (commit != nullptr) (*commit)();
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
@@ -581,7 +580,7 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
-        CommitterOverlap::Get().SetState(CommitterOverlap::Between);
+        if (CommitterOverlap::Enabled()) CommitterOverlap::Get().SetState(CommitterOverlap::Between);
         const auto spent = elapsedNs(start);
         traceWait("DrawPipeline", "commit", start);
         if (fatal != nullptr && !stopped) {

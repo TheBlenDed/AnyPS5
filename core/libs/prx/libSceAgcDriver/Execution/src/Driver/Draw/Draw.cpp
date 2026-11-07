@@ -1299,10 +1299,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, Graphics::PreparedDraw* prepared, std::uint64_t presyncSerial, const Graphics::AheadDraw* ahead, VulkanDevice::DrawTraceContext trace) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
-    CommitterOverlap::Get().SetState(CommitterOverlap::GpuWait);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+    if (CommitterOverlap::Enabled()) CommitterOverlap::Get().SetState(CommitterOverlap::GpuWait);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    CommitterOverlap::Get().SetState(CommitterOverlap::DrawResources);
+    if (CommitterOverlap::Enabled()) CommitterOverlap::Get().SetState(CommitterOverlap::DrawOther);
     if (auto current = device.Load(); current != nullptr && current != localDevice) {
         localDevice = std::move(current);
         prepared = nullptr;

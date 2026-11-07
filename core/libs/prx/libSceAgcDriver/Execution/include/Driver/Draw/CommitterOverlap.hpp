@@ -11,11 +11,15 @@ namespace AgcDriver::DriverDetail {
 
 class CommitterOverlap {
 public:
-    enum State : std::uint8_t { Between = 0, Idle, GpuWait, DrawResources, DrawRecord, Dispatch, Count };
+    enum State : std::uint8_t { Between = 0, Idle, GpuWait, DrawResources, DrawOther, DispatchOrOther, DeferredImages, Count };
 
     struct Snapshot {
         std::array<std::uint64_t, Count> stateNs{};
         std::uint64_t unionNs = 0;
+        std::uint64_t waiterNs = 0;
+        std::int64_t beginNs = 0;
+        std::int64_t endNs = 0;
+        std::uint32_t initialWaiters = 0;
         std::uint64_t begins = 0;
         std::uint64_t ends = 0;
         std::uint32_t waiters = 0;
@@ -37,11 +41,13 @@ public:
 
     void EnterCommitterThread() { committerThreadFlag() = true; }
 
-    void SetState(State next) {
-        if (!Enabled() || !committerThreadFlag()) return;
+    State SetState(State next) {
+        if (!Enabled() || !committerThreadFlag()) return Count;
         std::lock_guard lock(mutex);
         account(nowNs());
+        const auto previous = state;
         state = next;
+        return previous;
     }
 
     void ProducerEnter() {
@@ -67,11 +73,18 @@ public:
         account(nowNs());
         snap.stateNs = stateNs;
         snap.unionNs = unionNs;
+        snap.waiterNs = waiterNs;
+        snap.beginNs = windowBeginNs;
+        snap.endNs = lastNs;
+        snap.initialWaiters = initialWaiters;
+        windowBeginNs = lastNs;
+        initialWaiters = waiters;
         snap.begins = begins;
         snap.ends = ends;
         snap.waiters = waiters;
         stateNs = {};
         unionNs = 0;
+        waiterNs = 0;
         begins = 0;
         ends = 0;
         return snap;
@@ -97,12 +110,13 @@ private:
     void account(std::int64_t now) {
         if (!valid) {
             valid = true;
-            lastNs = now;
+            lastNs = windowBeginNs = now;
             return;
         }
         const std::int64_t delta = now - lastNs;
         if (delta > 0 && waiters != 0) {
             unionNs += static_cast<std::uint64_t>(delta);
+            waiterNs += static_cast<std::uint64_t>(delta) * waiters;
             stateNs[state] += static_cast<std::uint64_t>(delta);
         }
         lastNs = now;
@@ -115,8 +129,27 @@ private:
     bool valid = false;
     std::array<std::uint64_t, Count> stateNs{};
     std::uint64_t unionNs = 0;
+    std::uint64_t waiterNs = 0;
+    std::int64_t windowBeginNs = 0;
+    std::uint32_t initialWaiters = 0;
     std::uint64_t begins = 0;
     std::uint64_t ends = 0;
+};
+
+class CommitterOverlapScope {
+public:
+    explicit CommitterOverlapScope(CommitterOverlap::State state)
+        : previous(CommitterOverlap::Enabled() ? CommitterOverlap::Get().SetState(state) : CommitterOverlap::Count) {}
+
+    CommitterOverlapScope(const CommitterOverlapScope&) = delete;
+    CommitterOverlapScope& operator=(const CommitterOverlapScope&) = delete;
+
+    ~CommitterOverlapScope() {
+        if (previous != CommitterOverlap::Count) CommitterOverlap::Get().SetState(previous);
+    }
+
+private:
+    CommitterOverlap::State previous;
 };
 
 }  // namespace AgcDriver::DriverDetail
