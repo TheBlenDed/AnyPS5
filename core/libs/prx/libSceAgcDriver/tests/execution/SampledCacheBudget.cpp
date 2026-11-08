@@ -1006,6 +1006,53 @@ void secondUseTests(const Context& context) {
     Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the later-use lookup left the cache over its budget");
 }
 
+#ifdef _WIN32
+void oneOffOwnedProofTests(const Context& context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    WatchedSurface target(context);
+    Block fill(context);
+    ClearCachedTextures(context.device);
+    Recorder::CountPresent();
+    const auto bytes = Sampled(context, fill.Surface(0))->AllocationBytes();
+    const auto capacity = static_cast<std::size_t>(Budget / bytes);
+    Require(capacity >= 2u && capacity < Surfaces && (capacity + 1u) * bytes <= Ceiling, "the one-off fixture does not fit the protected cache budget");
+    for (std::size_t surface = 1; surface < capacity; ++surface) Sampled(context, fill.Surface(surface));
+    Recorder::CountPresent();
+
+    const auto address = target.Address();
+    Memory::Unwatch(address, SurfaceBytes);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
+    Require(Memory::CollectWritesUncached(address, SurfaceBytes) == 0 &&
+        Memory::CollectCommittedWrites(address, SurfaceBytes, committed) == 0, "the one-off fixture still has a tracker generation");
+    Memory::BumpCollectEpoch();
+    const auto epoch = Memory::CollectEpoch();
+    Require(epoch != 0, "the one-off fixture has no collect epoch");
+
+    const auto initial = SampledCacheCounters();
+    const auto first = Sampled(context, address);
+    Require(!first->ViewsStorageImage() && TextureCacheUsage().sampledEntries == capacity, "the target did not make a one-off snapshot");
+    Require(Sampled(context, address) == first, "the first full comparison missed an unchanged one-off");
+    const auto seeded = SampledCacheCounters();
+    Require(seeded.oneOffReuses == initial.oneOffReuses + 1 && seeded.oneOffOwnedReuses == initial.oneOffOwnedReuses, "the first one-off reuse did not seed through comparison");
+    Require(Sampled(context, address) == first, "the unchanged one-off snapshot was replaced");
+    const auto clean = SampledCacheCounters();
+    const auto* flag = std::getenv("APS5_SAMPLED_ONE_OFF_OWNED_PROOF");
+    const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0;
+    Require(clean.oneOffReuses == seeded.oneOffReuses + 1 && clean.oneOffOwnedReuses == seeded.oneOffOwnedReuses + (enabled ? 1u : 0u), "the unchanged reuse did not follow the selected proof path");
+
+    std::vector<std::uint64_t> words(Memory::HashBlockCount(address, SurfaceBytes));
+    Require(Memory::ArmOwnedBlocks(address, SurfaceBytes, words) && Memory::OwnedWordsHold(address, SurfaceBytes, words), "the ordinary epoch proof could not be primed");
+    *reinterpret_cast<std::uint8_t*>(address) ^= 0xffu;
+    Require(Memory::CollectEpoch() == epoch && Memory::OwnedWordsHold(address, SurfaceBytes, words), "the raw store did not exercise a stale same-epoch memo");
+
+    const auto changed = Sampled(context, address);
+    const auto final = SampledCacheCounters();
+    Require(changed != first && final.made == clean.made + 1 && final.oneOffOwnedReuses == clean.oneOffOwnedReuses &&
+        final.oneOffReuses == clean.oneOffReuses, "the same-epoch store did not replace the one-off snapshot");
+    Memory::EndCollectEpoch();
+}
+#endif
+
 void earlyMissTests(const Context& context) {
     Block block(context);
     ClearCachedTextures(context.device);
@@ -1841,6 +1888,14 @@ int main(int argc, char** argv) {
         }
         TextureDetiler detiler(context);
         context.detiler = &detiler;
+#ifdef _WIN32
+        if (mode == "one-off-owned-proof") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            oneOffOwnedProofTests(context);
+            std::puts("sampled one-off owned proof tests passed");
+            return 0;
+        }
+#endif
         if (mode == "second-use") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             secondUseTests(context);

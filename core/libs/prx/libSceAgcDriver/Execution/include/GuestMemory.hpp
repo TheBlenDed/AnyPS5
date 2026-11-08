@@ -111,6 +111,7 @@ bool ArmOwnedBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uin
 // APS5_VERIFY_OWNED_EPOCH=<n>: the first n such answers of every 10 s are asked again with a query
 // (disagreements: CPU stores after the thread's last ordering point, printed).
 bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
+bool OwnedWordsHoldFresh(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words);
 // `wordsHeld`: the caller has just seen OwnedWordsHold hold for these words (one GetWriteWatch
 // query per proof instead of two).
 bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since, bool wordsHeld = false);

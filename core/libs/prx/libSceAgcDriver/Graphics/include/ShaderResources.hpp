@@ -103,6 +103,7 @@ struct SampledCacheCounts {
     std::uint64_t spilled = 0;
     std::uint64_t spilledBytes = 0;
     std::uint64_t oneOffReuses = 0;
+    std::uint64_t oneOffOwnedReuses = 0;
     std::uint64_t made = 0;
     std::uint64_t spilledReuses = 0;
     std::uint64_t overflowDropped = 0;

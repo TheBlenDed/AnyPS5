@@ -128,6 +128,12 @@ struct OwnedProof {
 
 enum class OneOffProof : std::uint8_t { Stamped, CommittedPartial, UntrackedHinted, UntrackedUnhinted };
 
+struct OneOffOwnedProof {
+    std::vector<std::uint64_t> words;
+    std::uint64_t since = 0;
+    std::array<std::uint64_t, 2> guard{};
+};
+
 OneOffProof oneOffProofFor(std::uint64_t generation, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& committed, const std::array<std::uint64_t, 4>& untracked) {
     if (generation != 0) return OneOffProof::Stamped;
     if (committed.has_value()) return OneOffProof::CommittedPartial;
@@ -219,6 +225,8 @@ struct TextureCache {
         std::list<TextureKey>::iterator lru{};
         OneOffProof proof = OneOffProof::Stamped;
         GuestMemory::UntrackedWhy untrackedWhy = GuestMemory::UntrackedWhy::NotApplicable;
+        std::unique_ptr<OneOffOwnedProof> owned = nullptr;
+        bool ownedArmRefused = false;
     };
     std::unordered_map<TextureKey, OneOff, TextureKeyHash> oneOffs;
     std::size_t oneOffsSwept = 0;
@@ -268,6 +276,7 @@ struct TextureCache {
         std::uint64_t spilled = 0;
         std::uint64_t spilledBytes = 0;
         std::uint64_t oneOffReuses = 0;
+        std::uint64_t oneOffOwnedReuses = 0;
         std::uint64_t made = 0;
         std::uint64_t spilledReuses = 0;
         std::uint64_t overflowDropped = 0;
@@ -732,6 +741,9 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     }
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu snapshots made of %zu distinct surfaces; top re-snapshotted: [%s] [%s] [%s]; %llu spilled snapshots reused, %llu kept ones dropped (%llu MiB), %llu batches waited for; overflow type %llu MiB of a %llu MiB budget, %llu MiB of it kept for reuse in %zu snapshots\n", static_cast<unsigned long long>(counts.made), distinctMade, TopSurfaceText(top[0]).c_str(), TopSurfaceText(top[1]).c_str(), TopSurfaceText(top[2]).c_str(), static_cast<unsigned long long>(counts.spilledReuses), static_cast<unsigned long long>(counts.overflowDropped), static_cast<unsigned long long>(counts.overflowDroppedBytes >> 20u), static_cast<unsigned long long>(counts.overflowWaits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 20u), static_cast<unsigned long long>(budgets.overflow >> 20u), static_cast<unsigned long long>(cache.overflowKept >> 20u), cache.overflowLru.size());
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) evictions by path: admission %llu (%llu used this present or the last), share %llu (%llu), reclaim %llu (%llu); eviction frame %llu at present %llu; snapshots made after an admission eviction of the same surface %llu\n", static_cast<unsigned long long>(counts.evictedBy[0]), static_cast<unsigned long long>(counts.evictedRecent[0]), static_cast<unsigned long long>(counts.evictedBy[1]), static_cast<unsigned long long>(counts.evictedRecent[1]), static_cast<unsigned long long>(counts.evictedBy[2]), static_cast<unsigned long long>(counts.evictedRecent[2]), static_cast<unsigned long long>(cache.frame), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(madeAfterEvictTotal));
+    if (counts.oneOffOwnedReuses != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu one-off snapshots reused by owned write watch\n", static_cast<unsigned long long>(counts.oneOffOwnedReuses));
+    }
     if (counts.previousFrameLaterUseRefusals != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu previous-frame later-use admission refusals\n", static_cast<unsigned long long>(counts.previousFrameLaterUseRefusals));
     }
@@ -1093,7 +1105,29 @@ void oneOffProbeSample(std::uint64_t address, std::size_t bytes, const OneOffPro
     else ++counters.overflow;
 }
 
-bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t since, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& before, SnapshotCompare reason, OneOffProbeTiming* timing = nullptr) {
+std::array<std::uint64_t, 2> untrackedGuard(std::uint64_t address, std::size_t bytes) {
+    const auto* recorder = Recorder::Active();
+    return {GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+}
+
+bool oneOffOwnedProofEnabled() {
+#ifdef _WIN32
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_SAMPLED_ONE_OFF_OWNED_PROOF");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled && UntrackedBlocksEnabled() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedProofs);
+#else
+    return false;
+#endif
+}
+
+struct OneOffRevalidation {
+    TextureCache::OneOff& entry;
+    bool ownedHit = false;
+};
+
+bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> hashes, std::uint64_t since, const std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>>& before, SnapshotCompare reason, OneOffProbeTiming* timing = nullptr, OneOffRevalidation* oneOff = nullptr) {
     const bool narrow = since != 0 && BlockRevalidateEnabled() && hashes.size() == GuestMemory::HashBlockCount(address, bytes);
     const auto probeStart = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto& pending = pendingBlocks(address, bytes, narrow ? hashes.size() : 0);
@@ -1101,8 +1135,36 @@ bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<co
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
     GuestMemory::FlushGpuWrites(address, bytes);
     const auto probeFlush = timing != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::unique_ptr<OneOffOwnedProof> proof;
+    if (oneOff != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && !Recorder::InCompletion()) {
+        auto& entry = oneOff->entry;
+        proof = std::move(entry.owned);
+        const auto guard = untrackedGuard(address, bytes);
+        const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
+        if ((guard[0] & 1u) != 0 || Recorder::SnapshotWriteOverlaps(address, bytes) || StorageTexture::AnyPendingOverlaps(std::span(&range, 1))) {
+            proof.reset();
+        } else {
+            if (proof != nullptr && proof->guard == guard && GuestMemory::OwnedWordsHoldFresh(address, bytes, proof->words) &&
+                GuestMemory::OwnedProofHolds(address, bytes, proof->words, proof->since, true) && untrackedGuard(address, bytes) == guard) {
+                entry.owned = std::move(proof);
+                oneOff->ownedHit = true;
+                return true;
+            }
+            if (proof == nullptr) proof = std::make_unique<OneOffOwnedProof>();
+            proof->words.resize(hashes.size());
+            proof->since = GuestMemory::WriteGeneration();
+            proof->guard = guard;
+            if (!GuestMemory::ArmOwnedBlocks(address, bytes, proof->words, !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedPrivate))) {
+                entry.ownedArmRefused = true;
+                proof.reset();
+            }
+        }
+    }
     GuestMemory::BlockMatch match;
     const bool equal = narrow ? GuestMemory::CommittedBlocksMatchSince(address, bytes, hashes, since, before.has_value() ? &*before : nullptr, pending, &match) : GuestMemory::CommittedBlocksMatch(address, bytes, hashes);
+    if (equal && proof != nullptr && proof->since != 0 && untrackedGuard(address, bytes) == proof->guard && !Recorder::SnapshotWriteOverlaps(address, bytes)) {
+        oneOff->entry.owned = std::move(proof);
+    }
     if (timing != nullptr) {
         const auto probeCompare = std::chrono::steady_clock::now();
         timing->pendingNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(probePending - probeStart).count());
@@ -1113,11 +1175,6 @@ bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<co
     if (!narrow) match = {hashes.size(), 0, bytes, 0};
     noteSnapshotCompare(reason, equal, narrow, match, nullptr);
     return equal;
-}
-
-std::array<std::uint64_t, 2> untrackedGuard(std::uint64_t address, std::size_t bytes) {
-    const auto* recorder = Recorder::Active();
-    return {GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
 }
 
 std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes, GuestMemory::Commitment& layout) {
@@ -2466,7 +2523,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const bool probeSampled = verdict == GuestMemory::UnchangedSinceWhy::ZeroGeneration && OneOffProbeEnabled() && oneOffProbeBegin(bytes);
                 const auto ocStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 const auto ocWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
-                const bool unchanged = snapshotStillMatches(address, bytes, oneOff.hashes, generation != 0 ? oneOff.generation : 0, std::nullopt, SnapshotCompare::OneOff, probeSampled ? &probeTiming : nullptr);
+                OneOffRevalidation revalidation{oneOff};
+                const bool ownedEligible = generation == 0 && verdict == GuestMemory::UnchangedSinceWhy::ZeroGeneration &&
+                    !probeSampled && !oneOff.ownedArmRefused && oneOffOwnedProofEnabled() &&
+                    oneOff.hashes.size() == GuestMemory::HashBlockCount(address, bytes);
+                const bool unchanged = snapshotStillMatches(address, bytes, oneOff.hashes, generation != 0 ? oneOff.generation : 0, std::nullopt, SnapshotCompare::OneOff, probeSampled ? &probeTiming : nullptr, ownedEligible ? &revalidation : nullptr);
+                if (revalidation.ownedHit) {
+                    ++cache.counts.oneOffOwnedReuses;
+                    ++cache.totals.oneOffOwnedReuses;
+                    return true;
+                }
                 if (probeSel) LookupProbeAddOneOff(ocStart, ocWait, bytes, unchanged, static_cast<std::size_t>(oneOff.untrackedWhy));
                 if (probeSampled) oneOffProbeSample(address, bytes, probeTiming);
                 if (profile) {
@@ -3111,6 +3177,7 @@ SampledCacheCounts SampledCacheCounters() {
         counts.spilled = cache.totals.spilled;
         counts.spilledBytes = cache.totals.spilledBytes;
         counts.oneOffReuses = cache.totals.oneOffReuses;
+        counts.oneOffOwnedReuses = cache.totals.oneOffOwnedReuses;
         counts.made = cache.totals.made;
         counts.spilledReuses = cache.totals.spilledReuses;
         counts.overflowDropped = cache.totals.overflowDropped;

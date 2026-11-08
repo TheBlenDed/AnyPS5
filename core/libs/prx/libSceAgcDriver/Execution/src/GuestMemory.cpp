@@ -2525,11 +2525,8 @@ bool takeOwnedEpochVerify() {
     return windowTaken.fetch_add(1, std::memory_order_relaxed) < budget;
 }
 
-}
-
-bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words) {
+bool ownedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t mark) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || words.empty() || words.size() != HashBlockCount(address, bytes)) return false;
-    const auto mark = ThreadCollectEpoch() != 0 && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoOwnedEpoch) ? HostThreadSlot<std::uint64_t, OwnedMarkSlot>::Get() : 0;
     const bool holds = GuestArena::GuestArenaOwnedUnchanged_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, words.data(), words.size(), mark);
     if (holds && mark != 0 && takeOwnedEpochVerify()) {
         ownedEpochVerified.fetch_add(1, std::memory_order_relaxed);
@@ -2540,6 +2537,17 @@ bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const st
         }
     }
     return holds;
+}
+
+}
+
+bool OwnedWordsHold(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words) {
+    const auto mark = ThreadCollectEpoch() != 0 && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoOwnedEpoch) ? HostThreadSlot<std::uint64_t, OwnedMarkSlot>::Get() : 0;
+    return ownedWordsHold(address, bytes, words, mark);
+}
+
+bool OwnedWordsHoldFresh(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words) {
+    return ownedWordsHold(address, bytes, words, 0);
 }
 
 bool OwnedProofHolds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words, std::uint64_t since, bool wordsHeld) {

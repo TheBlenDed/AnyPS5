@@ -3556,6 +3556,16 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_sampled_cache_budget_memory agc_driver_sampled_cache_burst_overflow agc_driver_sampled_cache_overflow_lifetime PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    if(WIN32)
+        foreach(oneOffProofMode IN ITEMS 0 1)
+            set(oneOffTest agc_driver_sampled_cache_one_off_owned_proof_${oneOffProofMode})
+            add_test(NAME ${oneOffTest} COMMAND agc_driver_sampled_cache_budget_tests one-off-owned-proof)
+            set_tests_properties(${oneOffTest} PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SAMPLED_LATER_USE_REFUSAL=1;APS5_SAMPLED_LATER_USE_PROTECT_PREVIOUS_FRAME=1;APS5_NO_SAMPLED_FROM_STORAGE=1;APS5_NO_TEXTURE_SPILL=1;APS5_SAMPLED_ONE_OFF_OWNED_PROOF=${oneOffProofMode}"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>"
+                SKIP_RETURN_CODE 77 TIMEOUT 30)
+        endforeach()
+    endif()
     add_test(NAME agc_driver_sampled_cache_setup_report COMMAND agc_driver_sampled_cache_budget_tests setup-report)
     set_tests_properties(agc_driver_sampled_cache_setup_report PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
     if(WIN32)
