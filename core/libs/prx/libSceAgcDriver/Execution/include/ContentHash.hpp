@@ -4,6 +4,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #if defined(__GNUC__) && defined(__x86_64__)
 #include <immintrin.h>
@@ -180,7 +182,17 @@ __attribute__((target("avx2"))) inline Hash128 OfAvx2(const unsigned char* input
 inline Hash128 Of(const void* data, std::size_t bytes) noexcept {
     using namespace Detail;
 #if defined(__GNUC__) && defined(__x86_64__)
-    if (bytes >= BlockBytes && __builtin_cpu_supports("avx2")) return OfAvx2(static_cast<const unsigned char*>(data), bytes);
+    if (bytes >= BlockBytes) {
+        static const bool useAvx2 = [] {
+            const char* mode = std::getenv("APS5_AVX2_HASH");
+            const bool requested = mode != nullptr && std::strcmp(mode, "1") == 0;
+            const bool enabled = requested && __builtin_cpu_supports("avx2");
+            std::fprintf(stderr, "[gpu] content hash requested=%s selected=%s\n",
+                         requested ? "avx2" : "legacy", enabled ? "avx2" : "legacy");
+            return enabled;
+        }();
+        if (useAvx2) return OfAvx2(static_cast<const unsigned char*>(data), bytes);
+    }
 #endif
     const auto* secret = Secret.data();
     const auto* input = static_cast<const unsigned char*>(data);
