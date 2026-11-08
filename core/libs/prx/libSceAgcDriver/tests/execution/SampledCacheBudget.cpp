@@ -983,16 +983,27 @@ void secondUseTests(const Context& context) {
     Block block(context);
     ClearCachedTextures(context.device);
     Recorder::CountPresent();
-    const auto bytes = Sampled(context, block.Surface(0))->AllocationBytes();
+    auto oldestTexture = Sampled(context, block.Surface(0));
+    const auto bytes = oldestTexture->AllocationBytes();
+    const std::weak_ptr<Texture> oldest = oldestTexture;
+    oldestTexture.reset();
     const auto capacity = static_cast<std::size_t>(Budget / bytes);
     Require(capacity >= 2u && capacity < Surfaces && TextureCacheUsage().sampledEntries == 1u, "a snapshot of the 256 KiB surface holds " + std::to_string(bytes) + " bytes, which the test's 1 MiB budget does not fit as planned");
     for (std::size_t surface = 1; surface < capacity; ++surface) Sampled(context, block.Surface(surface));
     Recorder::CountPresent();
-    auto first = Sampled(context, block.Surface(capacity));
+    const auto first = Sampled(context, block.Surface(capacity));
     Require(TextureCacheUsage().sampledEntries == capacity && first.use_count() == 1, "the first use in a frame of a texture the cache does not hold was cached in place of one the last frame used");
     const auto second = Sampled(context, block.Surface(capacity));
-    Require(Sampled(context, block.Surface(capacity)) == second, "a texture used a second time in a frame whose least recently used entry is from the last frame was not cached");
-    Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the texture admitted on its second use left the cache over its budget");
+    const auto* protectPrevious = std::getenv("APS5_SAMPLED_LATER_USE_PROTECT_PREVIOUS_FRAME");
+    if (std::getenv("APS5_SAMPLED_LATER_USE_REFUSAL") != nullptr && protectPrevious != nullptr && std::strcmp(protectPrevious, "1") == 0) {
+        Require(TextureCacheUsage().sampledBytes + bytes <= Ceiling, "the fixture is above the later-use protection ceiling");
+        Require(!oldest.expired() && first == second && second.use_count() == 2, "the previous-frame texture was evicted or the refused snapshot was not reused");
+        Recorder::CountPresent();
+        Require(Sampled(context, block.Surface(capacity)) == second && oldest.expired(), "the texture used two frames ago still prevented admission");
+    } else {
+        Require(Sampled(context, block.Surface(capacity)) == second && oldest.expired(), "a texture used a second time in a frame whose least recently used entry is from the last frame was not cached");
+    }
+    Require(TextureCacheUsage().sampledEntries == capacity && TextureCacheUsage().sampledBytes <= Budget, "the later-use lookup left the cache over its budget");
 }
 
 void earlyMissTests(const Context& context) {
@@ -1830,6 +1841,13 @@ int main(int argc, char** argv) {
         }
         TextureDetiler detiler(context);
         context.detiler = &detiler;
+        if (mode == "second-use") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            secondUseTests(context);
+            ClearCachedTextures(context.device);
+            std::puts("sampled texture cache second-use tests passed");
+            return 0;
+        }
         if (resources) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;

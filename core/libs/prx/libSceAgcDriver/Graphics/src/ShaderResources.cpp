@@ -258,6 +258,7 @@ struct TextureCache {
     struct Counts {
         std::uint64_t inserted = 0;
         std::uint64_t uncached = 0;
+        std::uint64_t previousFrameLaterUseRefusals = 0;
         std::uint64_t evicted = 0;
         std::uint64_t passed = 0;
         std::uint64_t stale = 0;
@@ -502,6 +503,10 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
         cache.firstUsesPresent = present;
     }
     static const bool laterUses = std::getenv("APS5_SAMPLED_LATER_USE_REFUSAL") != nullptr;
+    static const bool protectPrevious = laterUses && [] {
+        const auto* value = std::getenv("APS5_SAMPLED_LATER_USE_PROTECT_PREVIOUS_FRAME");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
     const bool scan = incoming != 0 && Recorder::Presents() != 0;
     const bool firstUse = scan && !cache.firstUses.contains(key);
     const auto retired = retiredSerial();
@@ -509,9 +514,12 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     while (!cache.entries.empty() && cache.bytes + incoming > budget) {
         const auto back = std::prev(cache.entries.end());
         const bool over = cache.bytes + incoming > ceiling;
-        if (laterUses ? scan && !over && (firstUse ? back->present + 1u >= present : back->present == present) : firstUse && back->present + 1u >= present) {
+        const bool recent = back->present + 1u >= present;
+        const bool previousFrameLaterUse = protectPrevious && !firstUse && back->present + 1u == present;
+        if (laterUses ? scan && !over && (firstUse ? recent : back->present == present || previousFrameLaterUse) : firstUse && recent) {
             cache.firstUses.insert(key);
             ++cache.counts.uncached;
+            cache.counts.previousFrameLaterUseRefusals += previousFrameLaterUse;
             ++cache.totals.uncached;
             return false;
         }
@@ -724,6 +732,9 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     }
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu snapshots made of %zu distinct surfaces; top re-snapshotted: [%s] [%s] [%s]; %llu spilled snapshots reused, %llu kept ones dropped (%llu MiB), %llu batches waited for; overflow type %llu MiB of a %llu MiB budget, %llu MiB of it kept for reuse in %zu snapshots\n", static_cast<unsigned long long>(counts.made), distinctMade, TopSurfaceText(top[0]).c_str(), TopSurfaceText(top[1]).c_str(), TopSurfaceText(top[2]).c_str(), static_cast<unsigned long long>(counts.spilledReuses), static_cast<unsigned long long>(counts.overflowDropped), static_cast<unsigned long long>(counts.overflowDroppedBytes >> 20u), static_cast<unsigned long long>(counts.overflowWaits), static_cast<unsigned long long>(SampledTextureOverflowMemory() >> 20u), static_cast<unsigned long long>(budgets.overflow >> 20u), static_cast<unsigned long long>(cache.overflowKept >> 20u), cache.overflowLru.size());
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) evictions by path: admission %llu (%llu used this present or the last), share %llu (%llu), reclaim %llu (%llu); eviction frame %llu at present %llu; snapshots made after an admission eviction of the same surface %llu\n", static_cast<unsigned long long>(counts.evictedBy[0]), static_cast<unsigned long long>(counts.evictedRecent[0]), static_cast<unsigned long long>(counts.evictedBy[1]), static_cast<unsigned long long>(counts.evictedRecent[1]), static_cast<unsigned long long>(counts.evictedBy[2]), static_cast<unsigned long long>(counts.evictedRecent[2]), static_cast<unsigned long long>(cache.frame), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(madeAfterEvictTotal));
+    if (counts.previousFrameLaterUseRefusals != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu previous-frame later-use admission refusals\n", static_cast<unsigned long long>(counts.previousFrameLaterUseRefusals));
+    }
     cache.madeSurfaces.clear();
     droppedBefore = dropped;
     refusedSetsBefore = refusedSets;
