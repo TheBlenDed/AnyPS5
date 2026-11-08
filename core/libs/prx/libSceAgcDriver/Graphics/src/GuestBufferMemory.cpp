@@ -5574,6 +5574,44 @@ void GuestBufferMemory::completeSpaceWrites() const {
     }
 }
 
+void GuestBufferMemory::PresyncSubmittedWrites(Recorder& recorder, bool cachedSpace) const {
+    auto& gpu = GuestMemory::GpuMutex();
+    if (space != nullptr || gpu.DepthOnThisThread() != 0 || Recorder::InCompletion()) return;
+    if (cachedSpace) {
+        if (!addressSpaceCacheEnabled()) return;
+        const auto pending = Recorder::PendingWriteSnapshot();
+        if (pending == nullptr || pending->empty()) return;
+    } else if (std::none_of(regions.begin(), regions.end(), [](const auto& region) {
+        return Recorder::SnapshotWriteOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin));
+    })) return;
+
+    std::unique_lock lock(gpu);
+    if (Recorder::Active() != &recorder || !AnyPendingCpuWrites(context)) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto append = [&](const auto& region) {
+        if (PendingCpuWritesOverlap(context, recorder, region.begin, static_cast<std::size_t>(region.end - region.begin))) ranges.emplace_back(region.begin, region.end);
+    };
+    if (cachedSpace) {
+        const auto current = Spaces().current.load();
+        if (current == nullptr || !current->heapMirrors.empty() || !current->sparseMirrors.empty()) return;
+        const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        {
+            auto& imports = Imports();
+            std::lock_guard importsLock(imports.mutex);
+            if (spaceMiss(context, current.get(), generation, imports) != SpaceMiss::None) return;
+        }
+        Recorder::WriteRanges pending;
+        recorder.PendingWriteRanges(pending);
+        std::vector<std::size_t> candidates;
+        OverlappedRanges(std::span<const Region>(current->base), 0, pending, candidates);
+        for (const auto index : candidates) append(current->base[index]);
+        for (const auto& region : current->copied) append(region);
+    } else {
+        for (const auto& region : regions) append(region);
+    }
+    if (!ranges.empty()) recorder.WaitSubmittedWrites(std::move(lock), ranges, cachedSpace);
+}
+
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

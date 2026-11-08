@@ -788,7 +788,12 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
-                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address);
+                static const bool bufferWritePresync = [] {
+                    const char* value = std::getenv("APS5_BUFFER_WRITE_PRESYNC");
+                    return value != nullptr && std::strcmp(value, "1") == 0;
+                }();
+                const bool presyncBufferWrites = bufferWritePresync && recipeHit == nullptr && indirectArguments == 0 && Graphics::Recorder::ThreadLane() != 0 && !DispatchUsesImages(compiled);
+                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address, presyncBufferWrites);
             } catch (const Graphics::LiveSnapshotInvalidated&) {
                 throw;
             } catch (const std::exception& error) {

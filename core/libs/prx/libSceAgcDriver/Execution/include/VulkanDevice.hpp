@@ -306,7 +306,7 @@ public:
     // replay's primer: serves `tables` (registers and completes them) under the GPU mutex and syncs.
     std::vector<ShaderRecompiler::BindlessImageAbi::TableRegistration> BindlessRegistrations() const;
     void PrimeBindlessRegistrations(std::span<const ShaderRecompiler::BindlessImageAbi::TableRegistration> tables);
-    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0);
+    std::shared_ptr<PreparedDispatch> PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads = 0, std::uint64_t programAddress = 0, bool presyncBufferWrites = false);
     // APS5_PROFILE_DRAW: the parts of a PrepareDispatch in milliseconds, in the order key, find,
     // precollect, presync, stage A (the driver's 'prepare:' rows).
     static std::span<const double, 5> PreparePhaseMs(const PreparedDispatch& prepared);

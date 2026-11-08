@@ -26,6 +26,8 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::GuestMemory { class GpuMutexType; }
+
 namespace AgcDriver::Graphics {
 
 class Buffer;
@@ -512,6 +514,7 @@ public:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
     void WaitSerial(std::uint64_t serial);
+    void WaitSubmittedWrites(std::unique_lock<GuestMemory::GpuMutexType> lock, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool cachedSpace = false);
     bool WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos);
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.

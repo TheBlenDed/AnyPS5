@@ -5192,6 +5192,46 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 
 }
 
+void Recorder::WaitSubmittedWrites(std::unique_lock<GuestMemory::GpuMutexType> lock, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool cachedSpace) {
+    if (timeline == VK_NULL_HANDLE || asyncTimeline == VK_NULL_HANDLE || !SyncThroughEnabled() || lanes[0] != nullptr || lanes[1] != nullptr) return;
+    std::array<std::uint64_t, 2> targets{};
+    std::array<bool, 2> found{};
+    for (auto batch = inFlight.rbegin(); batch != inFlight.rend() && !(found[0] && found[1]); ++batch) {
+        const auto lane = static_cast<std::size_t>((*batch)->lane);
+        if (found[lane] || std::none_of(ranges.begin(), ranges.end(), [&](const auto& range) { return overlaps(**batch, range.first, range.second); })) continue;
+        found[lane] = true;
+        if (fenceStatus((*batch)->fence) == VK_NOT_READY) targets[lane] = (*batch)->serial;
+    }
+    if (targets[0] == 0 && targets[1] == 0) return;
+
+    const auto device = context.device;
+    const std::array<VkSemaphore, 2> semaphores{timeline, asyncTimeline};
+    const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    const UnlockedWaiter waiter{id};
+    const bool profile = DrawProfiled();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    lock.unlock();
+    for (std::size_t lane = 0; lane < targets.size(); ++lane) {
+        if (targets[lane] != 0) Check(WaitTimeline(device, semaphores[lane], waitSemaphores, targets[lane]), "vkWaitSemaphoresKHR buffer presync");
+    }
+    if (profile) {
+        const auto elapsedUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        static AgcDriver::Mutex countersMutex;
+        static std::array<std::uint64_t, 2> waits{};
+        static std::array<std::uint64_t, 2> totalUs{};
+        const auto slot = static_cast<std::size_t>(cachedSpace);
+        std::uint64_t reportWaits;
+        std::uint64_t reportUs;
+        {
+            std::lock_guard countersLock(countersMutex);
+            reportWaits = ++waits[slot];
+            totalUs[slot] += elapsedUs;
+            reportUs = totalUs[slot];
+        }
+        if (reportWaits == 1 || reportWaits % 100 == 0) AgcDriver::ProfilePrint_nid_no_patch("[buffer-presync] %s%llu submitted waits outside the GPU mutex, %.1f ms cumulative\n", cachedSpace ? "BDA " : "", static_cast<unsigned long long>(reportWaits), reportUs / 1000.0);
+    }
+}
+
 void Recorder::WaitSerial(std::uint64_t serial) {
     PerformanceTimer frameTiming("Recorder.WaitSerial");
     if (timeline == VK_NULL_HANDLE || serial == 0) return;

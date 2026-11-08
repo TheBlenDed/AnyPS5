@@ -27,7 +27,9 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -186,6 +188,7 @@ public:
         }
         Release();
         try {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             device.WaitIdle();
         } catch (...) {
         }
@@ -205,6 +208,28 @@ public:
             Release();
             if (!producerSubmitted && !stop.stop_requested()) std::fprintf(stderr, "pending producer gate: watchdog expired with producer batch %llu unsubmitted (vkSignalSemaphore %d)\n", static_cast<unsigned long long>(serial), static_cast<int>(releaseResult));
         });
+    }
+
+    void ReleaseAfterGpuMutex(const std::atomic<bool>* waitEntered = nullptr) {
+        worker = std::jthread([this, waitEntered](std::stop_token stop) {
+            std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline &&
+                   ((waitEntered != nullptr && !waitEntered->load()) || !lock.try_lock())) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            acquiredGpuMutex = lock.owns_lock();
+            if (acquiredGpuMutex && waitEntered == nullptr) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            Release();
+        });
+    }
+
+    void FinishUnlockedWait() {
+        const bool releasedBeforeReturn = signaled.load();
+        worker.join();
+        Require(releaseResult == VK_SUCCESS, "cannot release the submitted writer gate");
+        Require(acquiredGpuMutex, "the submitted writer wait held the GPU mutex");
+        Require(releasedBeforeReturn, "the submitted writer wait returned before the gate was released");
     }
 
     void Finish() {
@@ -239,8 +264,143 @@ private:
     std::jthread worker;
     std::atomic<bool> signaled{false};
     bool producerSubmitted = false;
+    bool acquiredGpuMutex = false;
     VkResult releaseResult = VK_NOT_READY;
 };
+
+int RunSubmittedWritePresync(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::Recorder;
+    auto& gpu = AgcDriver::GuestMemory::GpuMutex();
+    std::unique_lock lock(gpu);
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "the submitted writer test has no active recorder");
+    if (!recorder->AsyncLaneActive() || !recorder->HasTimeline()) {
+        std::puts("skipped: the submitted writer test needs both timeline lanes");
+        return VulkanTestSkipped;
+    }
+    device.WaitIdle();
+
+    constexpr std::uint32_t written = 42;
+    std::uint32_t value = 0;
+    std::uint32_t valueAtLabel = 0;
+    std::uint32_t completions = 0;
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&value));
+    const std::array ranges{std::pair{address, address + sizeof(value)}};
+    ProducerSubmissionGate gate(device);
+    {
+        const Recorder::LaneScope async(1);
+        gate.Arm(*recorder);
+        recorder->NotePendingWrite(address, sizeof(value));
+        recorder->OnComplete([&] {
+            value = written;
+            ++completions;
+        });
+        recorder->OnComplete([&] {
+            valueAtLabel = value;
+            ++completions;
+        });
+        recorder->Submit();
+    }
+
+    const auto pending = recorder->DescribePendingWrite(address, sizeof(value));
+    Require(pending.has_value() && !pending->open && !pending->signaled, "the gated writer was not submitted and unsignaled");
+    gate.ReleaseAfterGpuMutex();
+    recorder->WaitSubmittedWrites(std::move(lock), ranges);
+    gate.FinishUnlockedWait();
+
+    std::lock_guard reapLock(gpu);
+    const auto afterWait = recorder->DescribePendingWrite(address, sizeof(value));
+    Require(afterWait.has_value() && afterWait->serial == pending->serial, "the wait retired the writer batch");
+    Require(completions == 0 && value == 0 && valueAtLabel == 0, "the wait ran a write-back completion");
+    recorder->SyncThrough(address, sizeof(value));
+    Require(completions == 2 && value == written && valueAtLabel == written, "the locked sync did not run the write-back completions in order");
+    Require(!recorder->DescribePendingWrite(address, sizeof(value)).has_value(), "the locked sync left the writer pending");
+    std::puts("submitted writer presync released the GPU mutex and preserved completion order");
+    return 0;
+}
+
+PFN_vkGetDeviceProcAddr actualDeviceProc = nullptr;
+std::atomic<bool> bdaWaitEntered{false};
+
+VKAPI_ATTR VkResult VKAPI_CALL ObserveBdaWait(VkDevice device, const VkSemaphoreWaitInfo* wait, std::uint64_t timeout) {
+    bdaWaitEntered.store(true);
+    const auto real = reinterpret_cast<PFN_vkWaitSemaphoresKHR>(actualDeviceProc(device, "vkWaitSemaphoresKHR"));
+    return real(device, wait, timeout);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL ObserveBdaDeviceProc(VkDevice device, const char* name) {
+    if (std::string_view(name) == "vkWaitSemaphoresKHR") return reinterpret_cast<PFN_vkVoidFunction>(&ObserveBdaWait);
+    return actualDeviceProc(device, name);
+}
+
+int RunCachedBdaPresync(AgcDriver::VulkanDevice& device, Slot& slot) {
+    using AgcDriver::Graphics::AddressSpaceCounters;
+    using AgcDriver::Graphics::GuestBufferMemory;
+    using AgcDriver::Graphics::Recorder;
+    auto context = device.graphicsContext();
+    if (context.hostImportAlignment == 0 || context.asyncQueue == VK_NULL_HANDLE || !device.CanWaitUnlocked()) {
+        std::puts("skipped: cached BDA presync requires host imports and both timeline lanes");
+        return VulkanTestSkipped;
+    }
+    auto& gpu = AgcDriver::GuestMemory::GpuMutex();
+    std::unique_lock lock(gpu);
+    device.WaitIdle();
+
+    std::uint32_t valueBetweenLabels = 0;
+    actualDeviceProc = context.deviceProc;
+    context.deviceProc = &ObserveBdaDeviceProc;
+    Recorder recorder(context, true);
+    Require(recorder.AsyncLaneActive(), "the cached BDA test could not create its async timeline");
+    recorder.Activate();
+    {
+        GuestBufferMemory seed(context);
+        seed.AcquireRegistered();
+        seed.Upload(true);
+        seed.WriteBack();
+    }
+    recorder.Sync();
+
+    constexpr std::uint32_t first = 42;
+    constexpr std::uint32_t second = 43;
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&slot.label));
+    ProducerSubmissionGate gate(device);
+    {
+        const Recorder::LaneScope async(1);
+        gate.Arm(recorder);
+        recorder.AfterCompletions(address, std::as_bytes(std::span(&first, 1)), 1, Compute, false);
+        recorder.OnComplete([&] { valueBetweenLabels = slot.label; });
+        recorder.AfterCompletions(address, std::as_bytes(std::span(&second, 1)), 2, Compute, false);
+        recorder.Submit();
+    }
+    const auto pending = recorder.DescribePendingWrite(address, sizeof(slot.label));
+    Require(pending.has_value() && !pending->open && !pending->signaled, "the cached BDA producer was not submitted and unsignaled");
+    bdaWaitEntered.store(false);
+    gate.ReleaseAfterGpuMutex(&bdaWaitEntered);
+    lock.unlock();
+    try {
+        GuestBufferMemory probe(context);
+        probe.PresyncSubmittedWrites(recorder, true);
+        gate.FinishUnlockedWait();
+        Require(bdaWaitEntered.load(), "the cached BDA preflight did not enter the Vulkan timeline wait");
+    } catch (...) {
+        lock.lock();
+        throw;
+    }
+    lock.lock();
+    Require(slot.label == 0 && valueBetweenLabels == 0 && Recorder::PendingCompletionLabels() == 2, "the cached BDA preflight completed the pending labels");
+    const auto before = AddressSpaceCounters().hits;
+    {
+        GuestBufferMemory consumer(context);
+        consumer.AcquireRegistered();
+        Require(AddressSpaceCounters().hits == before + 1, "the BDA consumer did not use the cached address space");
+        consumer.Upload(true);
+        consumer.WriteBack();
+    }
+    Require(valueBetweenLabels == first && slot.label == second && Recorder::PendingCompletionLabels() == 0, "locked BDA upload did not complete the labels in order");
+    recorder.Sync();
+    std::puts("cached BDA presync released the GPU mutex and preserved completion order");
+    return 0;
+}
 
 void RunArgumentLabel(Slot& slot) {
     AgcDriverShutdown_nid_postfix();
@@ -346,9 +506,19 @@ void Run(Slot& slot, const Variant& variant) {
 
 int main(int argc, char** argv) {
     try {
+        const bool submittedWritePresync = argc == 2 && std::string_view(argv[1]) == "--submitted-write-presync";
+        const bool cachedBdaPresync = argc == 2 && std::string_view(argv[1]) == "--cached-bda-presync";
+        if (submittedWritePresync || cachedBdaPresync) {
+#ifdef _WIN32
+            _putenv_s("APS5_ASYNC_LANE", "51");
+#else
+            setenv("APS5_ASYNC_LANE", "51", 1);
+#endif
+        }
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        device.reset();
+        if (submittedWritePresync) return RunSubmittedWritePresync(*device);
+        if (!cachedBdaPresync) device.reset();
 #ifdef _WIN32
         auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, GuestBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 #else
@@ -357,6 +527,7 @@ int main(int argc, char** argv) {
         Require(block != nullptr, "cannot allocate guest memory");
         GuestAllocations::Mutation().Add(block, GuestBytes, true, true, true);
         auto* slots = new (block) Slot[Variants.size()];
+        if (cachedBdaPresync) return RunCachedBdaPresync(*device, slots[0]);
         for (std::size_t index = 0; index < Variants.size(); ++index) {
             if (argc > 1 && std::to_string(index) != argv[1]) continue;
             Run(slots[index], Variants[index]);

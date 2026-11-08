@@ -5579,23 +5579,24 @@ bool AnyPendingCpuWrites(const Context& context) {
     return (context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty() || Recorder::PendingCompletionLabels() != 0;
 }
 
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+bool PendingCpuWritesOverlap(const Context& context, const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
-    auto* recorder = Recorder::Active();
-    if (recorder == nullptr) return false;
     const auto drawWriters = DrawCopiedWriters();
     const bool labels = Recorder::PendingCompletionLabels() != 0;
     if ((context.copiedWriters == nullptr || context.copiedWriters->empty()) && drawWriters->empty() && !labels) return false;
-    if (!recorder->PendingWriteOverlaps(address, bytes)) return false;
+    if (!recorder.PendingWriteOverlaps(address, bytes)) return false;
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
-        Recorder::CountSync(4);
-        recorder->SyncThrough(address, bytes);
-        return true;
-    }
-    return false;
+    return (context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder.PendingLabelIn(address, bytes));
+}
+
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !PendingCpuWritesOverlap(context, *recorder, address, bytes)) return false;
+    Recorder::CountSync(4);
+    recorder->SyncThrough(address, bytes);
+    return true;
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, std::span<const GuestMemorySnapshot> snapshots) {
@@ -7704,6 +7705,10 @@ void ShaderResources::finishImageTables() {
     }
     if (bda == nullptr) return;
     bda->SetImageTables(std::move(faults), std::move(ranges));
+}
+
+void ShaderResources::PresyncBufferWrites(Recorder& recorder) const {
+    if (lockedBuild || (unlockedPrepare && !usesBda)) guestMemory.PresyncSubmittedWrites(recorder, lockedBuild);
 }
 
 std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
