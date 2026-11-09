@@ -1051,6 +1051,73 @@ void oneOffOwnedProofTests(const Context& context) {
         final.oneOffReuses == clean.oneOffReuses, "the same-epoch store did not replace the one-off snapshot");
     Memory::EndCollectEpoch();
 }
+
+void oneOffRetentionTests(const Context& context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    constexpr std::uint32_t FillSide = 1024;
+    constexpr std::uint32_t SmallSide = 64;
+    WatchedSurface filler(context, std::size_t{FillSide} * FillSide * 4u);
+    WatchedSurface calibration(context);
+    OverrideCacheBudgetForTest(16u * Budget);
+    const auto fillBytes = Sampled(context, filler.Address(), FillSide)->AllocationBytes();
+    const auto smallBytes = Sampled(context, calibration.Address(), SmallSide)->AllocationBytes();
+    ClearCachedTextures(context.device);
+    const auto capacity = static_cast<std::size_t>(std::min<std::uint64_t>(64ull << 20u, fillBytes / 32u) / smallBytes);
+    Require(capacity >= 1u && capacity <= 64u, "the refused retention fixture does not fit the cap");
+    const auto targetSpan = (capacity + 1u) * SurfaceBytes;
+    WatchedSurface targets(context, targetSpan);
+    Memory::Unwatch(targets.Address(), targetSpan);
+    const auto small = [&](std::size_t index) { return Sampled(context, targets.Address() + index * SurfaceBytes, SmallSide); };
+    OverrideCacheBudgetForTest(fillBytes);
+    Recorder::CountPresent();
+    const auto fill = Sampled(context, filler.Address(), FillSide);
+    Recorder::CountPresent();
+    Memory::BumpCollectEpoch();
+    const auto epoch = Memory::CollectEpoch();
+    Require(epoch != 0, "the refused retention fixture has no collect epoch");
+
+    const std::weak_ptr<Texture> first = small(0);
+    Require(!first.expired() && TextureCacheUsage().sampledEntries == 1u, "the refused snapshot did not survive dropping the caller");
+    Require(small(0) == first.lock(), "the unchanged refused snapshot was rebuilt");
+    const auto seeded = SampledCacheCounters();
+    Require(small(0) == first.lock(), "the owned proof did not reuse the refused snapshot");
+    const auto beforeMutation = SampledCacheCounters();
+    Require(beforeMutation.oneOffOwnedReuses == seeded.oneOffOwnedReuses + 1u, "the fixture did not exercise the retained owned proof");
+    *reinterpret_cast<std::uint8_t*>(targets.Address()) ^= 0xffu;
+    auto original = first.lock();
+    auto changed = small(0);
+    Require(Memory::CollectEpoch() == epoch && changed != original && SampledCacheCounters().made == beforeMutation.made + 1u,
+        "the same-epoch store did not replace the retained snapshot");
+    original.reset();
+    Require(first.expired(), "the invalidated refused snapshot stayed retained");
+
+    std::vector<std::weak_ptr<Texture>> retained{changed};
+    changed.reset();
+    for (std::size_t index = 1; index <= capacity; ++index) retained.push_back(small(index));
+    Require(!retained.front().expired() && retained.back().expired() &&
+        static_cast<std::size_t>(std::count_if(retained.begin(), retained.end(), [](const auto& texture) { return !texture.expired(); })) == capacity,
+        "the retained refused snapshots did not stay within the byte cap");
+
+    Recorder::CountPresent();
+    Require(Sampled(context, filler.Address(), FillSide) == fill, "the retained snapshots displaced the cached filler");
+    Require(small(0) == retained.front().lock(), "the retained snapshot missed in the adjacent present");
+    Recorder::CountPresent();
+    Recorder::CountPresent();
+    Sampled(context, filler.Address(), FillSide);
+    Require(std::all_of(retained.begin(), retained.end(), [](const auto& texture) { return texture.expired(); }),
+        "a refused snapshot survived two presents without use");
+
+    auto busy = small(0);
+    const std::weak_ptr<Texture> busyWeak = busy;
+    Require(ReleaseTextureCaches(smallBytes) == 0, "reclaim counted a refused snapshot another caller still owned");
+    busy.reset();
+    Require(busyWeak.expired(), "reclaim did not drop the refused keep");
+    const std::weak_ptr<Texture> reclaimable = small(0);
+    Require(!reclaimable.expired() && ReleaseTextureCaches(smallBytes) >= smallBytes && reclaimable.expired() &&
+        TextureCacheUsage().sampledEntries == 1u, "reclaim did not free the refused snapshot before the sampled cache");
+    Memory::EndCollectEpoch();
+    OverrideCacheBudgetForTest(0);
+}
 #endif
 
 void earlyMissTests(const Context& context) {
@@ -1889,6 +1956,12 @@ int main(int argc, char** argv) {
         TextureDetiler detiler(context);
         context.detiler = &detiler;
 #ifdef _WIN32
+        if (mode == "one-off-retention") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            oneOffRetentionTests(context);
+            std::puts("sampled refused snapshot retention tests passed");
+            return 0;
+        }
         if (mode == "one-off-owned-proof") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             oneOffOwnedProofTests(context);

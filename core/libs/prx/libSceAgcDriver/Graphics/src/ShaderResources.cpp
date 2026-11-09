@@ -227,11 +227,14 @@ struct TextureCache {
         GuestMemory::UntrackedWhy untrackedWhy = GuestMemory::UntrackedWhy::NotApplicable;
         std::unique_ptr<OneOffOwnedProof> owned = nullptr;
         bool ownedArmRefused = false;
+        std::uint64_t keptPresent = 0;
     };
     std::unordered_map<TextureKey, OneOff, TextureKeyHash> oneOffs;
     std::size_t oneOffsSwept = 0;
     std::list<TextureKey> overflowLru;
     std::uint64_t overflowKept = 0;
+    std::list<TextureKey> refusedLru;
+    std::uint64_t refusedKept = 0;
     // boundOverflow's last trim that dropped nothing, repeated only once the recorder retired a
     // batch or 50 ms passed (as makeRoom's).
     bool overflowTrimFailed = false;
@@ -277,6 +280,7 @@ struct TextureCache {
         std::uint64_t spilledBytes = 0;
         std::uint64_t oneOffReuses = 0;
         std::uint64_t oneOffOwnedReuses = 0;
+        std::uint64_t refusedKeptReuses = 0;
         std::uint64_t made = 0;
         std::uint64_t spilledReuses = 0;
         std::uint64_t overflowDropped = 0;
@@ -562,14 +566,78 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     return true;
 }
 
+bool KeepRefusedSnapshots() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_SAMPLED_KEEP_REFUSED");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t residentSampledBytes() {
+    const auto all = SampledTextureMemory();
+    return all - std::min(all, SampledTextureOverflowMemory());
+}
+
+std::uint64_t refusedKeepLimit(const TextureCacheBudgets& budgets) {
+    return std::min({64ull << 20u, budgets.sampled / 32ull, budgets.share / 32ull});
+}
+
+void unkeepRefused(TextureCache& cache, TextureCache::OneOff& entry) {
+    cache.refusedKept -= entry.kept->AllocationBytes();
+    cache.refusedLru.erase(entry.lru);
+    entry.kept.reset();
+}
+
+void expireRefusedKeeps(TextureCache& cache) {
+    if (cache.refusedLru.empty()) return;
+    const auto present = Recorder::Presents();
+    while (!cache.refusedLru.empty()) {
+        auto& entry = cache.oneOffs.at(cache.refusedLru.back());
+        if (present <= entry.keptPresent || present - entry.keptPresent <= 1u) return;
+        unkeepRefused(cache, entry);
+    }
+}
+
+struct RefusedReclaim {
+    std::uint64_t bytes = 0;
+    std::size_t textures = 0;
+};
+
+RefusedReclaim reclaimRefusedKeeps(TextureCache& cache, std::uint64_t wanted, VkDevice device = VK_NULL_HANDLE) {
+    RefusedReclaim reclaimed;
+    if (cache.refusedLru.empty() || wanted == 0) return reclaimed;
+    const auto retired = GuestMemory::GpuMutex().HeldByThisThread() ? retiredSerial() : 0;
+    for (auto it = cache.refusedLru.end(); it != cache.refusedLru.begin() && reclaimed.bytes < wanted;) {
+        const auto current = std::prev(it);
+        if (device != VK_NULL_HANDLE && current->device != device) {
+            it = current;
+            continue;
+        }
+        auto& entry = cache.oneOffs.at(*current);
+        const bool reclaimable = entry.kept.use_count() == 1 && entry.kept->LastUse() <= retired;
+        const auto bytes = entry.kept->AllocationBytes();
+        unkeepRefused(cache, entry);
+        if (reclaimable && entry.texture.expired()) {
+            reclaimed.bytes += bytes;
+            ++reclaimed.textures;
+        }
+    }
+    return reclaimed;
+}
+
 // Before a new snapshot is made: while every device-local sampled image (in the cache or not) and
 // the new one would pass the share, evicts the entries no holder or recorded batch uses, least
 // recently used first. False when that is not enough (what is left is in use): the snapshot then
 // goes to system memory rather than past the share where it can (APS5_NO_TEXTURE_SPILL=1 keeps it device-local).
 bool makeRoom(TextureCache& cache, std::uint64_t incoming, const TextureCacheBudgets& budgets) {
-    const auto all = SampledTextureMemory();
-    const auto live = all - std::min(all, SampledTextureOverflowMemory());
+    auto live = residentSampledBytes();
     if (budgets.share == 0 || live + incoming <= budgets.share) return true;
+    if (!cache.refusedLru.empty()) {
+        reclaimRefusedKeeps(cache, live + incoming - budgets.share);
+        live = residentSampledBytes();
+        if (live + incoming <= budgets.share) return true;
+    }
     const auto retired = retiredSerial();
     const auto now = std::chrono::steady_clock::now();
     if (cache.roomFailed && cache.roomFailedRetired == retired && now - cache.roomFailedAt < std::chrono::milliseconds(50)) return false;
@@ -598,13 +666,17 @@ bool SpillEnabled() {
 
 void eraseOneOff(TextureCache& cache, std::unordered_map<TextureKey, TextureCache::OneOff, TextureKeyHash>::iterator it) {
     if (it->second.kept != nullptr) {
-        cache.overflowKept -= it->second.kept->AllocationBytes();
-        cache.overflowLru.erase(it->second.lru);
+        if (it->second.kept->Spilled()) {
+            cache.overflowKept -= it->second.kept->AllocationBytes();
+            cache.overflowLru.erase(it->second.lru);
+        } else {
+            unkeepRefused(cache, it->second);
+        }
     }
     cache.oneOffs.erase(it);
 }
 
-void rememberOneOff(TextureCache& cache, const TextureKey& key, const std::shared_ptr<Texture>& texture, std::uint64_t bytes, std::vector<ContentHash::Hash128> hashes, DccKeys keys, std::uint64_t generation, OneOffProof proof, GuestMemory::UntrackedWhy untrackedWhy) {
+void rememberOneOff(TextureCache& cache, const TextureKey& key, const std::shared_ptr<Texture>& texture, std::uint64_t bytes, std::vector<ContentHash::Hash128> hashes, DccKeys keys, std::uint64_t generation, OneOffProof proof, GuestMemory::UntrackedWhy untrackedWhy, const TextureCacheBudgets& budgets) {
     if (cache.oneOffs.size() >= 2 * cache.oneOffsSwept + 1024) {
         std::erase_if(cache.oneOffs, [](const auto& entry) { return entry.second.kept == nullptr && entry.second.texture.expired(); });
         cache.oneOffsSwept = cache.oneOffs.size();
@@ -616,7 +688,17 @@ void rememberOneOff(TextureCache& cache, const TextureKey& key, const std::share
         oneOff.kept = texture;
         oneOff.lru = cache.overflowLru.insert(cache.overflowLru.begin(), key);
         cache.overflowKept += texture->AllocationBytes();
+        return;
     }
+    if (!KeepRefusedSnapshots() || keys != DccKeys::Uncompressed || texture->InHostMemory() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    const auto present = Recorder::Presents();
+    const auto limit = refusedKeepLimit(budgets);
+    const auto allocation = texture->AllocationBytes();
+    if (present == 0 || allocation == 0 || allocation > limit || cache.refusedKept > limit - allocation || residentSampledBytes() > budgets.share) return;
+    oneOff.lru = cache.refusedLru.insert(cache.refusedLru.begin(), key);
+    oneOff.kept = texture;
+    oneOff.keptPresent = present;
+    cache.refusedKept += allocation;
 }
 
 // Drops kept spilled snapshots no build or recorded work uses (no other holder, last used by a
@@ -743,6 +825,11 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) evictions by path: admission %llu (%llu used this present or the last), share %llu (%llu), reclaim %llu (%llu); eviction frame %llu at present %llu; snapshots made after an admission eviction of the same surface %llu\n", static_cast<unsigned long long>(counts.evictedBy[0]), static_cast<unsigned long long>(counts.evictedRecent[0]), static_cast<unsigned long long>(counts.evictedBy[1]), static_cast<unsigned long long>(counts.evictedRecent[1]), static_cast<unsigned long long>(counts.evictedBy[2]), static_cast<unsigned long long>(counts.evictedRecent[2]), static_cast<unsigned long long>(cache.frame), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(madeAfterEvictTotal));
     if (counts.oneOffOwnedReuses != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu one-off snapshots reused by owned write watch\n", static_cast<unsigned long long>(counts.oneOffOwnedReuses));
+    }
+    if (cache.refusedKept != 0 || counts.refusedKeptReuses != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) refused resident snapshots at present %llu: %zu kept (%llu bytes), %llu reused\n",
+            static_cast<unsigned long long>(Recorder::Presents()), cache.refusedLru.size(),
+            static_cast<unsigned long long>(cache.refusedKept), static_cast<unsigned long long>(counts.refusedKeptReuses));
     }
     if (counts.previousFrameLaterUseRefusals != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu previous-frame later-use admission refusals\n", static_cast<unsigned long long>(counts.previousFrameLaterUseRefusals));
@@ -2297,6 +2384,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const DropReleasedDependents dropAfterUnlock;
     const SampledCacheLock lock(cache);
     dropUncachedViews(cache);
+    expireRefusedKeeps(cache);
     // Diagnostic (APS5_TRACE_SAMPLED_ADDR=<hex surface address>): the lookup's decisions for one surface: the pending
     // image found, its filled keys, the keys read, whether the keys' fill overrides it, and the cache entry found.
     static const std::uint64_t traceAddress = [] { const char* text = std::getenv("APS5_TRACE_SAMPLED_ADDR"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
@@ -2503,6 +2591,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         cache.byTexture[texture.get()] = cache.entries.begin();
         if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
     };
+    if (cache.refusedKept != 0) {
+        const auto keepLimit = refusedKeepLimit(budgets);
+        while (cache.refusedKept > keepLimit) unkeepRefused(cache, cache.oneOffs.at(cache.refusedLru.back()));
+    }
     if (source == nullptr) {
         if (const auto found = cache.oneOffs.find(key); found != cache.oneOffs.end()) {
             auto& oneOff = found->second;
@@ -2545,9 +2637,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 ++cache.counts.oneOffReuses;
                 ++cache.totals.oneOffReuses;
                 if (oneOff.kept != nullptr) {
-                    ++cache.counts.spilledReuses;
-                    ++cache.totals.spilledReuses;
-                    cache.overflowLru.splice(cache.overflowLru.begin(), cache.overflowLru, oneOff.lru);
+                    if (texture->Spilled()) {
+                        ++cache.counts.spilledReuses;
+                        ++cache.totals.spilledReuses;
+                        cache.overflowLru.splice(cache.overflowLru.begin(), cache.overflowLru, oneOff.lru);
+                    } else {
+                        ++cache.counts.refusedKeptReuses;
+                        oneOff.keptPresent = Recorder::Presents();
+                        cache.refusedLru.splice(cache.refusedLru.begin(), cache.refusedLru, oneOff.lru);
+                    }
                 }
                 texture->NoteUse(useSerial());
                 CachedTexture entry{key, address, guestBytes, std::move(oneOff.hashes), texture, *keys, generation};
@@ -2736,7 +2834,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     if (probeSel && !spilled) LookupProbeAdd(LookupProbeKind::AdmitTexture, atmStart, atmWait);
     if (spilled || !admitted) {
         texture->SetSampledCacheState(Texture::CacheState::Released);
-        if (source == nullptr) rememberOneOff(cache, key, texture, guestBytes, std::move(entry.hashes), *keys, generation, oneOffProofFor(generation, committed, untracked), untrackedWhy);
+        if (source == nullptr) rememberOneOff(cache, key, texture, guestBytes, std::move(entry.hashes), *keys, generation, oneOffProofFor(generation, committed, untracked), untrackedWhy, budgets);
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budgets);
         reportTextureCounters();
@@ -3203,6 +3301,9 @@ VkDeviceSize reclaimSampledTextures(VkDevice device, VkDeviceSize wanted) {
     {
         auto& cache = Textures();
         const SampledCacheLock lock(cache);
+        const auto retained = reclaimRefusedKeeps(cache, goal, device);
+        freed += retained.bytes;
+        evicted += retained.textures;
         const auto retired = retiredSerial();
         for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < goal;) {
             const auto current = std::prev(it);
@@ -3347,6 +3448,9 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
         if ((inherited && (!newImage || sampledCacheReclaimable == 0)) || (!inherited && !lock.try_lock())) {
             sampledSkipped = true;
         } else {
+            const auto retained = reclaimRefusedKeeps(cache, bytes);
+            freed += retained.bytes;
+            sampledEntries += retained.textures;
             for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < bytes;) {
                 --it;
                 if (it->texture.use_count() != 1 || (it->source != nullptr && it->source->Dirty())) continue;
