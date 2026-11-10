@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <SDL_loadso.h>
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -18,6 +20,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <future>
 #include <initializer_list>
 #include <iostream>
 #include <new>
@@ -239,20 +244,21 @@ public:
         device.WaitIdle();
     }
 
+    VkResult Release() {
+        if (signaled.exchange(true)) return releaseResult;
+        VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        info.semaphore = semaphore;
+        info.value = 1;
+        releaseResult = signalSemaphore(device.Device(), &info);
+        return releaseResult;
+    }
+
 private:
     template <typename TFunction>
     TFunction function(const char* name) const {
         const auto function = reinterpret_cast<TFunction>(resolve(device.Device(), name));
         Require(function != nullptr, std::string("cannot resolve ") + name + " for the producer submission gate");
         return function;
-    }
-
-    void Release() {
-        if (signaled.exchange(true)) return;
-        VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-        info.semaphore = semaphore;
-        info.value = 1;
-        releaseResult = signalSemaphore(device.Device(), &info);
     }
 
     AgcDriver::VulkanDevice& device;
@@ -402,6 +408,181 @@ int RunCachedBdaPresync(AgcDriver::VulkanDevice& device, Slot& slot) {
     return 0;
 }
 
+int RunBdaUnlockedOrder(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    auto& gpu = AgcDriver::GuestMemory::GpuMutex();
+    std::unique_lock lock(gpu);
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "the BDA ordering test has no active recorder");
+    const auto context = device.graphicsContext();
+    if (!recorder->AsyncLaneActive() || context.queue == context.asyncQueue || RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize)) {
+        std::puts("skipped: BDA ordering needs two independent Vulkan lanes");
+        return VulkanTestSkipped;
+    }
+    recorder->Sync();
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    Require(fill != nullptr, "cannot resolve vkCmdFillBuffer for the BDA ordering test");
+
+    constexpr std::uint32_t written = 42;
+    constexpr std::uint32_t signaled = 43;
+    constexpr std::uint32_t peerWritten = 44;
+    enum class Order { Locked, Unlocked, ExplicitSync, ExplicitWriters, OrderedModel };
+    struct Values {
+        std::uint32_t value = 0;
+        std::uint32_t label = 0;
+        std::uint32_t valueAtLabel = 0;
+        bool callbackRan = false;
+    };
+    for (const auto order : {Order::Locked, Order::Unlocked, Order::ExplicitSync, Order::ExplicitWriters, Order::OrderedModel}) {
+        const bool mayPublishEarly = order != Order::Locked && order != Order::OrderedModel;
+        const auto values = std::make_shared<Values>();
+        const auto address = reinterpret_cast<std::uintptr_t>(&values->value);
+        const auto labelAddress = reinterpret_cast<std::uintptr_t>(&values->label);
+        const auto bytes = sizeof(values->value);
+        const auto staging = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::memset(staging->Bytes().data(), 0, bytes);
+        const auto peerStaging = order == Order::OrderedModel ? std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT) : nullptr;
+        ProducerSubmissionGate gate(device);
+        {
+            const Recorder::LaneScope writerLane(1);
+            gate.Arm(*recorder);
+            fill(recorder->Commands(), staging->Handle(), 0, bytes, written);
+            recorder->OweHostRead();
+            recorder->NotePendingWrite(address, bytes);
+            recorder->OnComplete([values, staging, bytes] { std::memcpy(&values->value, staging->Bytes().data(), bytes); });
+        }
+        {
+            const Recorder::LaneScope labelLane(0);
+            static_cast<void>(recorder->Commands());
+            recorder->OnComplete([values] {
+                values->valueAtLabel = values->value;
+                values->callbackRan = true;
+            });
+            recorder->AfterCompletions(labelAddress, std::as_bytes(std::span(&signaled, 1)), 1, Compute, false);
+            recorder->SubmitAllLanes();
+        }
+        const auto first = recorder->DescribePendingWrite(address, bytes);
+        auto last = recorder->DescribePendingWrite(labelAddress, bytes);
+        Require(first && last && !first->open && !last->open && first->serial < last->serial && !first->signaled, "the first writer was not submitted behind the gate before the later label");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!last->signaled && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+            last = recorder->DescribePendingWrite(labelAddress, bytes);
+        }
+        if (!last->signaled) {
+            Require(gate.Release() == VK_SUCCESS, "cannot release the BDA ordering gate");
+            recorder->Sync();
+            Require(values->value == written && values->label == signaled, "the independent-progress probe did not finish after releasing the gate");
+            std::puts("skipped: the later Vulkan lane did not signal while the earlier lane was gated");
+            return VulkanTestSkipped;
+        }
+        Require(values->value == 0 && values->label == 0 && !values->callbackRan, "a completion landed before reaping either fence");
+        bool peerFenceSignaled = false;
+        if (order != Order::Locked) {
+            std::exception_ptr failure;
+            std::promise<void> peerFinished;
+            const auto peerDone = peerFinished.get_future();
+            bool watchdogExpired = false;
+            VkResult releaseResult = VK_NOT_READY;
+            std::jthread release([&] {
+                watchdogExpired = peerDone.wait_for(std::chrono::seconds(10)) != std::future_status::ready;
+                releaseResult = gate.Release();
+            });
+            std::uint64_t peerSerial = 0;
+            std::jthread peer([&] {
+                try {
+                    std::lock_guard peerLock(gpu);
+                    const auto blocked = recorder->DescribePendingWrite(address, bytes);
+                    Require(blocked && !blocked->signaled, "the first writer escaped the gate before the peer reaped");
+                    if (mayPublishEarly) {
+                        if (order == Order::ExplicitSync) {
+                            recorder->SyncThrough(labelAddress, bytes, false);
+                        } else if (order == Order::ExplicitWriters) {
+                            const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{labelAddress, labelAddress + bytes}}};
+                            const auto wait = recorder->FinishWritersByLane(ranges, 0, 0);
+                            Require(wait.targets[0] == last->serial && wait.targets[1] == 0, "explicit writer wait selected the wrong batches");
+                        } else {
+                            recorder->Reap();
+                        }
+                        Require(values->value == 0 && values->label == signaled && values->callbackRan && values->valueAtLabel == 0, "per-lane retirement did not expose the later label before the gated write-back");
+                    } else {
+                        const auto orderedReap = [&] {
+                            const auto earlier = recorder->DescribePendingWrite(address, bytes);
+                            if (earlier && !earlier->signaled) return;
+                            if (earlier) recorder->FinishUpTo(earlier->serial);
+                            recorder->Reap();
+                        };
+                        orderedReap();
+                        const auto deferred = recorder->DescribePendingWrite(labelAddress, bytes);
+                        Require(deferred && deferred->signaled && Recorder::PendingCompletionLabels() != 0 && !values->callbackRan && values->label == 0, "the ordered model did not leave the signaled label pending");
+
+                        const Recorder::LaneScope peerLane(0);
+                        const auto peerAddress = reinterpret_cast<std::uintptr_t>(peerStaging->Bytes().data());
+                        fill(recorder->Commands(), peerStaging->Handle(), 0, bytes, peerWritten);
+                        recorder->OweHostRead();
+                        recorder->NotePendingWrite(peerAddress, bytes);
+                        recorder->NotePendingWrite(address, bytes);
+                        recorder->OnComplete([values, peerStaging, bytes] { std::memcpy(&values->value, peerStaging->Bytes().data(), bytes); });
+                        recorder->Submit();
+                        auto pendingPeer = recorder->DescribePendingWrite(peerAddress, bytes);
+                        Require(pendingPeer && !pendingPeer->open && pendingPeer->serial > last->serial, "the peer did not submit independent GPU work while the prefix was held");
+                        peerSerial = pendingPeer->serial;
+                        const auto peerDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                        while (!pendingPeer->signaled && std::chrono::steady_clock::now() < peerDeadline) {
+                            std::this_thread::yield();
+                            pendingPeer = recorder->DescribePendingWrite(peerAddress, bytes);
+                        }
+                        peerFenceSignaled = pendingPeer->signaled;
+                        Require(values->value == 0 && !values->callbackRan && values->label == 0, "the ordered model released CPU publication before the earlier writer");
+                        if (peerFenceSignaled) {
+                            std::uint32_t peerValue = 0;
+                            std::memcpy(&peerValue, peerStaging->Bytes().data(), bytes);
+                            Require(peerValue == peerWritten, "the peer fence signaled before the independent GPU store was visible");
+                        }
+                    }
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+                peerFinished.set_value();
+            });
+            lock.unlock();
+            std::exception_ptr waitFailure;
+            try {
+                recorder->WaitSerial(last->serial);
+            } catch (...) {
+                waitFailure = std::current_exception();
+            }
+            peer.join();
+            release.join();
+            lock.lock();
+            if (waitFailure) std::rethrow_exception(waitFailure);
+            if (failure) std::rethrow_exception(failure);
+            Require(!watchdogExpired && releaseResult == VK_SUCCESS, "the peer did not finish before the watchdog released the earlier writer");
+            recorder->FinishUpTo(last->serial);
+            if (peerSerial != 0) {
+                Require(values->value == written && values->valueAtLabel == written, "the reserved prefix did not publish the earlier writer before the label");
+                const auto newerWriter = recorder->DescribePendingWrite(address, bytes);
+                Require(newerWriter && newerWriter->serial == peerSerial, "the resource recheck missed the writer recorded while the mutex was unlocked");
+                recorder->SyncThrough(address, bytes, false);
+                Require(values->value == peerWritten && !recorder->DescribePendingWrite(address, bytes), "the recheck did not make the newer write visible");
+                std::printf("BDA recheck after relock: original prefix %u, current resource %u\n", written, values->value);
+            }
+        } else {
+            Require(gate.Release() == VK_SUCCESS, "cannot release the BDA ordering gate");
+            recorder->Sync();
+        }
+        Require(values->value == (order == Order::OrderedModel ? peerWritten : written) && values->label == signaled && values->callbackRan && values->valueAtLabel == (mayPublishEarly ? 0u : written), "retirement did not produce the expected label visibility order");
+        const char* name = "ordered retirement model";
+        if (order == Order::Locked) name = "locked Sync";
+        if (order == Order::Unlocked) name = "unlocked interleaving";
+        if (order == Order::ExplicitSync) name = "explicit SyncThrough";
+        if (order == Order::ExplicitWriters) name = "explicit FinishWritersByLane";
+        std::printf("BDA %s, serials %llu/%llu: write-back %u, label %u, write-back seen by label %u\n", name, static_cast<unsigned long long>(first->serial), static_cast<unsigned long long>(last->serial), values->value, values->label, values->valueAtLabel);
+        if (order == Order::OrderedModel) std::printf("BDA ordered retirement model: peer acquired the GPU mutex and %s independent GPU work before releasing the earlier writer\n", peerFenceSignaled ? "completed" : "submitted");
+    }
+    return 0;
+}
+
 void RunArgumentLabel(Slot& slot) {
     AgcDriverShutdown_nid_postfix();
     slot.arguments = {3, 1, 1, 0};
@@ -508,7 +689,8 @@ int main(int argc, char** argv) {
     try {
         const bool submittedWritePresync = argc == 2 && std::string_view(argv[1]) == "--submitted-write-presync";
         const bool cachedBdaPresync = argc == 2 && std::string_view(argv[1]) == "--cached-bda-presync";
-        if (submittedWritePresync || cachedBdaPresync) {
+        const bool bdaUnlockedOrder = argc == 2 && std::string_view(argv[1]) == "--bda-unlocked-order";
+        if (submittedWritePresync || cachedBdaPresync || bdaUnlockedOrder) {
 #ifdef _WIN32
             _putenv_s("APS5_ASYNC_LANE", "51");
 #else
@@ -518,6 +700,7 @@ int main(int argc, char** argv) {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (submittedWritePresync) return RunSubmittedWritePresync(*device);
+        if (bdaUnlockedOrder) return RunBdaUnlockedOrder(*device);
         if (!cachedBdaPresync) device.reset();
 #ifdef _WIN32
         auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, GuestBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
