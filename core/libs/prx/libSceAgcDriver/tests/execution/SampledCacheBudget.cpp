@@ -1107,6 +1107,29 @@ void oneOffRetentionTests(const Context& context) {
     Require(std::all_of(retained.begin(), retained.end(), [](const auto& texture) { return texture.expired(); }),
         "a refused snapshot survived two presents without use");
 
+    for (std::size_t index = 0; index < capacity; ++index) small(index);
+    auto unkept = small(capacity);
+    const std::weak_ptr<Texture> unkeptWeak = unkept;
+    Recorder::CountPresent();
+    Require(Sampled(context, filler.Address(), FillSide) == fill, "the cache filler was replaced while advancing the hold window");
+    Recorder::CountPresent();
+    Require(Sampled(context, filler.Address(), FillSide) == fill, "the cache filler was replaced while expiring the holds");
+    const auto beforeReuse = SampledCacheCounters().made;
+    Require(small(capacity) == unkept && SampledCacheCounters().made == beforeReuse && TextureCacheUsage().sampledEntries == 1u,
+        "the live weak snapshot was rebuilt or promoted during reuse");
+    unkept.reset();
+    const char* keepOnReuse = std::getenv("APS5_SAMPLED_KEEP_REFUSED_ON_REUSE");
+    const bool expectKept = keepOnReuse != nullptr && std::string_view(keepOnReuse) == "1";
+    Require(unkeptWeak.expired() != expectKept, "the snapshot did not follow the configured keep-on-reuse policy");
+    if (expectKept) {
+        const auto address = targets.Address() + capacity * SurfaceBytes;
+        *reinterpret_cast<std::uint8_t*>(address) ^= 0xffu;
+        small(capacity);
+        Require(SampledCacheCounters().made == beforeReuse + 1u && unkeptWeak.expired(),
+            "the re-held snapshot survived a same-epoch guest write");
+        Require(ReleaseTextureCaches(smallBytes) >= smallBytes, "the re-held snapshot path did not release its allocation");
+    }
+
     auto busy = small(0);
     const std::weak_ptr<Texture> busyWeak = busy;
     Require(ReleaseTextureCaches(smallBytes) == 0, "reclaim counted a refused snapshot another caller still owned");
