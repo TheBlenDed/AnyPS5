@@ -98,6 +98,13 @@ struct StageDataHit {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
 
+struct StageCandidateMiss {
+    bool compared = false, passed = false;
+    bool walk = false, unknown = false, fetch = false, registerOnly = false, other = false;
+    std::uint64_t changedMask = 0;
+    std::uint32_t changedHigh = 0;
+};
+
 struct DrawKeyComponents {
     std::uint64_t stable = 0;
     std::array<std::uint64_t, 3> userData{};
@@ -125,6 +132,9 @@ struct DrawEntryCounters {
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
+    std::uint64_t candidateMissWalk = 0, candidateMissFetch = 0, candidateMissRegister = 0, candidateMissUnknown = 0, candidateMissOther = 0, candidateMissPassed = 0, candidateMissAbsent = 0;
+    std::uint64_t rootImpactNoBaseline = 0, rootImpactNoTape = 0, rootImpactConservative = 0, rootImpactFully = 0, rootImpactPartially = 0, rootImpactZero = 0;
+    std::uint64_t rootImpactRoots = 0, rootImpactAffectedRoots = 0, rootImpactSourceRoots = 0, rootImpactAffectedSources = 0, rootImpactFlatRoots = 0, rootImpactAffectedFlats = 0, rootImpactConditionRoots = 0, rootImpactAffectedConditions = 0, rootImpactUnknownRoots = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -152,6 +162,7 @@ struct StageCapture {
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::uint64_t userDataWalkMask = 0;
 };
 
 struct RelocatableUserWord {

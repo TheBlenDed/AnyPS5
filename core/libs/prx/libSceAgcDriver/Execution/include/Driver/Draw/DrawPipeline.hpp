@@ -20,11 +20,33 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver {
+class TraceThread;
+}
+
 namespace AgcDriver::DriverDetail {
 
 class DrawPipeline {
 public:
     using Commit = std::function<void()>;
+    struct TraceIdentity {
+        std::uint64_t submission = 0;
+        std::uint32_t queue = 0;
+        std::size_t offset = 0;
+        std::size_t flipOffset = 0;
+        bool draw = false;
+    };
+    struct TraceLink {
+        bool flip = false;
+        std::chrono::steady_clock::time_point at{};
+        std::chrono::steady_clock::time_point freedAt{};
+        TraceIdentity pending{};
+        TraceIdentity freed{};
+        std::uint64_t freedItem = 0;
+        std::uint64_t batch = 0;
+        std::uint64_t unsignaled = 0;
+        TraceThread* thread = nullptr;
+    };
     // S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): an item's preparation, run by the preparer thread ahead
     // of the committer for items not yet committed (at most PrepareAhead() from the front). It
     // shares a PrepareSlot with the item's commit: the first of the two to claim the slot decides,
@@ -64,6 +86,7 @@ public:
     static unsigned Committers();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, Prepare prepare = {}, bool draw = false);
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare, bool draw, TraceIdentity identity);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
@@ -101,6 +124,8 @@ public:
     static bool MetadataPassesPipelined();
     static void CountPipelinedMetadataPass();
     static std::uint64_t PipelinedMetadataPasses();
+    static std::vector<TraceLink> CollectTraceLinks(std::uint64_t& dropped);
+    static void TraceFlip(const TraceIdentity& identity, std::uint64_t batch, std::uint64_t unsignaled);
 private:
     struct Item {
         Commit commit;
@@ -114,6 +139,18 @@ private:
         // The span of `reads` (HeldReads skips an item it misses; APS5_NO_HELD_READ_BOUNDS=1 scans every range).
         Range readBounds{~std::uint64_t{0}, 0};
         bool draw = false;
+        std::uint64_t pushSerial = 0;
+        TraceIdentity trace{};
+    };
+    struct RoomWaiter {
+        TraceIdentity pending{};
+        TraceIdentity freed{};
+        std::uint64_t freedItem = 0;
+        std::uint64_t freedBatch = 0;
+        std::chrono::steady_clock::time_point freedAt{};
+        std::chrono::steady_clock::time_point begin{};
+        TraceThread* thread = nullptr;
+        RoomWaiter* next = nullptr;
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>
@@ -155,6 +192,10 @@ private:
     void reap();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
+    void registerRoomWaiter(RoomWaiter& waiter, const TraceIdentity& identity, std::chrono::steady_clock::time_point begin);
+    void finishRoomWaiter(RoomWaiter& waiter);
+    void stampRoomWaiters(const Item& done);
+    void appendTraceLink(const TraceLink& link);
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -211,6 +252,10 @@ private:
     std::uint64_t writeScanDistinct = 0;
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Event::Count)> events{};
     std::array<std::uint64_t, static_cast<std::size_t>(Event::Count)> reportedEvents{};
+    RoomWaiter* roomWaiters = nullptr;
+    std::vector<TraceLink> traceLinks;
+    std::uint64_t traceLinksLost = 0;
+    std::uint64_t pushSerials = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

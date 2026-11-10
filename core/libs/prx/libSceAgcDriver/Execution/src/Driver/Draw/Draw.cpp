@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker/SrtTape.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <spirv/unified1/spirv.hpp>
@@ -49,6 +50,12 @@ bool TraceShaderCorrelation() {
 std::atomic<std::uint64_t>& NextDrawTraceToken() {
     static std::atomic<std::uint64_t> next{0};
     return next;
+}
+
+std::uint64_t NextFlipOffset(const Submission& submission, std::size_t packetOffset) {
+    if (!PerformanceTrace::Capturing()) return 0;
+    const auto next = submission.flips.upper_bound(packetOffset);
+    return next == submission.flips.end() ? std::uint64_t{0} : static_cast<std::uint64_t>(next->first);
 }
 
 std::string ExceptionReason(const std::exception_ptr& failure) {
@@ -610,12 +617,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>> dataCandidates(programs.size());
     std::vector<bool> reused(programs.size(), false);
     std::vector<StageDataHit> stageData(programs.size());
+    const bool classifyMisses = candidateMissReasons();
+    const bool srtRootImpact = srtRootImpactReasons();
+    std::vector<StageCandidateMiss> candidateMisses((classifyMisses || srtRootImpact) ? programs.size() : 0);
+    std::uint64_t candidateMissWalk = 0, candidateMissFetch = 0, candidateMissRegister = 0, candidateMissUnknown = 0, candidateMissOther = 0, candidateMissPassed = 0, candidateMissAbsent = 0;
+    std::uint64_t rootImpactNoBaseline = 0, rootImpactNoTape = 0, rootImpactConservative = 0, rootImpactFully = 0, rootImpactPartially = 0, rootImpactZero = 0;
+    std::uint64_t rootImpactRoots = 0, rootImpactAffectedRoots = 0, rootImpactSourceRoots = 0, rootImpactAffectedSources = 0, rootImpactFlatRoots = 0, rootImpactAffectedFlats = 0, rootImpactConditionRoots = 0, rootImpactAffectedConditions = 0, rootImpactUnknownRoots = 0;
     std::uint64_t dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     bool drawHit = false;
     bool verifyHit = false;
     const bool stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, candidateMisses);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -766,7 +779,78 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
-            else if (dataEntry != nullptr) ++dataStagesCompiled;
+            else if (dataEntry != nullptr) {
+                ++dataStagesCompiled;
+                if (classifyMisses) {
+                    const auto& miss = candidateMisses[i];
+                    if (!miss.compared) ++candidateMissAbsent;
+                    else if (miss.passed) ++candidateMissPassed;
+                    else if (miss.walk) ++candidateMissWalk;
+                    else if (miss.unknown) ++candidateMissUnknown;
+                    else if (miss.fetch) ++candidateMissFetch;
+                    else if (miss.registerOnly) ++candidateMissRegister;
+                    else ++candidateMissOther;
+                }
+                if (srtRootImpact) {
+                    const auto& miss = candidateMisses[i];
+                    if (!miss.compared) ++rootImpactNoBaseline;
+                    else {
+                        const auto& capture = stageCaptures[i].capture;
+                        const auto* tape = capture != nullptr && capture->plan != nullptr ? ShaderRecompiler::Detail::SrtTape::For(*capture->plan) : nullptr;
+                        if (tape == nullptr) ++rootImpactNoTape;
+                        else if (miss.changedHigh != 0) ++rootImpactConservative;
+                        else {
+                            const auto& masks = tape->rootMasks();
+                            std::uint64_t conditionUnion = 0;
+                            bool conditionUnknown = false;
+                            for (const auto& condition : masks.conditions) {
+                                if (!condition.present) continue;
+                                conditionUnion |= condition.mask;
+                                conditionUnknown = conditionUnknown || condition.unknown;
+                            }
+                            const bool folded = conditionUnknown || (conditionUnion & miss.changedMask) != 0;
+                            std::uint64_t total = 0, affected = 0;
+                            for (const auto& source : masks.sources) {
+                                for (const auto& root : source) {
+                                    if (!root.present) continue;
+                                    ++total;
+                                    ++rootImpactSourceRoots;
+                                    if (root.unknown) ++rootImpactUnknownRoots;
+                                    if (folded || root.unknown || (root.mask & miss.changedMask) != 0) {
+                                        ++affected;
+                                        ++rootImpactAffectedSources;
+                                    }
+                                }
+                            }
+                            for (const auto& root : masks.flats) {
+                                if (!root.present) continue;
+                                ++total;
+                                ++rootImpactFlatRoots;
+                                if (root.unknown) ++rootImpactUnknownRoots;
+                                if (folded || root.unknown || (root.mask & miss.changedMask) != 0) {
+                                    ++affected;
+                                    ++rootImpactAffectedFlats;
+                                }
+                            }
+                            for (const auto& root : masks.conditions) {
+                                if (!root.present) continue;
+                                ++total;
+                                ++rootImpactConditionRoots;
+                                if (root.unknown) ++rootImpactUnknownRoots;
+                                if (root.unknown || (root.mask & miss.changedMask) != 0) {
+                                    ++affected;
+                                    ++rootImpactAffectedConditions;
+                                }
+                            }
+                            rootImpactRoots += total;
+                            rootImpactAffectedRoots += affected;
+                            if (total != 0 && affected == total) ++rootImpactFully;
+                            else if (affected != 0) ++rootImpactPartially;
+                            else ++rootImpactZero;
+                        }
+                    }
+                }
+            }
         }
         if (i == 0 && drawParameters.indirect) {
             // gpuind: the front stage as compiled (or served by a hit) says whether it reads the
@@ -851,6 +935,32 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drawEntryCounters.dataStagesReused += dataStagesReused;
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
         drawEntryCounters.dataVerified += dataVerified;
+        if (classifyMisses) {
+            drawEntryCounters.candidateMissWalk += candidateMissWalk;
+            drawEntryCounters.candidateMissFetch += candidateMissFetch;
+            drawEntryCounters.candidateMissRegister += candidateMissRegister;
+            drawEntryCounters.candidateMissUnknown += candidateMissUnknown;
+            drawEntryCounters.candidateMissOther += candidateMissOther;
+            drawEntryCounters.candidateMissPassed += candidateMissPassed;
+            drawEntryCounters.candidateMissAbsent += candidateMissAbsent;
+        }
+        if (srtRootImpact) {
+            drawEntryCounters.rootImpactNoBaseline += rootImpactNoBaseline;
+            drawEntryCounters.rootImpactNoTape += rootImpactNoTape;
+            drawEntryCounters.rootImpactConservative += rootImpactConservative;
+            drawEntryCounters.rootImpactFully += rootImpactFully;
+            drawEntryCounters.rootImpactPartially += rootImpactPartially;
+            drawEntryCounters.rootImpactZero += rootImpactZero;
+            drawEntryCounters.rootImpactRoots += rootImpactRoots;
+            drawEntryCounters.rootImpactAffectedRoots += rootImpactAffectedRoots;
+            drawEntryCounters.rootImpactSourceRoots += rootImpactSourceRoots;
+            drawEntryCounters.rootImpactAffectedSources += rootImpactAffectedSources;
+            drawEntryCounters.rootImpactFlatRoots += rootImpactFlatRoots;
+            drawEntryCounters.rootImpactAffectedFlats += rootImpactAffectedFlats;
+            drawEntryCounters.rootImpactConditionRoots += rootImpactConditionRoots;
+            drawEntryCounters.rootImpactAffectedConditions += rootImpactAffectedConditions;
+            drawEntryCounters.rootImpactUnknownRoots += rootImpactUnknownRoots;
+        }
     }
     const bool shapeRefresh = Graphics::DrawPipelineEnabled();
     const auto refreshSeenTwice = [&] {
@@ -1007,7 +1117,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 for (const auto& item : expanded) commitDraw(localDevice, commitQueue, decode->state, item.direct, item.stages, item.snapshots, nullptr, {}, 0);
             };
             auto held = std::make_shared<decltype(commit)>(std::move(commit));
-            pipeline.Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
+            pipeline.Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), {}, false, {submission.serial, submission.queue, packetOffset, static_cast<std::size_t>(NextFlipOffset(submission, packetOffset)), true});
             pipeline.Note(DrawPipeline::Event::IndirectCommit);
             phaseTiming.Phase(DrawRowLockWait);
         };
@@ -1171,7 +1281,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, nullptr);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
-                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+                DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, {}, {}, false, {submission.serial, submission.queue, packetOffset, static_cast<std::size_t>(NextFlipOffset(submission, packetOffset)), true});
                 phaseTiming.Phase(DrawRowLockWait);
                 timing.Mark("draw_enqueued");
                 return drawn();
@@ -1270,7 +1380,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             };
         }
         timing.Mark("write_ranges_and_commit");
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), std::move(prepare), true);
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), std::move(prepare), true, {submission.serial, submission.queue, packetOffset, static_cast<std::size_t>(NextFlipOffset(submission, packetOffset)), true});
         if (pipelineIndirect) DrawPipeline::Queue0().Note(DrawPipeline::Event::IndirectCommit);
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");

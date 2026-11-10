@@ -5298,18 +5298,119 @@ void Recorder::FinishThroughOpened(std::uint64_t serial) {
     FinishUpTo(bound);
 }
 
+struct Recorder::BdaWaitTrace {
+    static constexpr unsigned ReportLimit = 128;
+    static inline std::atomic<unsigned> reports{0};
+
+    std::uint64_t begin;
+    std::uint64_t end;
+    std::uint64_t before = 0;
+    std::uint64_t submitted = 0;
+    std::uint64_t writeNotes = 0;
+    std::array<std::uint64_t, 2> writers{};
+    std::array<std::uint64_t, 2> writerTraceIds{};
+    std::array<std::uint64_t, 2> closure{};
+    unsigned openWriters = 0;
+    bool forced = false;
+    const char* unknown = nullptr;
+
+    static bool Enabled() {
+        struct Filter {
+            bool enabled = false;
+            std::optional<std::uint32_t> queue;
+        };
+        static const auto filter = [] {
+            const char* value = std::getenv("APS5_PROFILE_BDA_SYNC");
+            if (value == nullptr || std::strcmp(value, "1") != 0) return Filter{};
+            const char* queue = std::getenv("APS5_PROFILE_BDA_SYNC_QUEUE");
+            if (queue == nullptr) return Filter{true, std::nullopt};
+            char* end = nullptr;
+            const auto parsed = std::strtoull(queue, &end, 16);
+            if (end == queue || *end != '\0' || parsed > std::numeric_limits<std::uint32_t>::max()) {
+                std::fprintf(stderr, "[bda-sync] invalid APS5_PROFILE_BDA_SYNC_QUEUE, expected a hexadecimal queue ID\n");
+                return Filter{};
+            }
+            return Filter{true, static_cast<std::uint32_t>(parsed)};
+        }();
+        return filter.enabled && (!filter.queue || *filter.queue == GuestMemory::GpuLockThreadTag()) && reports.load(std::memory_order_relaxed) < ReportLimit;
+    }
+
+    void beforeSubmit(const Recorder& recorder) {
+        before = recorder.submissions;
+        for (std::size_t lane = 0; lane < recorder.lanes.size(); ++lane) {
+            const auto& batch = recorder.lanes[lane];
+            if (batch != nullptr && overlaps(*batch, begin, end)) openWriters |= 1u << lane;
+        }
+    }
+
+    void afterSubmit(const Recorder& recorder) {
+        submitted = recorder.submissions;
+        writeNotes = recorder.writeNoteCount;
+        if (recorder.inFlight.size() > 256) {
+            unknown = "batch_limit";
+            return;
+        }
+        for (auto it = recorder.inFlight.rbegin(); it != recorder.inFlight.rend(); ++it) {
+            const auto& batch = **it;
+            const auto lane = static_cast<std::size_t>(batch.lane);
+            if (lane >= writers.size() || batch.serial == 0 || batch.waitOther >= batch.serial) {
+                unknown = "invalid_batch";
+                return;
+            }
+            if (writers[lane] != 0 || !overlaps(batch, begin, end)) continue;
+            writers[lane] = batch.serial;
+            writerTraceIds[lane] = batch.traceId;
+        }
+        closure = writers;
+        for (auto it = recorder.inFlight.rbegin(); it != recorder.inFlight.rend(); ++it) {
+            const auto& batch = **it;
+            const auto lane = static_cast<std::size_t>(batch.lane);
+            if (batch.serial <= closure[lane]) closure[1 - lane] = std::max(closure[1 - lane], batch.waitOther);
+        }
+        if (forced) unknown = "forced_full_sync";
+        else if (recorder.lanes[0] != nullptr || recorder.lanes[1] != nullptr) unknown = "open_after_submit";
+        else if (recorder.asyncTimeline != VK_NULL_HANDLE && recorder.context.asyncQueue == recorder.context.queue) unknown = "shared_queue";
+        else if (RuntimeSwitches::Set(RuntimeSwitch::LaneSerialize)) unknown = "serialized_lanes";
+        else if ((writers[0] == 0 && writers[1] == 0) || ((openWriters & 1u) != 0 && writers[0] <= before) || ((openWriters & 2u) != 0 && writers[1] <= before)) unknown = "unresolved_writer";
+    }
+
+    void report(const Recorder& recorder, const Batch& batch, double waitMs, bool signaledAtStart) const {
+        if (waitMs < 10.0 || reports.load(std::memory_order_relaxed) >= ReportLimit || reports.fetch_add(1, std::memory_order_relaxed) >= ReportLimit) return;
+        const auto lane = static_cast<std::size_t>(batch.lane);
+        const char* reason = unknown;
+        if (reason == nullptr && (recorder.submissions != submitted || recorder.writeNoteCount != writeNotes || lane >= closure.size())) reason = "state_changed";
+        const char* classification = "unknown";
+        if (reason == nullptr) {
+            const bool required = batch.serial <= closure[lane];
+            classification = required ? "required" : "extra";
+            reason = required ? "within_writer_closure" : "outside_writer_closure";
+        }
+        std::fprintf(stderr, "[bda-sync] recorder=%llu queue=0x%x range=0x%llx..0x%llx open_writers=0x%x through=%llu writer0=%llu/%llu writer1=%llu/%llu closure0=%llu closure1=%llu fence_serial=%llu fence_trace=%llu fence_lane=%d fence_wait_other=%llu fence_signaled_at_start=%d fence_ms=%.3f class=%s reason=%s\n",
+            static_cast<unsigned long long>(recorder.id), GuestMemory::GpuLockThreadTag(), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), openWriters, static_cast<unsigned long long>(submitted),
+            static_cast<unsigned long long>(writers[0]), static_cast<unsigned long long>(writerTraceIds[0]), static_cast<unsigned long long>(writers[1]), static_cast<unsigned long long>(writerTraceIds[1]),
+            static_cast<unsigned long long>(closure[0]), static_cast<unsigned long long>(closure[1]), static_cast<unsigned long long>(batch.serial), static_cast<unsigned long long>(batch.traceId), batch.lane,
+            static_cast<unsigned long long>(batch.waitOther), static_cast<int>(signaledAtStart), waitMs, classification, reason);
+    }
+};
+
 void Recorder::Sync() {
+    syncFull(__builtin_return_address(0), nullptr);
+}
+
+void Recorder::syncFull(const void* caller, BdaWaitTrace* bdaWait) {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
+    if (bdaWait != nullptr) bdaWait->beforeSubmit(*this);
     SubmitAllLanes();
+    if (bdaWait != nullptr) bdaWait->afterSubmit(*this);
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
-    const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
+    const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : caller);
     while (!inFlight.empty()) {
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
-        finish(std::move(batch), true, source);
+        finish(std::move(batch), true, source, false, bdaWait);
     }
     activeSyncSite = previousSite;
 }
@@ -5319,7 +5420,7 @@ void Recorder::FlushDeferredReleases() {
     ReleaseDeferredKeeps();
 }
 
-void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
+void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked, bool bdaBaseWrite) {
     if (bytes == 0) return;
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {
@@ -5354,12 +5455,19 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         // A completion-store wait (kill switch above) is already counted as 'waited'.
         if (completionDepth == 0) ++holdCounters.hookLockedWaits;
     }
-    if (!SyncThroughEnabled() || anyOpen([&](const Batch& batch) { return overlaps(batch, address, end); })) {
+    const bool forceFull = !SyncThroughEnabled();
+    if (forceFull || anyOpen([&](const Batch& batch) { return overlaps(batch, address, end); })) {
         // The announced site (or this call's caller) names the sync, not this function.
         if (announcedSite == nullptr) announcedSite = __builtin_return_address(0);
         // The open batch's work has not run; without one the newest in flight is the target.
         if (open != nullptr || (!inFlight.empty() && unsignaled(inFlight.back()->serial))) ++hookRealWaits;
-        Sync();
+        if (bdaBaseWrite && BdaWaitTrace::Enabled()) {
+            BdaWaitTrace trace{address, end};
+            trace.forced = forceFull;
+            syncFull(nullptr, &trace);
+        } else {
+            Sync();
+        }
         return;
     }
     const auto source = std::exchange(announcedSource, 4);
@@ -5664,7 +5772,7 @@ bool Recorder::Reap() {
     return inFlight.empty();
 }
 
-void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow, const BdaWaitTrace* bdaWait) {
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
@@ -5696,7 +5804,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         const auto waitStart = std::chrono::steady_clock::now();
         // A fence still unsignaled here makes this a real GPU wait under the mutex (finish runs
         // under it): the [lock] line's 'locked GPU waits'.
-        const bool signaledAtStart = !profile || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
+        const bool signaledAtStart = (!profile && bdaWait == nullptr) || context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, batch->fence) == VK_SUCCESS;
         struct Report {
             bool enabled;
             int source;
@@ -5726,12 +5834,16 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         } report{profile, source, waitStart, *this, signaledAtStart};
         submitOtherLaneBeforeWait(*batch);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
+        const auto fenceStart = bdaWait != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
             if (waited == 10) std::fprintf(stderr, "[gpu] recorded batch %llu still running: %s; %s\n", static_cast<unsigned long long>(batch->serial), runningRanges(*batch).c_str(), laneState(*batch).c_str());
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        }
+        if (bdaWait != nullptr && result == VK_SUCCESS) {
+            bdaWait->report(*this, *batch, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fenceStart).count(), signaledAtStart);
         }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);

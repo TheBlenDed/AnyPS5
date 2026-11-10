@@ -136,6 +136,7 @@ std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, co
     variant->forgetSerial = capture.forgetSerial;
     variant->pushOffset = capture.pushOffset;
     variant->userDataMask = capture.userDataMask;
+    variant->userDataWalkMask = capture.userDataWalkMask;
     if (vertexInfo) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfo);
     std::vector<ShaderRecompiler::MemoryRegion> regions(capture.regions.begin(), capture.regions.end());
     for (const auto& read : decodeReads) regions.push_back({read.address, read.Bytes()});
@@ -249,6 +250,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     timing.Mark("materialize");
     stageCapture.userDataMask = StageUserDataMask(*capture, *stageCapture.compiled, vertexInfos[i]);
+    stageCapture.userDataWalkMask = capture->userDataUse.asValue | capture->userDataUse.asBase;
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
 } catch (const std::exception& error) {
@@ -352,6 +354,7 @@ bool Driver::compileDrawAhead(std::uint64_t key, std::uint64_t shape, const std:
         CommandMix::NoteMaterialized(*stageCapture.compiled, *capture);
         stageCapture.capture = capture;
         stageCapture.userDataMask = StageUserDataMask(*capture, *stageCapture.compiled, vertexInfos[i]);
+        stageCapture.userDataWalkMask = capture->userDataUse.asValue | capture->userDataUse.asBase;
         const auto& result = *stageCapture.compiled;
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");

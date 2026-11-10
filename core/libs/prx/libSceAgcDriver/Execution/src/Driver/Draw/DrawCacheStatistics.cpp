@@ -37,6 +37,8 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         if (!profile) text += drawKeyChangeLine(counters);
     }
     if (profile) text += profileDrawCacheLines(counters);
+    if (candidateMissReasons()) text += candidateMissLine(counters);
+    if (srtRootImpactReasons()) text += srtRootImpactLine(counters);
     if (profile) {
         const auto now = DrawAheadStatistics();
         char line[256];
@@ -68,6 +70,22 @@ std::string Driver::drawKeyChangeLine(const DrawEntryCounters& counters) {
     }
     char line[1024];
     std::snprintf(line, sizeof(line), "[draw-cache] register-key misses vs the last key of the same shader set (10 s): stable registers %llu, pixel user data %llu, vertex/geometry user data %llu, hull user data %llu, auxiliary registers %llu, device %llu, new shader set %llu, unchanged components %llu; first differing stable range:%s; shape found (data entry) %llu, data stages reused %llu, compiled %llu\n", change(DrawKeyChange::Stable), change(DrawKeyChange::PixelUserData), change(DrawKeyChange::VertexUserData), change(DrawKeyChange::HullUserData), change(DrawKeyChange::Auxiliary), change(DrawKeyChange::Device), change(DrawKeyChange::NewShaderSet), change(DrawKeyChange::Unchanged), ranges.empty() ? " none" : ranges.c_str(), count(counters.dataHits), count(counters.dataStagesReused), count(counters.dataStagesCompiled));
+    return line;
+}
+
+std::string Driver::candidateMissLine(const DrawEntryCounters& counters) {
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    const auto classified = counters.candidateMissWalk + counters.candidateMissFetch + counters.candidateMissRegister + counters.candidateMissUnknown + counters.candidateMissOther;
+    char line[1024];
+    std::snprintf(line, sizeof(line), "[draw-cache] candidate misses (10 s): %llu re-materialized stages whose same-shape candidates all failed the user-word comparison: resource-walk input changed %llu, fetch register changed %llu, register-only change %llu, unknown (conservative mask or word >= 64) %llu, other %llu; excluded: %llu stages had a candidate pass the comparison, %llu stages had no candidate to compare\n", count(classified), count(counters.candidateMissWalk), count(counters.candidateMissFetch), count(counters.candidateMissRegister), count(counters.candidateMissUnknown), count(counters.candidateMissOther), count(counters.candidateMissPassed), count(counters.candidateMissAbsent));
+    return line;
+}
+
+std::string Driver::srtRootImpactLine(const DrawEntryCounters& counters) {
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    const auto examined = counters.rootImpactNoBaseline + counters.rootImpactNoTape + counters.rootImpactConservative + counters.rootImpactFully + counters.rootImpactPartially + counters.rootImpactZero;
+    char line[2048];
+    std::snprintf(line, sizeof(line), "[draw-cache] srt root impact (10 s): %llu re-materialized stages examined (every stage the candidate-miss line counts, each once): paired with the stage's actual plan and tape %llu (fully affected %llu, partially affected %llu, zero affected roots %llu), conservative (a changed word >= 64, counted fully affected) %llu, no plan or tape (interpreter fallback or incomplete plan, not unaffected) %llu, no candidate baseline %llu; roots affected %llu of %llu (source dwords %llu of %llu, flat slots %llu of %llu, conditions %llu of %llu; %llu unknown-mask roots counted affected); a statically unaffected root is only an upper bound for reuse: guest-memory freshness, active roots and shared work are not measured, this is not a hit rate and no work saved can be inferred\n", count(examined), count(counters.rootImpactFully + counters.rootImpactPartially + counters.rootImpactZero), count(counters.rootImpactFully), count(counters.rootImpactPartially), count(counters.rootImpactZero), count(counters.rootImpactConservative), count(counters.rootImpactNoTape), count(counters.rootImpactNoBaseline), count(counters.rootImpactAffectedRoots), count(counters.rootImpactRoots), count(counters.rootImpactAffectedSources), count(counters.rootImpactSourceRoots), count(counters.rootImpactAffectedFlats), count(counters.rootImpactFlatRoots), count(counters.rootImpactAffectedConditions), count(counters.rootImpactConditionRoots), count(counters.rootImpactUnknownRoots));
     return line;
 }
 

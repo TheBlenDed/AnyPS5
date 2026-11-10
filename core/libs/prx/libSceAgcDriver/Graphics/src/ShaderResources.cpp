@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -127,6 +128,14 @@ struct OwnedProof {
 };
 
 enum class OneOffProof : std::uint8_t { Stamped, CommittedPartial, UntrackedHinted, UntrackedUnhinted };
+
+enum class SnapshotMakeReason : std::size_t { MissingKey, Expired, MetadataMismatch, CompareFailed, Count };
+
+struct SnapshotMakeStats {
+    std::uint64_t count = 0;
+    std::chrono::steady_clock::duration constructor{};
+    std::chrono::steady_clock::duration body{};
+};
 
 struct OneOffOwnedProof {
     std::vector<std::uint64_t> words;
@@ -291,6 +300,7 @@ struct TextureCache {
         std::array<std::uint64_t, 3> evictedBy{};
         std::array<std::uint64_t, 3> evictedRecent{};
     } counts, totals;
+    std::array<SnapshotMakeStats, static_cast<std::size_t>(SnapshotMakeReason::Count)> snapshotMakeReasons{};
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     std::uint64_t erasures = 0;
 };
@@ -790,6 +800,14 @@ std::string TopSurfaceText(const TextureCache::SurfaceChurn* surface) {
     return text;
 }
 
+bool SnapshotMakeReasonsEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_PROFILE_SNAPSHOT_MAKE_REASONS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -833,6 +851,20 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     }
     if (counts.previousFrameLaterUseRefusals != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu previous-frame later-use admission refusals\n", static_cast<unsigned long long>(counts.previousFrameLaterUseRefusals));
+    }
+    if (SnapshotMakeReasonsEnabled() && counts.made != 0) {
+        static constexpr std::array names{"missing key", "expired weak reference", "size/DCC mismatch", "comparison failed"};
+        const auto reasons = std::exchange(cache.snapshotMakeReasons, {});
+        std::string summary;
+        for (std::size_t i = 0; i < reasons.size(); ++i) {
+            const auto& stats = reasons[i];
+            char text[160];
+            std::snprintf(text, sizeof(text), " [%s %llu / %.1f / %.1f]", names[i], static_cast<unsigned long long>(stats.count),
+                std::chrono::duration<double, std::milli>(stats.constructor).count(), std::chrono::duration<double, std::milli>(stats.body).count());
+            summary += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) snapshot makes after one-off lookup at present %llu (count / constructor ms / body ms, includes constructor):%s\n",
+            static_cast<unsigned long long>(Recorder::Presents()), summary.c_str());
     }
     cache.madeSurfaces.clear();
     droppedBefore = dropped;
@@ -2595,6 +2627,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         const auto keepLimit = refusedKeepLimit(budgets);
         while (cache.refusedKept > keepLimit) unkeepRefused(cache, cache.oneOffs.at(cache.refusedLru.back()));
     }
+    auto makeReason = SnapshotMakeReason::MissingKey;
     if (source == nullptr) {
         if (const auto found = cache.oneOffs.find(key); found != cache.oneOffs.end()) {
             auto& oneOff = found->second;
@@ -2633,7 +2666,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 }
                 return unchanged;
             };
-            if (texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys && current()) {
+            const bool compatible = texture != nullptr && oneOff.bytes == guestBytes && oneOff.keys == *keys;
+            if (compatible && current()) {
                 ++cache.counts.oneOffReuses;
                 ++cache.totals.oneOffReuses;
                 if (oneOff.kept != nullptr) {
@@ -2677,6 +2711,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return texture;
             }
+            if (compatible) makeReason = SnapshotMakeReason::CompareFailed;
+            else if (texture == nullptr) makeReason = SnapshotMakeReason::Expired;
+            else makeReason = SnapshotMakeReason::MetadataMismatch;
             eraseOneOff(cache, found);
         }
     }
@@ -2750,6 +2787,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 std::rotate(clearSnapshots.begin(), found, found + 1);
             }
         }
+        std::optional<std::chrono::steady_clock::duration> constructorTime;
         if (reusedClear != nullptr) {
             entry.texture = std::move(reusedClear);
             entry.accounted = entry.texture->AllocationBytes();
@@ -2757,17 +2795,37 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             clearReuses.fetch_add(1, std::memory_order_relaxed);
         } else {
         static const bool uninitializedSnapshot = std::getenv("APS5_UNINITIALIZED_SNAPSHOT") != nullptr;
+        static const bool directSnapshotStaging = [] {
+            const auto* value = std::getenv("APS5_DIRECT_SNAPSHOT_STAGING");
+            return value != nullptr && std::string_view(value) == "1";
+        }();
+        Texture::PreparedSnapshotStaging preparedStaging;
         std::vector<std::byte> zeroed;
         std::unique_ptr<std::byte[]> uninit;
         std::span<std::byte> snapshot;
         const auto bailStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto bailWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
-        if (uninitializedSnapshot) {
-            uninit.reset(new std::byte[bytes]);
-            snapshot = std::span<std::byte>(uninit.get(), bytes);
-        } else {
-            zeroed.resize(bytes);
-            snapshot = std::span<std::byte>(zeroed.data(), zeroed.size());
+        if (directSnapshotStaging && *keys == DccKeys::Uncompressed) {
+            const auto allocationStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            try {
+                const MemoryStats::OwnerScope owner(MemoryStats::Owner::TextureUpload);
+                preparedStaging.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            } catch (const std::runtime_error&) {
+            } catch (const std::bad_alloc&) {
+            }
+            if (preparedStaging.buffer != nullptr) {
+                if (profile) preparedStaging.allocationNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - allocationStart).count();
+                snapshot = preparedStaging.buffer->Bytes();
+            }
+        }
+        if (preparedStaging.buffer == nullptr) {
+            if (uninitializedSnapshot) {
+                uninit.reset(new std::byte[bytes]);
+                snapshot = std::span<std::byte>(uninit.get(), bytes);
+            } else {
+                zeroed.resize(bytes);
+                snapshot = std::span<std::byte>(zeroed.data(), zeroed.size());
+            }
         }
         if (probeSel) LookupProbeAdd(LookupProbeKind::BufferAllocZeroInit, bailStart, bailWait);
         const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2780,6 +2838,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
         }
+        const auto hashSnapshot = [&] {
+            const auto hashStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
+            GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotHash, hashStart);
+        };
+        if (preparedStaging.buffer != nullptr) hashSnapshot();
         const bool spill = [&] {
             if (!SpillEnabled()) return false;
             const auto mrStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2789,8 +2854,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             return !ok;
         }();
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        entry.texture = createTexture(*context.detiler, resource, components, snapshot, depthCompare, spill);
-        if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotBuild, buildStart);
+        entry.texture = createTexture(*context.detiler, resource, components, snapshot, depthCompare, spill, preparedStaging);
+        if (profile) {
+            const auto buildEnd = LookupOutcomes::Add(LookupOutcomes::SnapshotBuild, buildStart);
+            if (SnapshotMakeReasonsEnabled()) constructorTime = buildEnd - buildStart;
+        }
         ++cache.counts.made;
         ++cache.totals.made;
         auto& surface = cache.madeSurfaces[address * 0x9e3779b97f4a7c15ull ^ guestBytes];
@@ -2810,12 +2878,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             cache.counts.spilledBytes += entry.texture->AllocationBytes();
             cache.totals.spilledBytes += entry.texture->AllocationBytes();
         }
-        if (*keys == DccKeys::Uncompressed) {
-            const auto hashStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
-            GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
-            if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotHash, hashStart);
-        }
+        if (*keys == DccKeys::Uncompressed && preparedStaging.buffer == nullptr) hashSnapshot();
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
         if (clearReuse && !entry.texture->Spilled()) {
@@ -2823,7 +2886,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             if (clearSnapshots.size() > 8) clearSnapshots.pop_back();
         }
         }
-        if (profile) snapStart = LookupOutcomes::Add(LookupOutcomes::SampledSnapshotBody, snapStart);
+        if (profile) {
+            const auto bodyEnd = LookupOutcomes::Add(LookupOutcomes::SampledSnapshotBody, snapStart);
+            if (constructorTime.has_value()) {
+                auto& stats = cache.snapshotMakeReasons[static_cast<std::size_t>(makeReason)];
+                ++stats.count;
+                stats.constructor += *constructorTime;
+                stats.body += bodyEnd - snapStart;
+            }
+            snapStart = bodyEnd;
+        }
     }
     auto texture = entry.texture;
     texture->NoteUse(useSerial());
@@ -5773,11 +5845,11 @@ bool PendingCpuWritesOverlap(const Context& context, const Recorder& recorder, s
     return (context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder.PendingLabelIn(address, bytes));
 }
 
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes, bool bdaBaseWrite) {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !PendingCpuWritesOverlap(context, *recorder, address, bytes)) return false;
     Recorder::CountSync(4);
-    recorder->SyncThrough(address, bytes);
+    recorder->SyncThrough(address, bytes, false, bdaBaseWrite);
     return true;
 }
 

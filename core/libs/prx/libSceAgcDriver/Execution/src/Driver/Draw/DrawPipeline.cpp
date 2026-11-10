@@ -395,6 +395,10 @@ void DrawPipeline::rethrowFailure() {
 }
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare, bool draw) {
+    Enqueue(std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), std::move(prepare), draw, TraceIdentity{});
+}
+
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare, bool draw, TraceIdentity identity) {
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -411,6 +415,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
+        RoomWaiter waiter;
+        const bool tracing = PerformanceTrace::Capturing();
+        if (tracing) registerRoomWaiter(waiter, identity, start);
         if (CommitterOverlap::Enabled()) CommitterOverlap::Get().ProducerEnter();
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         if (CommitterOverlap::Enabled()) CommitterOverlap::Get().ProducerExit();
@@ -419,6 +426,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         fullWaitNs += elapsedNs(start);
         ++roomWaits;
         roomWakeNs += static_cast<std::uint64_t>(std::max<std::int64_t>(0, nowNs() - lastPopNs));
+        if (tracing) finishRoomWaiter(waiter);
         traceWait("DrawPipeline", "room_wait", start);
         rethrowFailure();
     }
@@ -428,6 +436,10 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     const bool prepared = static_cast<bool>(prepare);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
     items.back().draw = draw;
+    if (PerformanceTrace::Capturing()) {
+        items.back().pushSerial = ++pushSerials;
+        items.back().trace = identity;
+    }
     addWrites(items.back().writes);
     for (const auto& [begin, limit] : items.back().reads) {
         items.back().readBounds.first = std::min(items.back().readBounds.first, begin);
@@ -454,6 +466,79 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (!profile && !stats && !CommitterOverlap::Enabled()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
+}
+
+void DrawPipeline::registerRoomWaiter(RoomWaiter& waiter, const TraceIdentity& identity, std::chrono::steady_clock::time_point begin) {
+    waiter.pending = identity;
+    waiter.begin = begin;
+    waiter.thread = PerformanceTrace::Thread();
+    waiter.next = roomWaiters;
+    roomWaiters = &waiter;
+}
+
+void DrawPipeline::finishRoomWaiter(RoomWaiter& waiter) {
+    RoomWaiter** link = &roomWaiters;
+    while (*link != nullptr) {
+        if (*link == &waiter) {
+            *link = waiter.next;
+            break;
+        }
+        link = &(*link)->next;
+    }
+    if (waiter.freedItem == 0 || !PerformanceTrace::Capturing()) return;
+    TraceLink record;
+    record.at = waiter.begin;
+    record.freedAt = waiter.freedAt;
+    record.pending = waiter.pending;
+    record.freed = waiter.freed;
+    record.freedItem = waiter.freedItem;
+    record.batch = waiter.freedBatch;
+    record.thread = waiter.thread;
+    appendTraceLink(record);
+}
+
+void DrawPipeline::stampRoomWaiters(const Item& done) {
+    const auto freedAt = std::chrono::steady_clock::now();
+    for (RoomWaiter* waiter = roomWaiters; waiter != nullptr; waiter = waiter->next) {
+        waiter->freedItem = done.pushSerial;
+        waiter->freedAt = freedAt;
+        waiter->freed = done.trace;
+        waiter->freedBatch = AgcDriver::TraceBatchTag;
+    }
+}
+
+void DrawPipeline::appendTraceLink(const TraceLink& link) {
+    constexpr std::size_t TraceLinkCapacity = 4096;
+    if (traceLinks.empty()) traceLinks.reserve(TraceLinkCapacity);
+    if (traceLinks.size() == traceLinks.capacity()) {
+        ++traceLinksLost;
+        return;
+    }
+    traceLinks.push_back(link);
+}
+
+std::vector<DrawPipeline::TraceLink> DrawPipeline::CollectTraceLinks(std::uint64_t& dropped) {
+    auto& pipeline = Queue0();
+    std::vector<TraceLink> links;
+    std::lock_guard lock(pipeline.mutex);
+    links.swap(pipeline.traceLinks);
+    dropped = pipeline.traceLinksLost;
+    pipeline.traceLinksLost = 0;
+    return links;
+}
+
+void DrawPipeline::TraceFlip(const TraceIdentity& identity, std::uint64_t batch, std::uint64_t unsignaled) {
+    if (!PerformanceTrace::Capturing()) return;
+    TraceLink link;
+    link.flip = true;
+    link.at = std::chrono::steady_clock::now();
+    link.pending = identity;
+    link.batch = batch;
+    link.unsignaled = unsignaled;
+    link.thread = PerformanceTrace::Thread();
+    auto& pipeline = Queue0();
+    std::lock_guard lock(pipeline.mutex);
+    pipeline.appendTraceLink(link);
 }
 
 // APS5_PROFILE_DRAW: the pending-write scans (Overlaps, OverlapsAny, DrainIfOverlaps) walk every write range of
@@ -602,7 +687,11 @@ void DrawPipeline::run() {
             lastPopNs = lastFinishNs = nowNs();
             sojournNs += static_cast<std::uint64_t>(std::max<std::int64_t>(0, lastFinishNs - done.pushedNs));
             outstanding.fetch_sub(1, std::memory_order_release);
-            if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+            const bool freedRoom = idleWaiters != 0 && (items.empty() || items.size() <= resumeAt);
+            if (freedRoom) {
+                idle.notify_all();
+                if (items.size() == resumeAt && roomWaiters != nullptr && PerformanceTrace::Capturing()) stampRoomWaiters(done);
+            }
             if (preparerWaiting) prepareWake.notify_one();
         }
         retire(std::move(done));

@@ -6,7 +6,44 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData) {
+void ClassifyCandidateMiss(const DispatchVariant& variant, const std::vector<std::uint32_t>& now, const std::vector<std::uint32_t>& was, StageCandidateMiss& miss) {
+    const auto used = variant.userDataMask;
+    const bool conservative = used == ~std::uint64_t{0};
+    std::uint64_t fetch = 0;
+    if (variant.vertexInfo != nullptr) {
+        for (const auto reg : {static_cast<std::uint32_t>(variant.vertexInfo->fetchAttribReg), static_cast<std::uint32_t>(variant.vertexInfo->fetchBufferReg)}) {
+            fetch |= reg + 1u < 64u ? std::uint64_t{3} << reg : ~std::uint64_t{0};
+        }
+    }
+    const auto reads = variant.compiled != nullptr ? variant.compiled->userDataRegisterReads : 0;
+    for (std::size_t w = 0; w < now.size(); ++w) {
+        if (now[w] == was[w]) continue;
+        if (w >= 64u) {
+            miss.unknown = true;
+            continue;
+        }
+        if (((used >> w) & 1u) == 0u) continue;
+        if (conservative) {
+            miss.unknown = true;
+            continue;
+        }
+        if (((variant.userDataWalkMask >> w) & 1u) != 0u) {
+            miss.walk = true;
+            continue;
+        }
+        if (((fetch >> w) & 1u) != 0u) {
+            miss.fetch = true;
+            continue;
+        }
+        if (((reads >> w) & 1u) != 0u) {
+            miss.registerOnly = true;
+            continue;
+        }
+        miss.other = true;
+    }
+}
+
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, std::vector<StageCandidateMiss>& candidateMisses) {
     using Role = ShaderRecompiler::ProgramRole;
     if (useDrawEntries) {
         if (!registerKey) {
@@ -244,17 +281,35 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
             std::optional<SampledReadScope> sampling;
+            const bool classify = candidateMissReasons();
+            const bool rootImpact = srtRootImpactReasons();
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack || programs[i].userData.size() != dataEntry->decode->programs[i].userData.size()) continue;
                 const auto& now = programs[i].userData;
                 const auto& was = dataEntry->decode->programs[i].userData;
                 auto& candidates = dataCandidates[i];
+                StageCandidateMiss* miss = nullptr;
+                if ((classify || rootImpact) && !dataEntry->stages[i].empty()) {
+                    miss = &candidateMisses[i];
+                    miss->compared = true;
+                    if (rootImpact) {
+                        for (std::size_t w = 0; w < now.size(); ++w) {
+                            if (now[w] == was[w]) continue;
+                            if (w >= 64u) miss->changedHigh += 1u;
+                            else miss->changedMask |= std::uint64_t{1} << w;
+                        }
+                    }
+                }
                 for (const auto& variant : dataEntry->stages[i]) {
                     bool usedEqual = true;
                     for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
                         if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
                     }
-                    if (!usedEqual) continue;
+                    if (!usedEqual) {
+                        if (classify && miss != nullptr) ClassifyCandidateMiss(*variant, now, was, *miss);
+                        continue;
+                    }
+                    if (miss != nullptr) miss->passed = true;
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
                     appendEntryRegions(*variant, regions);

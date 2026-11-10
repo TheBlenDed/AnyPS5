@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -55,6 +57,7 @@ struct Session {
     double gpuBusyAtOpen = 0;
     std::optional<TraceClockSample> gpuClock;
     std::vector<Clock::time_point> presents;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> presentFlips;
     bool bench = false;
     TraceBenchIntervals benchIntervals;
     std::uint64_t benchDropped = 0;
@@ -282,7 +285,7 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
     benchWriter()->Write(TraceBenchSnapshot{std::move(summary), state.benchIntervals, state.benchDropped});
 }
 
-void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device) {
+void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device, FrameTiming* timing) {
     const auto now = Clock::now();
     BindThread("presenter");
     auto& state = session();
@@ -296,6 +299,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     }
     const auto present = state.present++;
     const auto edge = state.window ? state.window->Present(present, now - state.first) : TraceWindow::Edge::None;
+    const auto flip = timing != nullptr && (state.windowOpen || edge == TraceWindow::Edge::Open) ? timing->FlipIdentity() : std::pair<std::uint64_t, std::uint64_t>{};
     if (state.interval) {
         if (!state.intervalOpen) {
             OpenInterval(now, present);
@@ -321,6 +325,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
             gpuRanges.reserve(GpuRangeCapacity);
         }
         state.presents.push_back(now);
+        state.presentFlips.assign(1, flip);
         presentCount.fetch_add(1, std::memory_order_relaxed);
         buffering.store(true, std::memory_order_relaxed);
         recording.store(true, std::memory_order_relaxed);
@@ -334,6 +339,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         return;
     }
     state.presents.push_back(now);
+    state.presentFlips.push_back(flip);
     presentCount.fetch_add(1, std::memory_order_relaxed);
     if (edge != TraceWindow::Edge::Close) return;
     state.windowOpen = false;
@@ -356,12 +362,39 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         snapshots.push_back({"gpu", gpuSlices, {}, gpuLost != 0, gpuLost});
     }
     const auto process = processId();
+    std::vector<TraceLink> links;
+    std::uint64_t linksDropped = 0;
+    for (auto& collected : DriverDetail::DrawPipeline::CollectTraceLinks(linksDropped)) {
+        if (collected.thread == nullptr || collected.at < state.presents.front() || collected.at > now || collected.freedAt > now) continue;
+        const auto found = std::find_if(state.threads.begin(), state.threads.end(), [&](const auto& thread) { return thread.get() == collected.thread; });
+        if (found == state.threads.end()) continue;
+        TraceLink link;
+        link.flip = collected.flip;
+        link.thread = static_cast<std::size_t>(found - state.threads.begin());
+        link.at = collected.at;
+        link.freedAt = collected.freedAt;
+        link.batch = collected.batch;
+        link.unsignaled = collected.unsignaled;
+        link.submission = collected.pending.submission;
+        link.queue = collected.pending.queue;
+        link.offset = collected.pending.offset;
+        link.flipOffset = collected.pending.flipOffset;
+        link.pendingDraw = collected.pending.draw;
+        link.freedItem = collected.freedItem;
+        link.freedSubmission = collected.freed.submission;
+        link.freedQueue = collected.freed.queue;
+        link.freedOffset = collected.freed.offset;
+        link.freedBatch = collected.batch;
+        link.freedDraw = collected.freed.draw;
+        links.push_back(std::move(link));
+    }
+    ProfilePrint_nid_no_patch("[trace] draw pipeline links: %llu kept, %llu dropped\n", static_cast<unsigned long long>(links.size()), static_cast<unsigned long long>(linksDropped));
     auto summary = identity(width, height, device);
     summary.window = state.window->Describe();
     summary.firstPresent = state.firstPresent;
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.gpuBusyAtOpen;
     summary.trace = "aps5-trace-" + summary.commit + "-" + std::to_string(process) + ".json.gz";
-    auto events = TraceFormat::Events(process, state.presents.front(), snapshots, presenter, state.presents, state.firstPresent);
+    auto events = TraceFormat::Events(process, state.presents.front(), snapshots, presenter, state.presents, state.firstPresent, links, state.presentFlips);
     auto& output = writer();
     output = std::make_unique<ProfileOutput>([directory = traceDirectory(), name = summary.trace, line = TraceFormat::Summary(summary, snapshots, state.presents)](std::string_view text) {
         try {

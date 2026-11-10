@@ -36,6 +36,7 @@ extern "C" AgcDriver::TraceThread* AgcDriverTraceThread_nid_postfix();
 namespace AgcDriver {
 
 class VulkanDevice;
+class FrameTiming;
 
 class TraceWindow {
 public:
@@ -202,6 +203,8 @@ public:
         if (length < MinimumSlice) folded += length;
         else append({scope, stage, begin, length, TraceBatchTag});
     }
+
+    bool Buffering() const { return buffering.load(std::memory_order_relaxed); }
 
     Snapshot Collect() const {
         Snapshot snapshot{name, {slices.get(), used.load(std::memory_order_acquire)}, {}, false};
@@ -436,6 +439,26 @@ struct TraceGpuRange {
     std::uint64_t batch = 0;
 };
 
+struct TraceLink {
+    bool flip = false;
+    std::size_t thread = 0;
+    std::chrono::steady_clock::time_point at{};
+    std::chrono::steady_clock::time_point freedAt{};
+    std::uint64_t batch = 0;
+    std::uint64_t unsignaled = 0;
+    std::uint64_t submission = 0;
+    std::uint64_t queue = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t flipOffset = 0;
+    bool pendingDraw = false;
+    std::uint64_t freedItem = 0;
+    std::uint64_t freedSubmission = 0;
+    std::uint64_t freedQueue = 0;
+    std::uint64_t freedOffset = 0;
+    std::uint64_t freedBatch = 0;
+    bool freedDraw = false;
+};
+
 struct TraceClockSample {
     double gpuNs = 0;
     std::chrono::steady_clock::time_point cpu{};
@@ -485,7 +508,7 @@ public:
         return stage == nullptr ? std::string(scope) : std::string(scope) + "." + stage;
     }
 
-    static std::string Events(std::uint64_t process, Clock::time_point origin, std::span<const TraceThread::Snapshot> threads, std::size_t presenter, std::span<const Clock::time_point> presents, std::uint64_t firstPresent) {
+    static std::string Events(std::uint64_t process, Clock::time_point origin, std::span<const TraceThread::Snapshot> threads, std::size_t presenter, std::span<const Clock::time_point> presents, std::uint64_t firstPresent, std::span<const TraceLink> links = {}, std::span<const std::pair<std::uint64_t, std::uint64_t>> presentFlips = {}) {
         std::string output = "{\"traceEvents\":[\n";
         bool first = true;
         const auto event = [&](std::string_view name, const char* phase, Clock::time_point at, std::size_t tid) {
@@ -528,7 +551,25 @@ public:
         }
         for (std::size_t index = 0; index + 1 < presents.size(); ++index) {
             event("present", "i", presents[index], presenter + 1);
-            output += ",\"s\":\"g\",\"args\":{\"present\":" + std::to_string(firstPresent + index) + "}}";
+            output += ",\"s\":\"g\",\"args\":{\"present\":" + std::to_string(firstPresent + index);
+            if (index < presentFlips.size() && presentFlips[index].first != 0) {
+                output += ",\"flip_submission\":" + std::to_string(presentFlips[index].first) + ",\"flip_offset\":" + std::to_string(presentFlips[index].second);
+            }
+            output += "}}";
+        }
+        for (const auto& link : links) {
+            char text[448];
+            if (link.flip) {
+                event("Driver.flip", "i", link.at, link.thread + 1);
+                std::snprintf(text, sizeof text, ",\"s\":\"t\",\"args\":{\"submission\":%llu,\"offset\":%llu,\"batch\":%llu,\"unsignaled\":%llu}}",
+                    static_cast<unsigned long long>(link.submission), static_cast<unsigned long long>(link.offset), static_cast<unsigned long long>(link.batch), static_cast<unsigned long long>(link.unsignaled));
+            } else {
+                event("DrawPipeline.room_wait_link", "i", link.at, link.thread + 1);
+                std::snprintf(text, sizeof text, ",\"s\":\"t\",\"args\":{\"freed_at_us\":%.3f,\"freed_item\":%llu,\"freed_submission\":%llu,\"freed_queue\":%llu,\"freed_offset\":%llu,\"freed_draw\":%s,\"recording_batch\":%llu,\"submission\":%llu,\"queue\":%llu,\"offset\":%llu,\"flip_offset\":%llu}}",
+                    microseconds(link.freedAt - origin), static_cast<unsigned long long>(link.freedItem), static_cast<unsigned long long>(link.freedSubmission), static_cast<unsigned long long>(link.freedQueue), static_cast<unsigned long long>(link.freedOffset), link.freedDraw ? "true" : "false",
+                    static_cast<unsigned long long>(link.freedBatch), static_cast<unsigned long long>(link.submission), static_cast<unsigned long long>(link.queue), static_cast<unsigned long long>(link.offset), static_cast<unsigned long long>(link.flipOffset));
+            }
+            output += text;
         }
         output += "\n]}\n";
         return output;
@@ -828,7 +869,7 @@ public:
     }
 
     static void BindThread(const char* name, std::size_t capacity = TraceThread::DefaultCapacity);
-    static void Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device);
+    static void Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device, FrameTiming* timing = nullptr);
 
     static void GpuRange(const char* name, double beginNs, double endNs, std::uint64_t batch = 0) {
         if (!buffering.load(std::memory_order_relaxed)) return;
@@ -842,6 +883,11 @@ public:
 
     static bool Recording() {
         return AgcDriverTraceRecording_nid_postfix();
+    }
+
+    static bool Capturing() {
+        const auto* thread = Thread();
+        return thread != nullptr && thread->Buffering();
     }
 
     static TraceThread* Thread() {

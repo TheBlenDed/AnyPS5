@@ -611,6 +611,42 @@ void AppendLines() {
     Check(written == "{\"presents\":1}\n{\"presents\":2}\n", "summary lines were not appended");
 }
 
+void LinkEvents() {
+    const auto origin = Clock::now();
+    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", {}, {}, false}};
+    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16)};
+    AgcDriver::TraceLink room;
+    room.thread = 0;
+    room.at = origin + microseconds(20);
+    room.freedAt = origin + microseconds(25);
+    room.freedItem = 4;
+    room.freedSubmission = 5;
+    room.freedQueue = 0;
+    room.freedOffset = 9;
+    room.freedDraw = true;
+    room.freedBatch = 87;
+    room.submission = 12;
+    room.queue = 0;
+    room.offset = 33;
+    room.flipOffset = 40;
+    AgcDriver::TraceLink flip;
+    flip.flip = true;
+    flip.thread = 0;
+    flip.at = origin + microseconds(30);
+    flip.submission = 12;
+    flip.offset = 40;
+    flip.batch = 6;
+    flip.unsignaled = 2;
+    const std::vector<AgcDriver::TraceLink> links{room, flip};
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> presentFlips{{12, 40}, {0, 0}};
+    const auto json = TraceFormat::Events(7, origin, threads, 0, presents, 5, links, presentFlips);
+    Check(json.find("{\"name\":\"DrawPipeline.room_wait_link\",\"ph\":\"i\",\"ts\":20.000,\"pid\":7,\"tid\":1,\"s\":\"t\",\"args\":{\"freed_at_us\":25.000,\"freed_item\":4,\"freed_submission\":5,\"freed_queue\":0,\"freed_offset\":9,\"freed_draw\":true,\"recording_batch\":87,\"submission\":12,\"queue\":0,\"offset\":33,\"flip_offset\":40}}") != std::string::npos, "the room-wait link instant lost its shape");
+    Check(json.find("{\"name\":\"Driver.flip\",\"ph\":\"i\",\"ts\":30.000,\"pid\":7,\"tid\":1,\"s\":\"t\",\"args\":{\"submission\":12,\"offset\":40,\"batch\":6,\"unsignaled\":2}}") != std::string::npos, "the flip instant lost its shape");
+    Check(json.find("\"args\":{\"present\":5,\"flip_submission\":12,\"flip_offset\":40}") != std::string::npos, "the present instant did not carry its flip identity");
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> unknownFlips{{0, 0}, {0, 0}};
+    Check(TraceFormat::Events(7, origin, threads, 0, presents, 5, links, unknownFlips).find("flip_submission") == std::string::npos, "a present without a known flip named one");
+}
+
 }
 
 int main() {
@@ -628,6 +664,7 @@ int main() {
         Utf8Strings();
         EventsShape();
         BatchIds();
+        LinkEvents();
         SummaryFields();
         DriverDrawSummary();
         GpuClock();

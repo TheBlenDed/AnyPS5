@@ -562,7 +562,7 @@ public:
     // completions run under it, so other queues do not queue behind a CPU read's wait. Inside a
     // batch's completion action no wait is made at all: every batch still in flight was recorded
     // after the completing one, and its store is that batch's in-order write (see Recorder.cpp).
-    void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
+    void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false, bool bdaBaseWrite = false);
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
@@ -1153,8 +1153,10 @@ private:
     // it is the target), the timeline wait with the mutex released, then the completions up to it.
     // Returns false when the locked path must run instead (no timeline, nested acquisition, off).
     bool syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site);
+    struct BdaWaitTrace;
+    void syncFull(const void* caller, BdaWaitTrace* bdaWait);
     // `source` is the CountSync source the wait is attributed to.
-    void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
+    void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false, const BdaWaitTrace* bdaWait = nullptr);
     void discard(std::unique_ptr<Batch> batch) noexcept;
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;

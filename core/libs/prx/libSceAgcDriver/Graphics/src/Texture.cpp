@@ -577,7 +577,11 @@ VkDeviceSize ImageAllocationOverhead(VkDeviceSize bytes) {
     return (granularity - bytes % granularity) % granularity;
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory) : context(context) {
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory)
+    : Texture(context, detiler, descriptor, components, snapshot, depthCompare, hostMemory, {}) {
+}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory, const PreparedSnapshotStaging& preparedStaging) : context(context) {
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::SampledTexture);
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -718,19 +722,26 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
             }
             const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
             const auto stagingBegin = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            auto staging = preparedStaging.buffer;
+            const bool direct = staging != nullptr;
+            if (!direct) staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             const auto copyBegin = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            if (direct) {
+                const auto prepared = staging->Bytes();
+                Require(prepared.data() == snapshot.data() && prepared.size() == snapshot.size(), "prepared staging does not own the texture snapshot");
+            } else {
+                std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            }
             const auto devicesBegin = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) {
                 const auto devicesEnd = std::chrono::steady_clock::now();
-                stagingAllocNs = AsNanoseconds(copyBegin - stagingBegin);
-                stagingCopyNs = AsNanoseconds(devicesBegin - copyBegin);
+                stagingAllocNs = direct ? preparedStaging.allocationNs : AsNanoseconds(copyBegin - stagingBegin);
+                stagingCopyNs = direct ? 0 : AsNanoseconds(devicesBegin - copyBegin);
                 deviceBuffersNs = AsNanoseconds(devicesEnd - devicesBegin);
-                setupSpanNs = AsNanoseconds(devicesEnd - setupBegin);
-                copiedBytes = static_cast<std::uint64_t>(snapshot.size());
+                setupSpanNs = AsNanoseconds(devicesEnd - setupBegin) + preparedStaging.allocationNs;
+                copiedBytes = direct ? 0 : static_cast<std::uint64_t>(snapshot.size());
             }
             if (profile) Profile().allocate += timer.lap();
             if (profile) Profile().read += timer.lap();

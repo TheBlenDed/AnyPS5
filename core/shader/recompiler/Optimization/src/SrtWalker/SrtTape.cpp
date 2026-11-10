@@ -319,6 +319,100 @@ const SrtTape* SrtTape::For(const IrResourcePlan& plan) {
     return static_cast<const SrtTape*>(slot->tape.get());
 }
 
+const SrtTape::RootMasks& SrtTape::rootMasks() const {
+    std::call_once(rootMasksOnce, [this] {
+        constexpr std::uint32_t Words = 64;
+        struct MaskEntry {
+            std::uint64_t mask = 0;
+            bool high = false;
+            bool unknown = false;
+            bool computed = false;
+        };
+        std::vector<MaskEntry> memo(nodes.size());
+        const auto compute = [&](const auto& self, std::uint32_t index, MaskEntry& entry) -> void {
+            if (index == NoNode || index >= nodes.size()) {
+                entry.unknown = true;
+                return;
+            }
+            MaskEntry& nodeEntry = memo[index];
+            if (nodeEntry.computed) {
+                entry.mask |= nodeEntry.mask;
+                entry.high = entry.high || nodeEntry.high;
+                entry.unknown = entry.unknown || nodeEntry.unknown;
+                return;
+            }
+            nodeEntry.computed = true;
+            const auto& node = nodes[index];
+            switch (node.op) {
+                case Op::Fail:
+                    nodeEntry.unknown = true;
+                    break;
+                case Op::UserData:
+                    if (node.immediate >= Words) nodeEntry.high = true;
+                    else nodeEntry.mask = std::uint64_t{1} << node.immediate;
+                    break;
+                case Op::Const:
+                case Op::ShaderBase:
+                    break;
+                default:
+                    for (std::uint8_t argument = 0; argument < node.argumentCount; ++argument) self(self, node.arguments[argument], nodeEntry);
+                    if (node.op == Op::Read || node.op == Op::ReadConstBuffer) {
+                        if (node.baseWord >= 0) {
+                            if (node.baseWord >= static_cast<std::int32_t>(Words)) nodeEntry.high = true;
+                            else nodeEntry.mask |= std::uint64_t{1} << node.baseWord;
+                        }
+                    }
+                    break;
+            }
+            entry.mask |= nodeEntry.mask;
+            entry.high = entry.high || nodeEntry.high;
+            entry.unknown = entry.unknown || nodeEntry.unknown;
+        };
+        const auto gather = [&](MaskEntry& entry, std::uint32_t index) {
+            compute(compute, index, entry);
+        };
+        rootMasksCache.sources.assign(sourceDwords.size(), {});
+        for (std::size_t source = 0; source < sourceDwords.size(); ++source) {
+            for (std::uint32_t dword = 0; dword < 8u; ++dword) {
+                const auto index = sourceDwords[source][dword];
+                if (index == NoNode) continue;
+                auto& root = rootMasksCache.sources[source][dword];
+                root.present = true;
+                MaskEntry entry;
+                gather(entry, index);
+                root.mask = entry.mask;
+                root.high = entry.high;
+                root.unknown = entry.unknown;
+            }
+        }
+        rootMasksCache.flats.assign(flatRoots.size(), {});
+        for (std::size_t slot = 0; slot < flatRoots.size(); ++slot) {
+            const auto index = flatRoots[slot];
+            if (index == NoNode) continue;
+            auto& root = rootMasksCache.flats[slot];
+            root.present = true;
+            MaskEntry entry;
+            gather(entry, index);
+            root.mask = entry.mask;
+            root.high = entry.high;
+            root.unknown = entry.unknown;
+        }
+        rootMasksCache.conditions.assign(conditionRoots.size(), {});
+        for (std::size_t block = 0; block < conditionRoots.size(); ++block) {
+            const auto index = conditionRoots[block];
+            if (index == NoNode) continue;
+            auto& root = rootMasksCache.conditions[block];
+            root.present = true;
+            MaskEntry entry;
+            gather(entry, index);
+            root.mask = entry.mask;
+            root.high = entry.high;
+            root.unknown = entry.unknown;
+        }
+    });
+    return rootMasksCache;
+}
+
 struct SrtTape::Frame {
     const SrtRuntime& runtime;
     std::uint64_t* values;

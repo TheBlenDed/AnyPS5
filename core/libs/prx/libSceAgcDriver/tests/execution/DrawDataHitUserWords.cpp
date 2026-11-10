@@ -130,7 +130,7 @@ AgcDriver::DriverDetail::DrawEntryCounters Submit(std::vector<std::uint32_t> com
 }
 
 std::string Counts(const AgcDriver::DriverDetail::DrawEntryCounters& counters) {
-    return std::to_string(counters.lookups) + " lookups, " + std::to_string(counters.dataHits) + " data-only hits, stages " + std::to_string(counters.dataStagesReused) + " reused / " + std::to_string(counters.dataStagesCompiled) + " compiled / " + std::to_string(counters.dataVerified) + " verified";
+    return std::to_string(counters.lookups) + " lookups, " + std::to_string(counters.dataHits) + " data-only hits, stages " + std::to_string(counters.dataStagesReused) + " reused / " + std::to_string(counters.dataStagesCompiled) + " compiled / " + std::to_string(counters.dataVerified) + " verified; candidate misses " + std::to_string(counters.candidateMissWalk) + " walk / " + std::to_string(counters.candidateMissFetch) + " fetch / " + std::to_string(counters.candidateMissRegister) + " register-only / " + std::to_string(counters.candidateMissUnknown) + " unknown / " + std::to_string(counters.candidateMissOther) + " other / " + std::to_string(counters.candidateMissPassed) + " passed / " + std::to_string(counters.candidateMissAbsent) + " absent; srt root impact " + std::to_string(counters.rootImpactFully) + " fully / " + std::to_string(counters.rootImpactPartially) + " partially / " + std::to_string(counters.rootImpactZero) + " zero / " + std::to_string(counters.rootImpactConservative) + " conservative / " + std::to_string(counters.rootImpactNoTape) + " no tape / " + std::to_string(counters.rootImpactNoBaseline) + " no baseline / " + std::to_string(counters.rootImpactAffectedRoots) + " of " + std::to_string(counters.rootImpactRoots) + " roots affected";
 }
 
 void UnreadUserWordsKeepTheStage(bool verify) {
@@ -179,6 +179,10 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     Require(counters.dataHits == moved.dataHits + 1, "a draw that pointed the pixel stage at another buffer descriptor was not a data-only hit: " + Counts(counters));
     Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
     if (!verify) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
+    Require(counters.candidateMissWalk - moved.candidateMissWalk == 1, "a draw that moved the pixel stage's descriptor pointer did not classify its compiled stage as a resource-walk input change (" + Counts(counters) + ", before: " + Counts(moved) + ")");
+    Require(counters.candidateMissRegister - moved.candidateMissRegister == 0, "a draw that moved the pixel stage's descriptor pointer classified its compiled stage as register-only (" + Counts(counters) + ", before: " + Counts(moved) + ")");
+    Require(counters.rootImpactFully - moved.rootImpactFully == 1, "a draw that moved the pixel stage's descriptor pointer did not statically affect every root of its compiled stage (" + Counts(counters) + ", before: " + Counts(moved) + ")");
+    Require(counters.rootImpactAffectedRoots - moved.rootImpactAffectedRoots >= 1 && counters.rootImpactRoots - moved.rootImpactRoots >= 1, "a draw that moved the pixel stage's descriptor pointer did not pair its compiled stage with affected roots (" + Counts(counters) + ", before: " + Counts(moved) + ")");
 
     const bool refresh = std::getenv("APS5_DRAW_PIPELINE") != nullptr;
     for (const std::uint32_t unread : {0x33u, 0x44u}) {
@@ -223,6 +227,11 @@ void ReadUserWordsChangeTheOutput() {
     const auto closeTo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
     Require(closeTo(first, 128), "a pixel stage adding user word 2 (0.25) to a loaded 0.25 wrote " + std::to_string(first) + ", expected 128");
     Require(closeTo(second, 191), "a pixel stage adding user word 2 changed to 0.5 wrote " + std::to_string(second) + ", expected 191 (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.candidateMissRegister - before.candidateMissRegister == 1, "a draw that changed only a register-read user word did not classify its compiled stage as register-only (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.candidateMissWalk - before.candidateMissWalk == 0, "a draw that changed only a register-read user word classified its compiled stage as a resource-walk input change (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.candidateMissUnknown - before.candidateMissUnknown == 0, "a draw that changed only a register-read user word classified its compiled stage as unknown (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.rootImpactZero - before.rootImpactZero >= 1 && after.rootImpactFully - before.rootImpactFully == 0 && after.rootImpactPartially - before.rootImpactPartially == 0, "a draw that changed only a register-read user word did not pair its re-materialized stages with zero affected roots (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.rootImpactAffectedRoots - before.rootImpactAffectedRoots == 0, "a draw that changed only a register-read user word affected a walk root (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
 void DirectBufferBaseMovesWithItsPayload() {
@@ -256,6 +265,7 @@ void DirectBufferBaseMovesWithItsPayload() {
     Require(moved > repeated, "a draw whose descriptor base and payload both moved read the old payload: " + std::to_string(repeated) + " then " + std::to_string(moved) + " (" + Counts(after) + ", before: " + Counts(before) + ")");
     Require(after.dataHits == before.dataHits + 1, "a draw whose descriptor base and payload moved was not a data-only hit (" + Counts(after) + ", before: " + Counts(before) + ")");
     Require(after.dataStagesCompiled - before.dataStagesCompiled >= 1, "a draw whose descriptor base moved reused the pixel stage built for the old base: the rebuild this test documents is gone, flip it to a reuse check (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.candidateMissWalk - before.candidateMissWalk >= 1, "a draw whose descriptor base moved did not classify its compiled stage as a resource-walk input change (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
 }
@@ -269,6 +279,11 @@ int main() {
             libraries = device->GraphicsPipelineLibraries();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
+#ifdef _WIN32
+        if (_putenv("APS5_PROFILE_DRAW_CANDIDATE_MISSES=1") != 0 || _putenv("APS5_PROFILE_SRT_ROOT_IMPACT=1") != 0) return 1;
+#else
+        if (setenv("APS5_PROFILE_DRAW_CANDIDATE_MISSES", "1", 1) != 0 || setenv("APS5_PROFILE_SRT_ROOT_IMPACT", "1", 1) != 0) return 1;
+#endif
         const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
         UnreadUserWordsKeepTheStage(verify);
         ReadUserWordsChangeTheOutput();

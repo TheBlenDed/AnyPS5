@@ -65,6 +65,16 @@ bool Driver::verifyDrawRecipe() {
     return verify;
 }
 
+bool Driver::candidateMissReasons() {
+    static const bool reasons = std::getenv("APS5_PROFILE_DRAW_CANDIDATE_MISSES") != nullptr;
+    return reasons;
+}
+
+bool Driver::srtRootImpactReasons() {
+    static const bool reasons = std::getenv("APS5_PROFILE_SRT_ROOT_IMPACT") != nullptr;
+    return reasons;
+}
+
 std::size_t Driver::drawCacheEntries() {
     static const std::size_t entries = [] {
         const char* text = std::getenv("APS5_DRAW_CACHE_ENTRIES");

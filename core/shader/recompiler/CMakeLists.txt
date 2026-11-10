@@ -311,6 +311,7 @@ function(add_shader_recompiler target runtimeTarget)
             ShaderDiskCache::SourceVersion
             SrgbDecodeBit
             SrgbUnormFormat
+            Detail::SrtTape::For
             FindUserDataTail
             LinkUserDataTail
             ThreadOwned

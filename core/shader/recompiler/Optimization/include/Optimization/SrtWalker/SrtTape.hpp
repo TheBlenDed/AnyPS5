@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace ShaderRecompiler::Detail {
@@ -18,6 +19,19 @@ public:
     static bool Verified();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
+
+    struct RootMask {
+        bool present = false;
+        std::uint64_t mask = 0;
+        bool high = false;
+        bool unknown = false;
+    };
+    struct RootMasks {
+        std::vector<std::array<RootMask, 8>> sources;
+        std::vector<RootMask> flats;
+        std::vector<RootMask> conditions;
+    };
+    const RootMasks& rootMasks() const;
 
     std::size_t Nodes() const { return nodes.size(); }
 
@@ -52,6 +66,8 @@ private:
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
+    mutable std::once_flag rootMasksOnce;
+    mutable RootMasks rootMasksCache;
 };
 
 }

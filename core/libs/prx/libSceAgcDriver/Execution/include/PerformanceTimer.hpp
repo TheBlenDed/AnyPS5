@@ -120,6 +120,11 @@ public:
         return flipReached;
     }
 
+    std::pair<std::uint64_t, std::uint64_t> FlipIdentity() {
+        std::lock_guard lock(mutex);
+        return {flipSerial, static_cast<std::uint64_t>(flipOffset)};
+    }
+
     // Recorder batches at the flip packet (after its submit) and how many had not signaled.
     void NoteFlipBatches(std::uint64_t atFlip, std::uint64_t unsignaled) {
         std::lock_guard lock(mutex);

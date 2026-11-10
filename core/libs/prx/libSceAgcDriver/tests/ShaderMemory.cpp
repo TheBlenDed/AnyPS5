@@ -1744,6 +1744,19 @@ void verifySrtTape() {
         require(tape.asBase != 0u && tape.asValue != 0u && !tape.userDataReads.empty(), "SRT tape: the guarded program's walk reported no user-data use");
     }
 
+    const auto* guardedTape = Detail::SrtTape::For(*guardedPlan);
+    require(guardedTape != nullptr, "SRT tape: the guarded program has no tape for root masks");
+    const auto& guardedMasks = guardedTape->rootMasks();
+    bool walkedRoot = false;
+    for (const auto& source : guardedMasks.sources) {
+        for (const auto& root : source) {
+            if (!root.present) continue;
+            walkedRoot = true;
+            require((root.mask & 3u) == 3u && !root.unknown && !root.high, "SRT tape: a walked source root does not depend on both pointer user words");
+        }
+    }
+    require(walkedRoot, "SRT tape: the guarded program has no walked source roots");
+
     const auto nullRuntime = runtimeFor(nullUserData);
     require(!answers(*guardedPlan, nullRuntime), "SRT tape: the tape answered a walk through a null user-data root");
     const auto nullWalk = walk(*guardedPlan, nullRuntime, true);
@@ -1761,6 +1774,90 @@ void verifySrtTape() {
     const auto runtime = runtimeFor(userData);
     require(answers(*outOfRangePlan, runtime), "SRT tape: the tape refused a constant read past its V#");
     require(walk(*outOfRangePlan, runtime, true) == walk(*outOfRangePlan, runtime, false), "SRT tape: a constant read past its V# differs from the Evaluator's");
+}
+
+void verifySrtTapeRootMasks() {
+    using namespace ShaderRecompiler;
+    struct PlanValues {
+        IrResourcePlan plan;
+        std::vector<std::unique_ptr<IrValue>> values;
+    };
+    const auto make = [](PlanValues& built, IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) -> IrValue& {
+        built.values.push_back(std::make_unique<IrValue>(opcode, type, static_cast<std::uint32_t>(built.values.size())));
+        for (auto* argument : arguments) built.values.back()->AddArgument(argument);
+        return *built.values.back();
+    };
+    const auto constant = [&](PlanValues& built, std::uint32_t value) -> IrValue& {
+        auto& leaf = make(built, IrOpcode::Void, IrType::U32);
+        leaf.SetImmediateU32(value);
+        return leaf;
+    };
+    const auto userData = [&](PlanValues& built, std::uint32_t reg) -> IrValue& {
+        auto& scalar = make(built, IrOpcode::Void, IrType::ScalarReg);
+        scalar.SetRegister({RegisterBank::Scalar, reg});
+        return make(built, IrOpcode::GetUserData, IrType::U32, {&scalar});
+    };
+
+    PlanValues shared;
+    auto& sharedWord = userData(shared, 0);
+    shared.plan.descriptorSources.resize(2);
+    shared.plan.descriptorSources[0].dwordCount = 1;
+    shared.plan.descriptorSources[0].dwords[0] = &sharedWord;
+    shared.plan.descriptorSources[1].dwordCount = 1;
+    shared.plan.descriptorSources[1].dwords[0] = &sharedWord;
+    shared.plan.materializationSources = {0, 1};
+    shared.plan.srtReads.push_back({&userData(shared, 1), 0});
+    ResourceBlock sharedBlock;
+    sharedBlock.condition = &make(shared, IrOpcode::IEqual32, IrType::Bool, {&sharedWord, &constant(shared, 0)});
+    shared.plan.controlFlow.push_back(sharedBlock);
+    shared.plan.srtPlanComplete = true;
+    const auto* sharedTape = Detail::SrtTape::For(shared.plan);
+    require(sharedTape != nullptr, "SRT root masks: a plan of plain user data has no tape");
+    const auto& sharedMasks = sharedTape->rootMasks();
+    require(sharedMasks.sources.size() == 2u && sharedMasks.sources[0][0].present && sharedMasks.sources[1][0].present && !sharedMasks.sources[0][1].present, "SRT root masks: the shared node's aliasing roots are wrong");
+    require(sharedMasks.sources[0][0].mask == 1u && sharedMasks.sources[1][0].mask == 1u && !sharedMasks.sources[0][0].unknown && !sharedMasks.sources[1][0].unknown && !sharedMasks.sources[0][0].high, "SRT root masks: the shared user word did not mark both aliasing source roots");
+    require(sharedMasks.flats.size() == 1u && sharedMasks.flats[0].present && sharedMasks.flats[0].mask == 2u && !sharedMasks.flats[0].unknown, "SRT root masks: the flat root did not record only its own user word");
+    require(sharedMasks.conditions.size() == 1u && sharedMasks.conditions[0].present && sharedMasks.conditions[0].mask == 1u && !sharedMasks.conditions[0].unknown, "SRT root masks: the condition root did not record its user word");
+
+    PlanValues local;
+    auto& branchLeft = userData(local, 2);
+    auto& branchRight = userData(local, 3);
+    local.plan.descriptorSources.resize(2);
+    local.plan.descriptorSources[0].dwordCount = 1;
+    local.plan.descriptorSources[0].dwords[0] = &branchLeft;
+    local.plan.descriptorSources[1].dwordCount = 1;
+    local.plan.descriptorSources[1].dwords[0] = &branchRight;
+    local.plan.materializationSources = {0, 1};
+    local.plan.srtPlanComplete = true;
+    const auto* localTape = Detail::SrtTape::For(local.plan);
+    require(localTape != nullptr, "SRT root masks: the branch-local plan has no tape");
+    const auto& localMasks = localTape->rootMasks();
+    require(localMasks.sources[0][0].present && localMasks.sources[1][0].present && localMasks.sources[0][0].mask == 4u && localMasks.sources[1][0].mask == 8u, "SRT root masks: branch-local inputs did not stay local to their source roots");
+
+    PlanValues high;
+    auto& highWord = userData(high, 64);
+    high.plan.descriptorSources.resize(1);
+    high.plan.descriptorSources[0].dwordCount = 1;
+    high.plan.descriptorSources[0].dwords[0] = &highWord;
+    high.plan.materializationSources = {0};
+    high.plan.srtPlanComplete = true;
+    const auto* highTape = Detail::SrtTape::For(high.plan);
+    require(highTape != nullptr, "SRT root masks: the high-word plan has no tape");
+    const auto& highMasks = highTape->rootMasks();
+    require(highMasks.sources[0][0].present && highMasks.sources[0][0].high && !highMasks.sources[0][0].unknown, "SRT root masks: a user word >= 64 did not mark its root high");
+
+    PlanValues failed;
+    auto& vector = make(failed, IrOpcode::Void, IrType::VectorReg);
+    vector.SetRegister({RegisterBank::Vector, 0});
+    failed.plan.descriptorSources.resize(1);
+    failed.plan.descriptorSources[0].dwordCount = 1;
+    failed.plan.descriptorSources[0].dwords[0] = &make(failed, IrOpcode::GetRegister, IrType::U32, {&vector});
+    failed.plan.materializationSources = {0};
+    failed.plan.srtPlanComplete = true;
+    const auto* failedTape = Detail::SrtTape::For(failed.plan);
+    require(failedTape != nullptr, "SRT root masks: the unsupported-op plan has no tape");
+    const auto& failedMasks = failedTape->rootMasks();
+    require(failedMasks.sources[0][0].present && failedMasks.sources[0][0].unknown, "SRT root masks: a failed root was not marked unknown");
 }
 
 struct alignas(256) TableTexture {
@@ -9032,6 +9129,11 @@ int main(int argc, char** argv) {
             std::cout << "SRT read patching replaces repeated and multiple uses\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--srt-tape-root-masks") {
+            verifySrtTapeRootMasks();
+            std::cout << "SRT tape root masks passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--type-zero-image-materialization") {
             verifyTypeZeroImageMaterialization();
             std::cout << "TYPE=0 image descriptor materialization passed\n";
@@ -9056,6 +9158,7 @@ int main(int argc, char** argv) {
         verifyLaneMaskGuardedDescriptorSources();
         verifyExecGuardedDescriptorSources();
         verifySrtTape();
+        verifySrtTapeRootMasks();
         verifyTargetFeatureKey();
         verifyImageTableKeys();
         verifyImageTables();
