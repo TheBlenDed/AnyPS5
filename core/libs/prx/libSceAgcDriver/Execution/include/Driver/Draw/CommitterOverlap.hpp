@@ -41,6 +41,7 @@ public:
     }
 
     void EnterCommitterThread() { committerThreadFlag() = true; }
+    static bool IsCommitterThread() { return committerThreadFlag(); }
 
     std::uint32_t OverlapGateValue() const { return gate.load(std::memory_order_acquire); }
 

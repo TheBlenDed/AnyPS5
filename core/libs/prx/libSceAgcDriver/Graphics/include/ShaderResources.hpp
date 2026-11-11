@@ -132,6 +132,7 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
+bool PendingStorageOverlapsReadOnly(std::uint64_t address, std::size_t bytes, const StorageTexture* except);
 
 struct PipelineSetLayouts {
     VkDescriptorSetLayout main = VK_NULL_HANDLE;

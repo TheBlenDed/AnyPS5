@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -2028,6 +2029,28 @@ int main(int argc, char** argv) {
         if (recover) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             recoveryTests(context, mode);
+            return 0;
+        }
+        if (mode == "live-source-reasons") {
+            using AgcDriver::DriverDetail::DrawPipeline;
+            namespace Memory = AgcDriver::GuestMemory;
+            Block block(context);
+            const auto sample = [&](std::size_t index) {
+                std::lock_guard gpu(Memory::GpuMutex());
+                Memory::SetCurrentPacket(0x2d, 0);
+                Require(Sampled(context, block.Surface(index)) != nullptr, "the source diagnostic fixture did not create a snapshot");
+            };
+            const auto before = SampledCacheCounters().made;
+            sample(0);
+            auto& pipeline = DrawPipeline::Queue0();
+            pipeline.Enqueue([&] { sample(1); }, {}, 0, {}, {}, {}, true);
+            pipeline.Drain(DrawPipeline::DrainReason::Submission);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10100));
+            pipeline.Enqueue([&] { sample(2); }, {}, 0, {}, {}, {}, true);
+            pipeline.Drain(DrawPipeline::DrainReason::Submission);
+            Require(SampledCacheCounters().made == before + 3, "the diagnostic fixture did not make exactly three snapshots");
+            ClearCachedTextures(context.device);
+            std::puts("sampled live-source diagnostic fixture passed");
             return 0;
         }
         if (setupReport) {

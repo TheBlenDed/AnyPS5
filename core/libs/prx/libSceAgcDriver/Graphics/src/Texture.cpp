@@ -5480,6 +5480,17 @@ bool StorageTexture::PendingSlicesOf(const GuestTextureResource& surface, const 
     return true;
 }
 
+bool PendingStorageOverlapsReadOnly(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
+    if (bytes == 0) return false;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    return std::any_of(pending.textures.begin(), pending.textures.end(), [&](const StorageTexture* texture) {
+        const auto begin = texture->Descriptor().baseAddress;
+        const auto length = texture->GuestBytes();
+        return texture != except && length != 0 && (address >= begin ? address - begin < length : begin - address < bytes);
+    });
+}
+
 bool PendingStorageOverlaps(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);

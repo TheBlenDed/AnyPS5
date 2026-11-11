@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitterOverlap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ThreadOwned.hpp"
@@ -130,6 +131,7 @@ struct OwnedProof {
 enum class OneOffProof : std::uint8_t { Stamped, CommittedPartial, UntrackedHinted, UntrackedUnhinted };
 
 enum class SnapshotMakeReason : std::size_t { MissingKey, Expired, MetadataMismatch, CompareFailed, Count };
+enum class SnapshotLiveReason : std::size_t { NoLive, PendingMatchingShape, PendingOther, LiveIncompatible, LiveDcc, LiveRecordedWrite, LiveNoHostImport, LiveUnproven, Count };
 
 struct SnapshotMakeStats {
     std::uint64_t count = 0;
@@ -302,6 +304,8 @@ struct TextureCache {
         std::array<std::uint64_t, 3> evictedRecent{};
     } counts, totals;
     std::array<SnapshotMakeStats, static_cast<std::size_t>(SnapshotMakeReason::Count)> snapshotMakeReasons{};
+    std::uint64_t snapshotLiveMakes = 0;
+    std::array<SnapshotMakeStats, static_cast<std::size_t>(SnapshotLiveReason::Count)> snapshotLiveReasons{};
     std::chrono::steady_clock::time_point countsReported = std::chrono::steady_clock::now();
     std::uint64_t erasures = 0;
 };
@@ -874,6 +878,23 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
         }
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) snapshot makes after one-off lookup at present %llu (count / constructor ms / body ms, includes constructor):%s\n",
             static_cast<unsigned long long>(Recorder::Presents()), summary.c_str());
+    }
+    if (cache.snapshotLiveMakes != 0) {
+        static constexpr std::array names{"no_live", "pending_matching_shape", "pending_other", "live_incompatible", "live_dcc", "live_recorded_write", "live_no_host_import", "live_unproven"};
+        const auto reasons = std::exchange(cache.snapshotLiveReasons, {});
+        std::uint64_t observed = 0;
+        std::string summary;
+        for (std::size_t i = 0; i < reasons.size(); ++i) {
+            const auto& stats = reasons[i];
+            observed += stats.count;
+            char text[128];
+            std::snprintf(text, sizeof(text), " [%s %llu / %.3f]", names[i], static_cast<unsigned long long>(stats.count),
+                std::chrono::duration<double, std::milli>(stats.constructor).count());
+            summary += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[sampled-live] (10 s) queue 0x0 draw committer at present %llu: %llu of %llu snapshot makes observed before depth/storage flush (count / constructor ms):%s\n",
+            static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(observed),
+            static_cast<unsigned long long>(std::exchange(cache.snapshotLiveMakes, 0)), summary.c_str());
     }
     cache.madeSurfaces.clear();
     droppedBefore = dropped;
@@ -2118,6 +2139,36 @@ void noteLookupProbe(const LookupProbeAccumulator& before) {
     profile.beginPresents = endPresents;
 }
 
+bool ObservingSnapshotLiveSources() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PROFILE_SAMPLED_LIVE_REASONS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled || !AgcDriver::DriverDetail::CommitterOverlap::IsCommitterThread() || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const auto packet = GuestMemory::CurrentPacket();
+    return packet.queue == 0 && Pm4::DrawOpcode(packet.opcode);
+}
+
+bool StorageImagePresentForProbe(const Context& context, const StorageTexture* image);
+
+SnapshotLiveReason ObserveSnapshotLiveSource(const Context& context, const GuestTextureResource& resource, std::size_t bytes, bool depthCompare) {
+    const auto address = resource.baseAddress;
+    const auto matchingShape = [&](const StorageTexture& image) {
+        return !depthCompare && resource.format == image.Descriptor().format && Texture::CanCopyFrom(image, resource);
+    };
+    if (const auto pending = StorageTexture::FindPending(address, bytes)) {
+        return matchingShape(*pending) ? SnapshotLiveReason::PendingMatchingShape : SnapshotLiveReason::PendingOther;
+    }
+    if (PendingStorageOverlapsReadOnly(address, bytes, nullptr)) return SnapshotLiveReason::PendingOther;
+    const auto live = StorageTexture::FindLive(address, bytes);
+    if (live == nullptr || !StorageImagePresentForProbe(context, live.get())) return SnapshotLiveReason::NoLive;
+    if (!matchingShape(*live)) return SnapshotLiveReason::LiveIncompatible;
+    if (resource.dccAddress != 0 || live->Descriptor().dccAddress != 0) return SnapshotLiveReason::LiveDcc;
+    if (Recorder::SnapshotWriteOverlaps(address, bytes)) return SnapshotLiveReason::LiveRecordedWrite;
+    if (!HostImportCovers(context, address, bytes)) return SnapshotLiveReason::LiveNoHostImport;
+    return SnapshotLiveReason::LiveUnproven;
+}
+
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
@@ -2208,6 +2259,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
     }
     LookupProbeGuard probeGuard{probeSel, probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}, probeSel ? Recorder::ThreadWaitedMs() : 0.0};
+    const bool observeLiveSources = !disabled && profile && ObservingSnapshotLiveSources();
+    std::optional<SnapshotLiveReason> liveSource;
+    if (observeLiveSources) {
+        static thread_local std::uint64_t tick = 0;
+        if (((tick++ * 0x9e3779b97f4a7c15ull) >> 58u) == 0) liveSource = ObserveSnapshotLiveSource(context, resource, bytes, depthCompare);
+    }
     static_cast<void>(FlushDepthPlanes(address, bytes));
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
@@ -2875,6 +2932,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (profile) {
             const auto buildEnd = LookupOutcomes::Add(LookupOutcomes::SnapshotBuild, buildStart);
             if (SnapshotMakeReasonsEnabled()) constructorTime = buildEnd - buildStart;
+            if (observeLiveSources) ++cache.snapshotLiveMakes;
+            if (liveSource.has_value()) {
+                auto& stats = cache.snapshotLiveReasons[static_cast<std::size_t>(*liveSource)];
+                ++stats.count;
+                stats.constructor += buildEnd - buildStart;
+            }
         }
         ++cache.counts.made;
         ++cache.totals.made;
@@ -3001,6 +3064,12 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
         if (it->key.device == device && it->texture.get() == image) return it;
     }
     return cache.entries.end();
+}
+
+bool StorageImagePresentForProbe(const Context& context, const StorageTexture* image) {
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    return findStorageByImage(cache, context.device, image) != cache.entries.end();
 }
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
