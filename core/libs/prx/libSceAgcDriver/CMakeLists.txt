@@ -622,6 +622,17 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
+    add_test_executable(agc_inflight_builds_tests tests/InflightBuilds.cpp)
+    target_include_directories(agc_inflight_builds_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_inflight_builds_tests PRIVATE libc)
+    configure_windows_unwind(agc_inflight_builds_tests)
+    add_test(NAME agc_inflight_builds COMMAND agc_inflight_builds_tests)
+    set_tests_properties(agc_inflight_builds PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_inflight_builds PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
     add_test_executable(agc_newpath_router_tests tests/NewPathRouter.cpp Execution/src/Driver/NewPath/Router.cpp)
     target_include_directories(agc_newpath_router_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
     target_link_libraries(agc_newpath_router_tests PRIVATE libc)
@@ -2884,6 +2895,7 @@ target_include_directories(agc_driver_failed_capture_dump_tests PRIVATE $<TARGET
 
 target_include_directories(agc_driver_prepared_publication_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
+
 target_include_directories(agc_driver_prepared_graphics_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 target_link_libraries(agc_driver_interpolation_modes_tests PRIVATE shader_recompiler_agc_driver)
 
@@ -3039,6 +3051,13 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_tests_properties(agc_driver_prebuild_draw_pipeline PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINE_JOURNAL=1;APS5_PREBUILD_DRAW_PIPELINE=1"
+        SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_prebuild_draw_pipeline PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+    endif()
     add_test(NAME agc_driver_gpu_buffer_format_store_spanned COMMAND agc_driver_gpu_buffer_format_store_tests --wave64)
     set_tests_properties(agc_driver_gpu_buffer_format_store_spanned PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SPANNED_WAVE=1;APS5_BINDLESS_IMAGES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
     add_test(NAME agc_driver_gpu_skinning_loop_spanned COMMAND agc_driver_gpu_skinning_loop_tests)

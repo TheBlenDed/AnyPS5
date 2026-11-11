@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InflightBuilds.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/IndexClamp_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -46,6 +47,9 @@
 #include <memory>
 #include <unordered_set>
 #include <deque>
+#include <future>
+#include <thread>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1634,6 +1638,11 @@ struct PreparedDraw {
     std::shared_ptr<ShaderResources> resources;
     std::uint64_t forgetSerial = 0;
     std::uint64_t registryGeneration = 0;
+    std::shared_future<void> pipeline;
+
+    ~PreparedDraw() {
+        if (pipeline.valid()) pipeline.wait();
+    }
 };
 
 namespace {
@@ -1655,6 +1664,14 @@ struct SplitCounters {
     std::atomic<std::uint64_t> staleOther{0};
     std::atomic<std::uint64_t> lockedBuilds{0};
     std::atomic<std::uint64_t> keyReused{0};
+    std::atomic<std::uint64_t> pipelinesQueued{0};
+    std::atomic<std::uint64_t> pipelinesDeduped{0};
+    std::atomic<std::uint64_t> pipelinesSkipped{0};
+    std::atomic<std::uint64_t> pipelineWaits{0};
+    std::atomic<std::uint64_t> pipelineWaitNs{0};
+    std::atomic<std::uint64_t> totalPipelinesQueued{0};
+    std::atomic<std::uint64_t> totalPipelinesDeduped{0};
+    std::atomic<std::uint64_t> totalPipelinesSkipped{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1683,6 +1700,15 @@ void reportSplits() {
     const auto other = take(c.staleOther);
     const auto locked = take(c.lockedBuilds);
     const auto keys = take(c.keyReused);
+    const auto queuedPipelines = take(c.pipelinesQueued);
+    const auto dedupedPipelines = take(c.pipelinesDeduped);
+    const auto skippedPipelines = take(c.pipelinesSkipped);
+    const auto pipelineWaits = take(c.pipelineWaits);
+    const auto pipelineWaitNs = take(c.pipelineWaitNs);
+    const auto committerBuilds = TakeCommitterBuilds();
+    AgcDriver::ProfilePrint_nid_no_patch("[split] pipeline prebuilds (10 s): queued %llu, deduped %llu, full %llu, commits waited %llu (%.3f ms), committer builds %llu (%.3f ms)\n",
+        queuedPipelines, dedupedPipelines, skippedPipelines, pipelineWaits, static_cast<double>(pipelineWaitNs) / 1e6,
+        static_cast<unsigned long long>(committerBuilds.builds), static_cast<double>(committerBuilds.nanoseconds) / 1e6);
     std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused\n", prepared, cached, address, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys);
 }
 
@@ -1707,6 +1733,7 @@ std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& s
     }
     prepared->indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return prepared;
+    prepared->pipeline = PrebuildDrawPipeline(context, state, shaders);
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
@@ -3240,6 +3267,149 @@ std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const 
     if (!attributes.empty()) prepared->vertexInput = std::make_shared<const VertexInputLayout>(BuildVertexInputLayout(context, attributes));
     if (TrimmedDrawKey()) prepared->contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0, false);
     return prepared;
+}
+
+namespace {
+
+struct PipelinePrebuilds {
+    std::mutex mutex;
+    std::condition_variable work;
+    std::deque<std::packaged_task<void()>> jobs;
+    std::vector<std::thread> threads;
+};
+
+constexpr std::size_t MaximumQueuedPipelines = 64;
+
+PipelinePrebuilds& Prebuilds() {
+    static auto* prebuilds = new PipelinePrebuilds();
+    return *prebuilds;
+}
+
+InflightBuilds& InflightPrebuilds() {
+    static auto* builds = new InflightBuilds();
+    return *builds;
+}
+
+bool PrebuildDedupe() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_NO_PREBUILD_DEDUPE");
+        return value == nullptr || std::strcmp(value, "1") != 0;
+    }();
+    return enabled;
+}
+
+std::size_t PrebuildThreads() {
+    static const std::size_t threads = [] {
+        const char* text = std::getenv("APS5_PREBUILD_DRAW_PIPELINE_THREADS");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 3ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1ull, 16ull));
+    }();
+    return threads;
+}
+
+void runPrebuilds(PipelinePrebuilds& prebuilds) {
+    MarkBuildThread(BuildThread::Pool);
+    for (;;) {
+        std::packaged_task<void()> job;
+        {
+            std::unique_lock lock(prebuilds.mutex);
+            prebuilds.work.wait(lock, [&] { return !prebuilds.jobs.empty(); });
+            job = std::move(prebuilds.jobs.front());
+            prebuilds.jobs.pop_front();
+        }
+        job();
+    }
+}
+
+}
+
+PipelinePrebuildCounters PipelinePrebuildTotals() {
+    auto& counts = Splits();
+    return {counts.totalPipelinesQueued.load(std::memory_order_relaxed),
+        counts.totalPipelinesDeduped.load(std::memory_order_relaxed),
+        counts.totalPipelinesSkipped.load(std::memory_order_relaxed)};
+}
+
+std::shared_future<void> PrebuildDrawPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_PREBUILD_DRAW_PIPELINE");
+        return value != nullptr && std::strcmp(value, "1") == 0 &&
+            std::getenv("APS5_NO_PREBUILD_DRAW_PIPELINE") == nullptr && std::getenv("APS5_DRAW_TRANSITIONS") == nullptr;
+    }();
+    if (!enabled || context.descriptorCache == nullptr || context.bufferPool == nullptr ||
+        GuestMemory::GpuMutex().HeldByThisThread() || shaders.empty() ||
+        std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return {};
+    InflightBuilds::Key key;
+    InflightBuilds::Claim claim;
+    std::shared_ptr<std::promise<void>> completion;
+    try {
+        bool memoized = false;
+        bool hit = false;
+        const auto fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit, false);
+        auto masked = maskedState(state, fragmentOutputs);
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        auto vertexInput = attributes.empty() ? VertexInputLayout{} : BuildVertexInputLayout(context, attributes);
+        auto described = DescribeSetLayouts(context, shaders);
+        if (CachedPipelineResident(context, masked.has_value() ? *masked : state, vertexInput, described.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, &key) || key.empty()) return {};
+        const auto owner = reinterpret_cast<std::uintptr_t>(context.bufferPool.get());
+        const auto ownerBytes = std::as_bytes(std::span(&owner, 1));
+        key.insert(key.end(), ownerBytes.begin(), ownerBytes.end());
+        completion = std::make_shared<std::promise<void>>();
+        auto ready = completion->get_future().share();
+        if (PrebuildDedupe()) {
+            claim = InflightPrebuilds().Acquire(key, ready);
+            if (!claim.owner) {
+                Splits().pipelinesDeduped.fetch_add(1, std::memory_order_relaxed);
+                Splits().totalPipelinesDeduped.fetch_add(1, std::memory_order_relaxed);
+                return claim.build->ready;
+            }
+        }
+        auto& prebuilds = Prebuilds();
+        {
+            std::lock_guard lock(prebuilds.mutex);
+            if (prebuilds.jobs.size() < MaximumQueuedPipelines) {
+                auto programs = std::make_shared<std::vector<ShaderRecompiler::RecompileResult>>();
+                programs->reserve(shaders.size());
+                auto stages = std::vector<CompiledShader>(shaders.begin(), shaders.end());
+                for (auto& stage : stages) {
+                    programs->push_back(*stage.program);
+                    stage.program = &programs->back();
+                }
+                std::packaged_task<void()> job([context, pipelineState = masked.has_value() ? std::move(*masked) : state,
+                    vertexInput = std::move(vertexInput), described = std::move(described), programs = std::move(programs),
+                    stages = std::move(stages), key, build = claim.build, completion] {
+                    try {
+                        static_cast<void>(CachedPipeline(context, pipelineState, vertexInput, described.View(), stages, VK_IMAGE_LAYOUT_GENERAL, nullptr));
+                    } catch (...) {
+                    }
+                    if (build != nullptr) InflightPrebuilds().Release(key, build);
+                    completion->set_value();
+                });
+                while (prebuilds.threads.size() < PrebuildThreads()) prebuilds.threads.emplace_back([&prebuilds] { runPrebuilds(prebuilds); });
+                prebuilds.jobs.push_back(std::move(job));
+                Splits().pipelinesQueued.fetch_add(1, std::memory_order_relaxed);
+                Splits().totalPipelinesQueued.fetch_add(1, std::memory_order_relaxed);
+                prebuilds.work.notify_one();
+                return ready;
+            }
+        }
+        Splits().pipelinesSkipped.fetch_add(1, std::memory_order_relaxed);
+        Splits().totalPipelinesSkipped.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+    }
+    if (claim.owner) InflightPrebuilds().Release(key, claim.build);
+    if (completion != nullptr) completion->set_value();
+    return {};
+}
+
+void WaitForPreparedPipeline(const PreparedDraw* prepared) {
+    if (prepared == nullptr || !prepared->pipeline.valid()) return;
+    if (prepared->pipeline.wait_for(std::chrono::seconds(0)) == std::future_status::ready) return;
+    const auto start = std::chrono::steady_clock::now();
+    prepared->pipeline.wait();
+    auto& counters = Splits();
+    counters.pipelineWaits.fetch_add(1, std::memory_order_relaxed);
+    counters.pipelineWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }
 
 namespace {

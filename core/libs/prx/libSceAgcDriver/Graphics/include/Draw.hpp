@@ -1,3 +1,4 @@
+#include <future>
 #include <string>
 #include <optional>
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
@@ -44,6 +45,14 @@ struct DrawTraceContext {
 // stamps taken before the preparation (ForgetSerial, the registry generation, the device) are
 // unchanged; otherwise it builds under the lock as before.
 struct PreparedDraw;
+struct PipelinePrebuildCounters {
+    std::uint64_t queued = 0;
+    std::uint64_t deduped = 0;
+    std::uint64_t skipped = 0;
+};
+PipelinePrebuildCounters PipelinePrebuildTotals();
+std::shared_future<void> PrebuildDrawPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders);
+void WaitForPreparedPipeline(const PreparedDraw* prepared);
 bool SplitDrawBuild();
 std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr, const DrawTraceContext* trace = nullptr);
