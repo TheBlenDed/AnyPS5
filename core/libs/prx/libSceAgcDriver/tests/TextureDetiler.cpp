@@ -11,6 +11,14 @@ namespace {
 
 using namespace AgcDriver::Graphics;
 
+thread_local PFN_vkGetDeviceProcAddr detilerDeviceProc = nullptr;
+thread_local std::uint64_t detilerProcLookups = 0;
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL countDetilerDeviceProc(VkDevice device, const char* name) {
+    ++detilerProcLookups;
+    return detilerDeviceProc(device, name);
+}
+
 struct Push {
     std::uint32_t srcBase;
     std::uint32_t dstBase;
@@ -218,4 +226,37 @@ void RunTextureDetilerTests(const Context& context, const TextureDetilerTestAcce
     reject([&] { detiler.Dispatch(commands, TextureTileMode::kStandard4KB, 3, source, 0, destination, 0, layout, 0); }, "unsupported element size");
     reject([&] { detiler.Dispatch(commands, TextureTileMode::kStandard4KB, 4, source, 20, destination, 40, makeLayout(20, 12, 96, 5, 1024, 48), 0); }, "buffer range exceeds device limits");
     reject([&] { detiler.Dispatch(commands, TextureTileMode::kStandard4KB, 4, source, 0, destination, 0, layout, false, 0, false, DetileWindow{48, 48, 0, 0, 0}); }, "window is empty");
+    {
+        auto fallbackContext = context;
+        fallbackContext.functions = nullptr;
+        detilerDeviceProc = context.deviceProc;
+        fallbackContext.deviceProc = &countDetilerDeviceProc;
+        DeviceFunctions functions{};
+        functions.updateDescriptorSets = context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets");
+        functions.cmdBindPipeline = context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
+        functions.cmdBindDescriptorSets = context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets");
+        functions.cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
+        functions.cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
+        auto tableContext = fallbackContext;
+        tableContext.functions = &functions;
+        TextureDetiler fallbackDetiler(fallbackContext);
+        TextureDetiler tableDetiler(tableContext);
+        const auto dispatch = [&](TextureDetiler& target) {
+            target.Dispatch(commands, TextureTileMode::kStandard4KB, 4, source, 20, destination, 40, layout, 0);
+        };
+        dispatch(fallbackDetiler);
+        dispatch(tableDetiler);
+        const auto beforeFallback = detilerProcLookups;
+        dispatch(fallbackDetiler);
+        const auto fallbackLookups = detilerProcLookups - beforeFallback;
+        const auto fallbackCapture = access.lastDispatch();
+        const auto beforeTable = detilerProcLookups;
+        dispatch(tableDetiler);
+        const auto tableLookups = detilerProcLookups - beforeTable;
+        const auto tableCapture = access.lastDispatch();
+        Require(fallbackLookups == tableLookups + 5, "detiler table must avoid five record entry-point lookups");
+        Require(fallbackCapture.pushConstants == tableCapture.pushConstants && fallbackCapture.groupsX == tableCapture.groupsX && fallbackCapture.groupsY == tableCapture.groupsY && fallbackCapture.groupsZ == tableCapture.groupsZ, "detiler table changed dispatch commands");
+        Require(fallbackCapture.sourceBuffer == tableCapture.sourceBuffer && fallbackCapture.destinationBuffer == tableCapture.destinationBuffer && fallbackCapture.sourceOffset == tableCapture.sourceOffset && fallbackCapture.sourceRange == tableCapture.sourceRange && fallbackCapture.destinationOffset == tableCapture.destinationOffset && fallbackCapture.destinationRange == tableCapture.destinationRange, "detiler table changed buffer bindings");
+    }
+
 }
