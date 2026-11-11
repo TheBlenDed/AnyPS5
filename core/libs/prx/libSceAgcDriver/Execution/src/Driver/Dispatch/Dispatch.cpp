@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/LiveSnapshotRetry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/SlowMaterializations.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/KeyMissObserver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -33,6 +34,60 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+bool DispatchKeyMissEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_PROFILE_DISPATCH_KEY_MISSES");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+void NoteDispatchKeyMiss(const DispatchKeyMissObserver::Observation& observation) noexcept {
+    try {
+        struct Reports {
+            std::mutex mutex;
+            DispatchKeyMissObserver observer;
+            std::chrono::steady_clock::time_point last{};
+        };
+        static Reports reports;
+        std::lock_guard lock(reports.mutex);
+        reports.observer.Observe(observation);
+        const auto& totals = reports.observer.Totals();
+        if (totals.total != 1 && totals.total % 256u != 0) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (totals.total != 1 && now - reports.last < std::chrono::seconds(10)) return;
+        reports.last = now;
+        const auto count = [&](DispatchKeyMissObserver::Outcome outcome) {
+            return static_cast<unsigned long long>(totals.outcomes[static_cast<std::size_t>(outcome)]);
+        };
+        AgcDriver::ProfilePrint_nid_no_patch("[dispatch-key-miss] total=%llu no_previous=%llu conservative=%llu unchanged=%llu changed_used=%llu potential_key_churn=%llu overwritten=%llu slots=%zu/64 (cumulative; potential is not a reusable hit)\n",
+            static_cast<unsigned long long>(totals.total), count(DispatchKeyMissObserver::Outcome::NoPrevious),
+            count(DispatchKeyMissObserver::Outcome::Conservative), count(DispatchKeyMissObserver::Outcome::Unchanged),
+            count(DispatchKeyMissObserver::Outcome::Used), count(DispatchKeyMissObserver::Outcome::Potential),
+            static_cast<unsigned long long>(totals.overwritten), reports.observer.Size());
+    } catch (...) {
+    }
+}
+
+struct DispatchKeyMissScope {
+    bool active = false;
+    DispatchKeyMissObserver::Observation observation;
+    ~DispatchKeyMissScope() {
+        if (active) NoteDispatchKeyMiss(observation);
+    }
+    void Finish(const ShaderRecompiler::ResourceCapture& capture, const ShaderRecompiler::RecompileResult& compiled, bool keyHygiene) noexcept {
+        if (!active) return;
+        observation.source = capture.source;
+        observation.pointers[0] = reinterpret_cast<std::uintptr_t>(capture.source.get());
+        const bool complete = keyHygiene && capture.plan != nullptr && capture.snapshot.srtPoison.empty() &&
+            capture.snapshot.nullRootReads == 0 && compiled.poisonedSrtReads == 0 && compiled.imageTableFaults == 0 && compiled.imageTablePoison.empty();
+        observation.mask = DispatchKeyMissObserver::DependencyMask(capture.userDataUse.asBase | capture.userDataUse.asValue,
+            compiled.userDataRegisterReads, observation.wordCount, complete);
+        NoteDispatchKeyMiss(observation);
+        active = false;
+    }
+};
 
 // Whether a compiled compute program binds images or samplers (directly, through image tables, or
 // the bindless heap): such a dispatch of the async compute ring is recorded into the main lane.
@@ -478,6 +533,34 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
+    std::optional<DispatchKeyMissScope> keyMiss;
+    if (DispatchKeyMissObserver::Eligible(DispatchKeyMissEnabled(), submission.queue, indirectArguments != 0,
+        resolving, fromAhead, noDispatchCache, validated)) {
+        auto& scope = keyMiss.emplace();
+        scope.active = true;
+        auto& observation = scope.observation;
+        observation.shader = registeredShader;
+        observation.device = localDevice;
+        observation.pointers[1] = reinterpret_cast<std::uintptr_t>(registeredShader.get());
+        observation.pointers[2] = reinterpret_cast<std::uintptr_t>(localDevice.get());
+        observation.exactKey = key;
+        observation.wordCount = userData.size();
+        if (userData.size() <= observation.words.size()) std::copy(userData.begin(), userData.end(), observation.words.begin());
+        observation.fixed[0] = address;
+        observation.fixed[1] = packet[4] & 0x8000u;
+        for (std::size_t i = 0; i < 3; ++i) observation.fixed[2 + i] = compute.partialThreads[i];
+        observation.fixed[5] = compute.singleWorkgroup;
+        const std::array<std::uint32_t, 5> offsets{0x207u, 0x208u, 0x209u, 0x212u, 0x213u};
+        for (std::size_t i = 0; i < offsets.size(); ++i) {
+            const auto found = queue.shader.find(offsets[i]);
+            observation.fixed[6 + i] = found == queue.shader.end() ? (1ull << 32u) : found->second;
+        }
+        observation.fixed[11] = request.layout.descriptorSet;
+        observation.fixed[12] = request.layout.firstBinding;
+        observation.fixed[13] = request.layout.pushConstantOffsetBytes;
+        observation.fixed[14] = request.layout.pushConstantSizeBytes;
+        observation.fixed[15] = userData.size();
+    }
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     bool missItem = false;
@@ -527,6 +610,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
             CommandMix::NoteMaterialized(*compiledResult, *capture);
+            if (keyMiss) keyMiss->Finish(*capture, *compiledResult, keyHygiene);
             timing.Mark("materialize");
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
