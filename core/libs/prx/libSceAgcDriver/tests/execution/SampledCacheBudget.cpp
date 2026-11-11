@@ -1053,6 +1053,113 @@ void oneOffOwnedProofTests(const Context& context) {
     Memory::EndCollectEpoch();
 }
 
+void oneOffRetentionLruTests(const Context& context) {
+    namespace Memory = AgcDriver::GuestMemory;
+    constexpr std::uint32_t FillSide = 2048;
+    constexpr std::uint32_t SmallSide = 64;
+    WatchedSurface filler(context, std::size_t{FillSide} * FillSide * 4u);
+    WatchedSurface calibration(context);
+    OverrideCacheBudgetForTest(32u * Budget);
+    const auto fillBytes = Sampled(context, filler.Address(), FillSide)->AllocationBytes();
+    const auto smallBytes = Sampled(context, calibration.Address(), SmallSide)->AllocationBytes();
+    const auto mediumBytes = Sampled(context, calibration.Address())->AllocationBytes();
+    ClearCachedTextures(context.device);
+    const auto limit = std::min<std::uint64_t>(64ull << 20u, fillBytes / 32u);
+    const auto capacity = static_cast<std::size_t>(limit / smallBytes);
+    Require(capacity >= 3u && capacity <= 64u && mediumBytes > smallBytes && mediumBytes <= limit,
+        "the LRU fixture cannot exercise its fixed cap and insufficient-victim cases");
+    const auto targetSpan = (capacity + 2u) * SurfaceBytes;
+    WatchedSurface targets(context, targetSpan);
+    Memory::Unwatch(targets.Address(), targetSpan);
+    const auto small = [&](std::size_t index) { return Sampled(context, targets.Address() + index * SurfaceBytes, SmallSide); };
+    const auto* value = std::getenv("APS5_SAMPLED_KEEP_REFUSED_LRU");
+    const bool enabled = value != nullptr && std::strcmp(value, "1") == 0;
+    OverrideCacheBudgetForTest(fillBytes);
+    std::shared_ptr<Texture> fill;
+    const auto seed = [&] {
+        fill.reset();
+        ClearCachedTextures(context.device);
+        Recorder::CountPresent();
+        fill = Sampled(context, filler.Address(), FillSide);
+        Recorder::CountPresent();
+        std::vector<std::weak_ptr<Texture>> held;
+        for (std::size_t index = 0; index < capacity; ++index) held.push_back(small(index));
+        Require(std::all_of(held.begin(), held.end(), [](const auto& texture) { return !texture.expired(); }),
+            "the LRU fixture did not fill its refused retention cap");
+        return held;
+    };
+    auto held = seed();
+    const std::weak_ptr<Texture> protectedRefusal = small(capacity);
+    Require(protectedRefusal.expired() && std::all_of(held.begin(), held.end(), [](const auto& texture) { return !texture.expired(); }),
+        "a full current-present retention set was displaced");
+    Recorder::CountPresent();
+    Require(Sampled(context, filler.Address(), FillSide) == fill && small(0) == held.front().lock(),
+        "refreshing the current-present survivor changed its texture");
+    const auto victim = held[1];
+    std::weak_ptr<Texture> incoming;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        Buffer scratch(context, sizeof(std::uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(recorder.Commands(), scratch.Handle(), 0, sizeof(std::uint32_t), 0x12345678u);
+        recorder.Keep(victim.lock());
+        incoming = small(capacity);
+        Require(!victim.expired(), "replacing a retained reference destroyed recorder-owned work");
+        Require(incoming.expired() != enabled, "the incoming snapshot did not follow the selected replacement policy");
+        Require(!held.front().expired() && TextureCacheUsage().sampledEntries == 1u,
+            "LRU replacement displaced a current-present snapshot or the main cache");
+        recorder.Sync();
+    }
+    Require(victim.expired() == enabled, "LRU admission did not replace the oldest eligible retention owner");
+    const auto live = std::count_if(held.begin(), held.end(), [](const auto& texture) { return !texture.expired(); }) + (!incoming.expired() ? 1u : 0u);
+    Require(static_cast<std::size_t>(live) == capacity, "replacement exceeded or lost the fixed retention cap");
+    auto old = small(capacity);
+    const auto beforeCpu = SampledCacheCounters().made;
+    *reinterpret_cast<std::uint8_t*>(targets.Address() + capacity * SurfaceBytes) ^= 0xffu;
+    auto afterCpu = small(capacity);
+    Require(afterCpu != old && SampledCacheCounters().made == beforeCpu + 1u,
+        "the replacement snapshot survived a CPU content change");
+    old.reset();
+    afterCpu.reset();
+    held = seed();
+    Recorder::CountPresent();
+    Sampled(context, filler.Address(), FillSide);
+    for (std::size_t index = 1; index < capacity; ++index) small(index);
+    const auto insufficientVictim = held.front();
+    const std::weak_ptr<Texture> insufficient = Sampled(context, targets.Address() + capacity * SurfaceBytes);
+    Require(insufficient.expired() && !insufficientVictim.expired() &&
+        std::all_of(held.begin(), held.end(), [](const auto& texture) { return !texture.expired(); }),
+        "an unsuccessful replacement partially evicted existing owners");
+    held = seed();
+    Recorder::CountPresent();
+    Sampled(context, filler.Address(), FillSide);
+    const auto address = targets.Address() + capacity * SurfaceBytes;
+    auto beforeGpu = small(capacity);
+    const auto madeBeforeGpu = SampledCacheCounters().made;
+    const auto* imported = HostImportFor(context, address, SurfaceBytes);
+    Require(imported != nullptr, "the GPU freshness fixture requires an actual host import");
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, imported->buffer, HostImportOffset(*imported, address), sizeof(std::uint32_t), 0xa5a5a5a5u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.NotePendingWrite(address, sizeof(std::uint32_t));
+        recorder.OnComplete([address] { Memory::MarkWritten(address, sizeof(std::uint32_t)); });
+        recorder.Sync();
+    }
+    std::uint32_t written = 0;
+    std::memcpy(&written, reinterpret_cast<const void*>(address), sizeof(written));
+    Require(written == 0xa5a5a5a5u, "the GPU did not modify the retained snapshot's guest source");
+    Require(small(capacity) != beforeGpu && SampledCacheCounters().made == madeBeforeGpu + 1u,
+        "the replacement snapshot survived a tracked GPU content change");
+    beforeGpu.reset();
+    ClearCachedTextures(context.device);
+    fill.reset();
+    OverrideCacheBudgetForTest(0);
+}
+
 void oneOffRetentionTests(const Context& context) {
     namespace Memory = AgcDriver::GuestMemory;
     constexpr std::uint32_t FillSide = 1024;
@@ -1980,6 +2087,12 @@ int main(int argc, char** argv) {
         TextureDetiler detiler(context);
         context.detiler = &detiler;
 #ifdef _WIN32
+        if (mode == "one-off-retention-lru") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            oneOffRetentionLruTests(context);
+            std::puts("sampled refused snapshot LRU admission tests passed");
+            return 0;
+        }
         if (mode == "one-off-retention") {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             oneOffRetentionTests(context);

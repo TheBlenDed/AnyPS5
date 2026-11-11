@@ -696,7 +696,31 @@ void tryKeepRefused(TextureCache& cache, const TextureKey& key, const std::share
     const auto present = Recorder::Presents();
     const auto limit = refusedKeepLimit(budgets);
     const auto allocation = texture->AllocationBytes();
-    if (present == 0 || allocation == 0 || allocation > limit || cache.refusedKept > limit - allocation || residentSampledBytes() > budgets.share) return;
+    if (present == 0 || allocation == 0 || allocation > limit || residentSampledBytes() > budgets.share) return;
+    if (cache.refusedKept > limit - allocation) {
+        static const bool replace = [] {
+            const auto* value = std::getenv("APS5_SAMPLED_KEEP_REFUSED_LRU");
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }();
+        if (!replace) return;
+        const auto needed = cache.refusedKept - (limit - allocation);
+        std::uint64_t available = 0;
+        for (auto it = cache.refusedLru.rbegin(); it != cache.refusedLru.rend() && available < needed; ++it) {
+            const auto& victim = cache.oneOffs.at(*it);
+            if (victim.keptPresent >= present) break;
+            if (it->device == key.device) available += victim.kept->AllocationBytes();
+        }
+        if (available < needed) return;
+        for (auto it = cache.refusedLru.end(); cache.refusedKept > limit - allocation;) {
+            const auto current = std::prev(it);
+            auto& victim = cache.oneOffs.at(*current);
+            it = current;
+            if (current->device == key.device) {
+                it = std::next(current);
+                unkeepRefused(cache, victim);
+            }
+        }
+    }
     oneOff.lru = cache.refusedLru.insert(cache.refusedLru.begin(), key);
     oneOff.kept = texture;
     oneOff.keptPresent = present;
