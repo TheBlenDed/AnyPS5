@@ -562,7 +562,7 @@ public:
     // completions run under it, so other queues do not queue behind a CPU read's wait. Inside a
     // batch's completion action no wait is made at all: every batch still in flight was recorded
     // after the completing one, and its store is that batch's in-order write (see Recorder.cpp).
-    void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false, bool bdaBaseWrite = false);
+    void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false, bool bdaBaseWrite = false, bool completeProof = false, int caller = -1);
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
@@ -752,6 +752,8 @@ public:
     // return address of the Sync/SyncThrough call itself is taken, so an unannounced sync still
     // names its real caller.
     static void CountSync(int source, const void* site = nullptr);
+    static void CountLockedCallerWait(int caller, int depth, double ms);
+    static void CountCallerUnlocked(int caller, std::uint64_t waits, std::uint64_t rewaits);
     // Names only the site for the sync or drain this thread makes next (its source stays as
     // announced, or as the drain counts it): for a wrapper (VulkanDevice::ReapRecorded) whose
     // FinishUpTo counts the drain itself, so a CountSync there would count it twice.
@@ -1152,7 +1154,7 @@ private:
     // The unlocked wait of SyncThrough(waitUnlocked): the target batch (submitting the open one when
     // it is the target), the timeline wait with the mutex released, then the completions up to it.
     // Returns false when the locked path must run instead (no timeline, nested acquisition, off).
-    bool syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site);
+    bool syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site, bool completeProof, int caller);
     struct BdaWaitTrace;
     void syncFull(const void* caller, BdaWaitTrace* bdaWait);
     // `source` is the CountSync source the wait is attributed to.

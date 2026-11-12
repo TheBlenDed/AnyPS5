@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -7,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -27,18 +29,21 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -498,6 +503,343 @@ void PendingSnapshotWrite(Scene& scene) {
     Require(scene.Color() == 255 && scene.Stored() == Bits(One), "address draw reuse: the draw after the captured pointer was restored did not read the guest value");
 }
 
+class FreshnessGate {
+public:
+    explicit FreshnessGate(AgcDriver::VulkanDevice& device) : device(device), context(AgcDriver::VulkanDeviceTestAccess::ContextOf(device)) {
+        const auto create = context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore");
+        destroy = context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore");
+        signal = reinterpret_cast<PFN_vkSignalSemaphore>(context.deviceProc(context.device, "vkSignalSemaphoreKHR"));
+        if (signal == nullptr) signal = reinterpret_cast<PFN_vkSignalSemaphore>(context.deviceProc(context.device, "vkSignalSemaphore"));
+        Require(signal != nullptr, "freshness unlock: cannot resolve vkSignalSemaphore");
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        const VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        Require(create(device.Device(), &info, nullptr, &semaphore) == VK_SUCCESS, "freshness unlock: cannot create the writer gate");
+    }
+
+    ~FreshnessGate() {
+        Release();
+        try {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            device.WaitIdle();
+        } catch (...) {
+        }
+        destroy(device.Device(), semaphore, nullptr);
+    }
+
+    void Arm(AgcDriver::Graphics::Recorder& recorder) {
+        recorder.Commands();
+        recorder.HoldNextSubmit(semaphore, 1);
+    }
+
+    VkResult Release() {
+        std::lock_guard guard(mutex);
+        if (released) return result;
+        released = true;
+        VkSemaphoreSignalInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        info.semaphore = semaphore;
+        info.value = 1;
+        result = signal(device.Device(), &info);
+        signaled.store(result == VK_SUCCESS);
+        return result;
+    }
+
+    bool Signaled() const { return signaled.load(); }
+
+private:
+    AgcDriver::VulkanDevice& device;
+    AgcDriver::Graphics::Context context;
+    PFN_vkDestroySemaphore destroy = nullptr;
+    PFN_vkSignalSemaphore signal = nullptr;
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    std::mutex mutex;
+    bool released = false;
+    std::atomic<bool> signaled{false};
+    VkResult result = VK_NOT_READY;
+};
+
+void FreshnessUnlock(Scene& scene) {
+    using AgcDriver::Graphics::Recorder;
+    constexpr std::size_t RewrittenOffset = 32;
+    const bool expectsUnlocked = std::getenv("APS5_SNAPSHOT_FRESHNESS_UNLOCKED") != nullptr;
+    const std::array<std::uint64_t, 1> captured{scene.guest.Address(ValueOffset)};
+    const std::array<AgcDriver::Graphics::GuestMemorySnapshot, 3> snapshots{{
+        scene.snapshots[0],
+        scene.snapshots[1],
+        {scene.guest.Address(PointerOffset), std::as_bytes(std::span(captured))},
+    }};
+    const AgcDriver::Pm4::DrawParameters parameters{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    const auto draw = [&] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        scene.device.Draw(scene.state, parameters, scene.shaders, snapshots);
+    };
+    Scene::Store(scene.guest, RewrittenOffset, Zero);
+    scene.Point(scene.guest.Address(ValueOffset));
+    for (int warm = 0; warm < 2; ++warm) {
+        draw();
+        scene.Wait();
+    }
+    Require(scene.Color() == 255, "freshness unlock: the warm draw with a captured pointer did not read the guest value");
+    const auto writer = scene.guest.Address(PointerOffset);
+    const auto rewritten = scene.guest.Address(RewrittenOffset);
+    const auto restore = scene.guest.Address(ValueOffset);
+    const std::array<std::uint32_t, 4> pendingPattern{static_cast<std::uint32_t>(rewritten), static_cast<std::uint32_t>(rewritten >> 32u), 0u, 0u};
+    const std::array<std::uint32_t, 4> peerPattern{static_cast<std::uint32_t>(restore), static_cast<std::uint32_t>(restore >> 32u), 0u, 0u};
+    const auto before = AgcDriver::Graphics::AddressReuseCounters();
+    FreshnessGate gate(scene.device);
+    std::atomic<bool> peerAcquired{false};
+    std::atomic<bool> peerRecorded{false};
+    std::atomic<bool> drawStarted{false};
+    std::uint64_t gated = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "freshness unlock: the device has no active recorder");
+        gate.Arm(*recorder);
+        Require(scene.device.FillBuffer(writer, 16, pendingPattern), "freshness unlock: the pending snapshot write was not recorded");
+        scene.device.SubmitRecorded(true);
+        const auto pending = recorder->DescribePendingWrite(writer, 16);
+        Require(pending.has_value() && !pending->signaled, "freshness unlock: the gated snapshot write was not submitted and unsignaled");
+        gated = pending->serial;
+        printf("[freshness-unlock] armed gated writer 0x%llx 16 bytes serial %llu\n", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(writer)), static_cast<unsigned long long>(gated));
+    }
+    std::exception_ptr peerError;
+    std::jthread peer([&](std::stop_token stop) {
+        try {
+        std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4000);
+        while (!stop.stop_requested() && !gate.Signaled() && std::chrono::steady_clock::now() < deadline) {
+            if (lock.try_lock()) {
+                if (drawStarted && !gate.Signaled()) break;
+                lock.unlock();
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        peerAcquired = lock.owns_lock() && drawStarted && !gate.Signaled();
+        if (peerAcquired) {
+            peerRecorded = scene.device.FillBuffer(writer, 16, peerPattern);
+            scene.device.SubmitRecorded(true);
+            gate.Release();
+        }
+        } catch (...) {
+            peerError = std::current_exception();
+            gate.Release();
+        }
+    });
+    std::jthread watchdog([&](std::stop_token stop) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::getenv("APS5_FRESHNESS_WATCHDOG_MS") != nullptr ? std::atoi(std::getenv("APS5_FRESHNESS_WATCHDOG_MS")) : 3000);
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline && !gate.Signaled()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        gate.Release();
+    });
+    const bool captureTrace = std::getenv("APS5_Q51_TEST_CAPTURE") != nullptr;
+    if (captureTrace) AgcDriver::PerformanceTrace::Present(1, 1, &scene.device);
+    drawStarted.store(true);
+    const auto drawStart = std::chrono::steady_clock::now();
+    draw();
+    const auto drawMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drawStart).count();
+    if (captureTrace) AgcDriver::PerformanceTrace::Present(1, 1, &scene.device);
+    peer.join();
+    watchdog.request_stop();
+    watchdog.join();
+    if (peerError) std::rethrow_exception(peerError);
+    const auto afterPeer = AgcDriver::Graphics::AddressReuseCounters();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "freshness unlock: the recorder went away during the draw");
+        const auto remaining = recorder->DescribePendingWrite(writer, 16);
+        Require(!remaining.has_value() || remaining->serial != gated, "freshness unlock: the gated writer batch " + std::to_string(gated) + " is still in flight after the draw");
+    }
+    const auto color = scene.Color();
+    printf("[freshness-unlock] %s: gated writer %llu, peer %s the protected interval, color %u\n", expectsUnlocked ? "unlocked caller" : "locked caller", static_cast<unsigned long long>(gated), peerAcquired ? "entered" : "could not enter", color);
+    printf("[freshness-unlock] probe: draw %.1f ms, gate %s at return, peer acquired %d, recorded %d\n", drawMs, gate.Signaled() ? "signaled" : "held", peerAcquired.load() ? 1 : 0, peerRecorded.load() ? 1 : 0);
+    if (expectsUnlocked) {
+        Require(peerRecorded, "freshness unlock: the peer recorded no second writer during the released window");
+        Require(color == 255, "freshness unlock: the reuse proof did not see the writer recorded during the released window (color " + std::to_string(color) + ")");
+    } else {
+        Require(!peerAcquired, "freshness unlock: the peer entered the protected interval while the locked freshness wait held the GPU mutex");
+        Require(color == 0, "freshness unlock: the locked proof did not refuse the gated writer (color " + std::to_string(color) + ")");
+    }
+    Require(Refusals(afterPeer) >= Refusals(before), "freshness unlock: the reuse proof counters went backwards");
+    scene.Point(scene.guest.Address(ValueOffset));
+    scene.Clear();
+    scene.Draw();
+}
+
+void FreshnessMultiSnapshot(Scene& scene) {
+    using AgcDriver::Graphics::Recorder;
+    constexpr std::size_t SecondOffset = 64;
+    constexpr std::size_t SpareOffset = 128;
+    const bool expectsUnlocked = std::getenv("APS5_SNAPSHOT_FRESHNESS_UNLOCKED") != nullptr;
+    const std::array<std::uint64_t, 1> captured{scene.guest.Address(ValueOffset)};
+    std::array<std::uint8_t, 16> secondBytes{};
+    std::memcpy(secondBytes.data(), scene.guest.Data() + SecondOffset, secondBytes.size());
+    std::array<std::uint8_t, 8> spareBytes{};
+    std::memcpy(spareBytes.data(), scene.guest.Data() + SpareOffset, spareBytes.size());
+    const std::array<AgcDriver::Graphics::GuestMemorySnapshot, 5> snapshots{{
+        scene.snapshots[0],
+        scene.snapshots[1],
+        {scene.guest.Address(PointerOffset), std::as_bytes(std::span(captured))},
+        {scene.guest.Address(SecondOffset), std::as_bytes(std::span(secondBytes))},
+        {scene.guest.Address(SpareOffset), std::as_bytes(std::span(spareBytes))},
+    }};
+    const AgcDriver::Pm4::DrawParameters parameters{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    const auto draw = [&] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        scene.device.Draw(scene.state, parameters, scene.shaders, snapshots);
+    };
+    scene.Point(scene.guest.Address(ValueOffset));
+    Scene::Store(scene.guest, ValueOffset, One);
+    for (int warm = 0; warm < 2; ++warm) {
+        draw();
+        scene.Wait();
+    }
+    Require(scene.Color() == 255, "freshness multi: the warm multi-snapshot draw did not read the guest value");
+    const auto writer = scene.guest.Address(PointerOffset);
+    const auto second = scene.guest.Address(SecondOffset);
+    const auto rewritten = scene.guest.Address(32);
+    const auto restore = scene.guest.Address(ValueOffset);
+    const std::array<std::uint32_t, 4> pendingPattern{static_cast<std::uint32_t>(rewritten), static_cast<std::uint32_t>(rewritten >> 32u), 0u, 0u};
+    const std::array<std::uint32_t, 4> peerPattern{static_cast<std::uint32_t>(restore), static_cast<std::uint32_t>(restore >> 32u), 0u, 0u};
+    const std::array<std::uint32_t, 4> markerPattern{0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au, 0x5a5a5a5au};
+    const std::array<std::uint32_t, 4> zeroPattern{0u, 0u, 0u, 0u};
+    const auto before = AgcDriver::Graphics::AddressReuseCounters();
+    FreshnessGate gate(scene.device);
+    std::atomic<bool> peerAcquired{false};
+    std::atomic<bool> peerRecorded{false};
+    std::atomic<bool> drawStarted{false};
+    std::uint64_t gated = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "freshness multi: the device has no active recorder");
+        gate.Arm(*recorder);
+        Require(scene.device.FillBuffer(writer, 16, pendingPattern), "freshness multi: the pointer write was not recorded");
+        Require(scene.device.FillBuffer(second, 16, markerPattern), "freshness multi: the second snapshot write was not recorded");
+        scene.device.SubmitRecorded(true);
+        const auto pendingPointer = recorder->DescribePendingWrite(writer, 16);
+        const auto pendingSecond = recorder->DescribePendingWrite(second, 16);
+        Require(pendingPointer.has_value() && !pendingPointer->signaled && pendingSecond.has_value() && !pendingSecond->signaled, "freshness multi: the gated writes were not submitted and unsignaled");
+        gated = pendingPointer->serial;
+        printf("[freshness-multi] armed %zu snapshots, gated pointer 0x%llx serial %llu and second 0x%llx serial %llu\n", snapshots.size(), static_cast<unsigned long long>(writer), static_cast<unsigned long long>(gated), static_cast<unsigned long long>(second), static_cast<unsigned long long>(pendingSecond->serial));
+    }
+    std::exception_ptr peerError;
+    std::jthread peer([&](std::stop_token stop) {
+        try {
+        std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4000);
+        while (!stop.stop_requested() && !gate.Signaled() && std::chrono::steady_clock::now() < deadline) {
+            if (lock.try_lock()) {
+                if (drawStarted && !gate.Signaled()) break;
+                lock.unlock();
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        peerAcquired = lock.owns_lock() && drawStarted && !gate.Signaled();
+        if (peerAcquired) {
+            peerRecorded = scene.device.FillBuffer(writer, 16, peerPattern) && scene.device.FillBuffer(second, 16, zeroPattern);
+            scene.device.SubmitRecorded(true);
+            gate.Release();
+        }
+        } catch (...) {
+            peerError = std::current_exception();
+            gate.Release();
+        }
+    });
+    std::jthread watchdog([&](std::stop_token stop) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::getenv("APS5_FRESHNESS_WATCHDOG_MS") != nullptr ? std::atoi(std::getenv("APS5_FRESHNESS_WATCHDOG_MS")) : 3000);
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline && !gate.Signaled()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        gate.Release();
+    });
+    drawStarted.store(true);
+    const auto drawStart = std::chrono::steady_clock::now();
+    draw();
+    const auto drawMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drawStart).count();
+    peer.join();
+    watchdog.request_stop();
+    watchdog.join();
+    if (peerError) std::rethrow_exception(peerError);
+    const auto afterPeer = AgcDriver::Graphics::AddressReuseCounters();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "freshness multi: the recorder went away during the draw");
+        const auto remaining = recorder->DescribePendingWrite(writer, 16);
+        Require(!remaining.has_value() || remaining->serial != gated, "freshness multi: the gated batch " + std::to_string(gated) + " is still in flight after the draw");
+    }
+    std::uint32_t secondValue = 0;
+    std::memcpy(&secondValue, scene.guest.Data() + SecondOffset, sizeof(secondValue));
+    std::uint64_t spareValue = 0;
+    std::memcpy(&spareValue, scene.guest.Data() + SpareOffset, sizeof(spareValue));
+    const auto color = scene.Color();
+    printf("[freshness-multi] %s: gated batch %llu, peer %s, color %u, second snapshot dword 0x%08x, spare snapshot 0x%llx, draw %.1f ms\n", expectsUnlocked ? "unlock env on" : "unlock env off", static_cast<unsigned long long>(gated), peerAcquired ? "entered" : "could not enter", color, secondValue, static_cast<unsigned long long>(spareValue), drawMs);
+    if (expectsUnlocked) {
+        Require(peerRecorded, "freshness multi: the peer recorded no second writer during the released window");
+        Require(color == 255, "freshness multi: the multi-snapshot reuse proof did not see the writer recorded during the released window (color " + std::to_string(color) + ")");
+        Require(secondValue == 0, "freshness multi: the second gated snapshot range was not restored by the peer's newer write (" + std::to_string(secondValue) + ")");
+    } else {
+        Require(!peerAcquired, "freshness multi: the peer entered the protected interval while the locked freshness wait held the GPU mutex");
+        Require(color == 0, "freshness multi: the locked multi-snapshot proof did not refuse the gated writes (color " + std::to_string(color) + ")");
+        Require(secondValue == 0x5a5a5a5au, "freshness multi: the second gated snapshot write did not land in the locked arm (" + std::to_string(secondValue) + ")");
+    }
+    Require(spareValue == 0, "freshness multi: an untouched snapshot range changed during the freshness wait");
+    Require(Refusals(afterPeer) >= Refusals(before), "freshness multi: the reuse proof counters went backwards");
+    std::memset(scene.guest.Data() + SecondOffset, 0, 16);
+    std::memset(scene.guest.Data() + SpareOffset, 0, 8);
+    scene.Point(scene.guest.Address(ValueOffset));
+    Scene::Store(scene.guest, ValueOffset, One);
+    scene.Clear();
+    scene.Draw();
+}
+
+void FreshnessCpcw(Scene& scene) {
+    const bool expectsUnlocked = std::getenv("APS5_SNAPSHOT_FRESHNESS_UNLOCKED") != nullptr;
+    const AgcDriver::Pm4::DrawParameters parameters{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    scene.Point(scene.guest.Address(ValueOffset));
+    Scene::Store(scene.guest, ValueOffset, One);
+    scene.Clear();
+    scene.Draw();
+    scene.Wait();
+    Require(scene.Color() == 255, "freshness cpcw: the warm draw did not read the guest value");
+    const std::array<std::uint32_t, 4> pattern{Bits(One), 0u, 0u, 0u};
+    const auto before = AgcDriver::Graphics::AddressReuseCounters();
+    const bool captureTrace = std::getenv("APS5_Q51_TEST_CAPTURE") != nullptr;
+    if (captureTrace) AgcDriver::PerformanceTrace::Present(1, 1, &scene.device);
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(scene.device.FillBuffer(scene.guest.Address(32), 16, pattern), "freshness cpcw: the pending guest fill was not recorded");
+        Scene::Store(scene.guest, ValueOffset, Zero);
+        scene.device.SubmitRecorded(true);
+        scene.device.Draw(scene.state, parameters, scene.shaders, scene.snapshots);
+    }
+    if (captureTrace) AgcDriver::PerformanceTrace::Present(1, 1, &scene.device);
+    const auto color = scene.Color();
+    const auto after = AgcDriver::Graphics::AddressReuseCounters();
+    const auto reused = Counted(after, AgcDriver::Graphics::AddressReuse::Reused) - Counted(before, AgcDriver::Graphics::AddressReuse::Reused);
+    const auto refusals = Refusals(after) - Refusals(before);
+    printf("[freshness-cpcw] %s: pending guest fill plus a guest write, draw color %u, %llu reuses, %llu refusals, %llu proofs\n", expectsUnlocked ? "unlock env on" : "unlock env off", color, static_cast<unsigned long long>(reused), static_cast<unsigned long long>(refusals), static_cast<unsigned long long>(after.proofs - before.proofs));
+    Require(color == 0, "freshness cpcw: the draw after a guest write rendered the stale value");
+    Require(reused == 1 && refusals == 0, "freshness cpcw: the draw after a guest write was not one reuse with no refusal (" + std::to_string(reused) + " reuses, " + std::to_string(refusals) + " refusals)");
+    Scene::Store(scene.guest, ValueOffset, One);
+    scene.Clear();
+    scene.Draw();
+    Require(scene.Color() == 255, "freshness cpcw: the draw after the guest value was restored did not read it");
+}
+
+void TemplateProbe(Scene& scene) {
+    using AgcDriver::Graphics::ShaderResources;
+    const auto before = ShaderResources::TemplateOutcomes();
+    scene.Draw();
+    scene.Wait();
+    const auto after = ShaderResources::TemplateOutcomes();
+    std::printf("[hardening-templates] one address draw recorded:");
+    for (std::size_t index = 0; index < after.size(); ++index) {
+        if (after[index] == before[index]) continue;
+        std::printf(" %s %llu;", ShaderResources::TemplateOutcomeName(static_cast<ShaderResources::TemplateOutcome>(index)), static_cast<unsigned long long>(after[index] - before[index]));
+    }
+    std::printf("\n");
+}
+
 void Fault(Scene& scene) {
     void* reserved = nullptr;
 #ifdef _WIN32
@@ -784,6 +1126,10 @@ int main(int argc, char** argv) {
                 ReuseCounters(scene);
                 GuestWrite(scene);
                 PendingSnapshotWrite(scene);
+                FreshnessUnlock(scene);
+                FreshnessMultiSnapshot(scene);
+                FreshnessCpcw(scene);
+                TemplateProbe(scene);
                 Fault(scene);
                 Remap(scene);
                 scene.Wait();

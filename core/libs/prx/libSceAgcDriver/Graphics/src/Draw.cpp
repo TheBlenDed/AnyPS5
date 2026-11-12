@@ -2306,18 +2306,18 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         } else if (ahead != nullptr && !ahead->contentKey.empty() && trimKey) {
             resolved.contentKey = ahead->contentKey;
         } else {
-            resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+            { PerformanceTimer trace("Q51.resource_key"); resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey); }
         }
-        auto cached = SharedResourceCache().Find(resolved.contentKey);
-        const bool inUse = cached != nullptr && cached->InUse() && !cached->SharesUses();
+        auto cached = [&] { PerformanceTimer trace("Q51.cache_find"); return SharedResourceCache().Find(resolved.contentKey); }();
+        const bool inUse = [&] { PerformanceTimer trace("Q51.in_use"); return cached != nullptr && cached->InUse() && !cached->SharesUses(); }();
         if (inUse) CountAddressReuse(AddressReuse::InUse);
         if (cached != nullptr && !inUse) {
             const bool addressBased = cached->ReusesAddressSpace();
             const auto proofStart = addressBased && timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const bool valid = cached->Revalidate(shaders, nullptr, snapshots);
+            const bool valid = [&] { PerformanceTimer trace("Q51.revalidate"); return cached->Revalidate(shaders, nullptr, snapshots); }();
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            if (valid && recorder != nullptr) { PerformanceTimer trace("Q51.moved_buffers"); moved = cached->MovedReadOnlyBuffers(shaders, *recorder); }
             if (moved.has_value()) {
                 resolved.resources = std::move(cached);
                 resolved.use.resources = resolved.resources;

@@ -5011,7 +5011,9 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                             leaseEnd = end > top - block ? end : (end + block - 1) / block * block;
                         }
                         Recorder::CountSync(source);
+                        const auto flushSiteStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                         wait = recorder->FinishWritersByLane(stored, leaseBegin, leaseEnd);
+                        if (profiled) Recorder::CountLockedCallerWait(2, GuestMemory::GpuMutex().DepthOnThisThread(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - flushSiteStart).count());
                         if (FlushLaneWaitVerified() && recorder->WritersPendingOver(stored, leaseBegin, leaseEnd)) {
                             char message[256];
                             std::snprintf(message, sizeof(message), "AGC graphics: a lane-targeted flush wait for 0x%llx+0x%llx (%s) left a batch that writes or leases the stored range unfinished", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), reason != nullptr ? reason : "?");
@@ -5233,7 +5235,10 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
     if (last <= first) return;
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr, "a write-back's saved guest bytes are pending without a recorder");
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto syncStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     recorder->SyncThrough(first, static_cast<std::size_t>(last - first));
+    if (profile) Recorder::CountLockedCallerWait(1, GuestMemory::GpuMutex().DepthOnThisThread(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - syncStart).count());
     const auto outstanding = [&] {
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (savedTicket[unit] != 0 && (layers == nullptr || (*layers)[unit])) return true;

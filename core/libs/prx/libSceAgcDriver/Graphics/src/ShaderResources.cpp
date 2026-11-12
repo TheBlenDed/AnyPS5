@@ -4935,10 +4935,15 @@ bool BdaTemplatesOn() {
 void CompleteSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion()) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool unlocked = std::getenv("APS5_SNAPSHOT_FRESHNESS_UNLOCKED") != nullptr;
     for (const auto& snapshot : snapshots) {
-        if (snapshot.bytes.empty() || !recorder->PendingWriteOverlaps(snapshot.address, snapshot.bytes.size())) continue;
+        bool overlaps = false;
+        { PerformanceTimer trace("Q51.csw.overlap"); overlaps = !snapshot.bytes.empty() && recorder->PendingWriteOverlaps(snapshot.address, snapshot.bytes.size()); }
+        if (!overlaps) continue;
         Recorder::CountSync(4);
-        recorder->SyncThrough(snapshot.address, snapshot.bytes.size());
+        if (profile) std::fprintf(stderr, "[complete-snapshot-writes] sync 0x%llx %llu depth %d\n", static_cast<unsigned long long>(snapshot.address), static_cast<unsigned long long>(snapshot.bytes.size()), GuestMemory::GpuMutex().DepthOnThisThread());
+        { PerformanceTimer trace("Q51.csw.sync"); if (unlocked) recorder->SyncThrough(snapshot.address, snapshot.bytes.size(), true, false, true); else recorder->SyncThrough(snapshot.address, snapshot.bytes.size()); }
     }
 }
 
@@ -5959,7 +5964,11 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !PendingCpuWritesOverlap(context, *recorder, address, bytes)) return false;
     Recorder::CountSync(4);
-    recorder->SyncThrough(address, bytes, false, bdaBaseWrite);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool unlocked = std::getenv("APS5_CPCW_FRESHNESS_UNLOCKED") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (unlocked) recorder->SyncThrough(address, bytes, true, bdaBaseWrite, true, 0); else recorder->SyncThrough(address, bytes, false, bdaBaseWrite);
+    if (profile) Recorder::CountLockedCallerWait(0, GuestMemory::GpuMutex().DepthOnThisThread(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
     return true;
 }
 
@@ -5980,8 +5989,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (bdaTemplate && !BdaTemplatesOn()) return refuse(AddressReuse::NotReusable);
     if (!shared && InUse()) return refuse(AddressReuse::InUse);
     if (!bdaTemplate) {
-        CompleteSnapshotWrites(snapshots);
-        if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+        { PerformanceTimer trace("Q51.rev.complete_snapshot_writes"); CompleteSnapshotWrites(snapshots); }
+        { PerformanceTimer trace("Q51.rev.same_snapshots"); if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots); }
     }
     struct Suspend {
         GuestBufferMemory& memory;
@@ -5991,16 +6000,17 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     } suspend{guestMemory};
     try {
-        if (!guestMemory.ResumeSpace()) return refuse(AddressReuse::Space);
+        { PerformanceTimer trace("Q51.rev.resume_space"); if (!guestMemory.ResumeSpace()) return refuse(AddressReuse::Space); }
         if (bdaTemplate) {
-            CompleteSnapshotWrites(snapshots);
-            if (!guestMemory.SnapshotsServed(snapshots)) return refuse(AddressReuse::Snapshots);
+            { PerformanceTimer trace("Q51.rev.complete_snapshot_writes_bda"); CompleteSnapshotWrites(snapshots); }
+            { PerformanceTimer trace("Q51.rev.snapshots_served"); if (!guestMemory.SnapshotsServed(snapshots)) return refuse(AddressReuse::Snapshots); }
         }
-        if (!proveBuild(shaders, &outcome)) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof);
+        { PerformanceTimer trace("Q51.rev.prove_build"); if (!proveBuild(shaders, &outcome)) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof); }
+        { PerformanceTimer trace("Q51.rev.space_imports_current");
         if (!guestMemory.SpaceImportsCurrent()) {
             outcome.failure = ProofFailure::Imports;
             return refuse(AddressReuse::Imports);
-        }
+        } }
     } catch (const std::exception&) {
         outcome.failure = ProofFailure::Other;
         return refuse(AddressReuse::Threw);
@@ -6064,19 +6074,22 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    { PerformanceTimer trace("Q51.rev.cpcw_direct_regions");
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    }
+    } }
+    { PerformanceTimer trace("Q51.rev.cpcw_described_ranges");
     for (const auto& range : describedRanges) {
         if (!range.imageTable) RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
         if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
-    }
+    } }
+    { PerformanceTimer trace("Q51.rev.cpcw_storage_textures");
     for (const auto& image : storageTextures) {
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
-    }
+    } }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -6177,7 +6190,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    bool fast = false;
+    { PerformanceTimer trace("Q51.rev.fast_revalidate"); fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted); }
     {
         static const bool verifyUntracked = std::getenv("APS5_VERIFY_UNTRACKED_PROOFS") != nullptr;
         const bool anyUntracked = std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const ValidatedSurface& surface) { return surface.untracked[0] != 0; }) || std::any_of(storageUntracked.begin(), storageUntracked.end(), [](const auto& stamp) { return stamp[0] != 0; });
