@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -105,6 +107,80 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     }
 }
 
+namespace {
+
+enum class WaitDiagReason : std::uint32_t {
+    ValueSatisfied, CpuStore, LabelTakenTable, LabelTakenPending, WritesSettled
+};
+
+enum class WaitDiagAction : std::uint32_t {
+    None, OpenWriteSubmitted, LabelDueSubmitted, Reaped, WritesFlushed
+};
+
+const char* WaitDiagReasonName(WaitDiagReason reason) {
+    switch (reason) {
+        case WaitDiagReason::ValueSatisfied: return "value_satisfied";
+        case WaitDiagReason::CpuStore: return "cpu_store";
+        case WaitDiagReason::LabelTakenTable: return "label_taken_table";
+        case WaitDiagReason::LabelTakenPending: return "label_taken_pending";
+        case WaitDiagReason::WritesSettled: return "writes_settled";
+    }
+    return "unknown";
+}
+
+const char* WaitDiagActionName(WaitDiagAction action) {
+    switch (action) {
+        case WaitDiagAction::None: return "none";
+        case WaitDiagAction::OpenWriteSubmitted: return "open_write_submitted";
+        case WaitDiagAction::LabelDueSubmitted: return "label_due_submitted";
+        case WaitDiagAction::Reaped: return "reaped";
+        case WaitDiagAction::WritesFlushed: return "gpu_writes_flushed";
+    }
+    return "unknown";
+}
+
+bool waitDiagEnabled() {
+    static const bool enabled = std::getenv("APS5_WAIT_TRACE") != nullptr;
+    return enabled;
+}
+
+struct WaitDiagLane {
+    std::atomic<std::uint64_t> waits{0}, over5ms{0}, blockedUs{0}, maxUs{0};
+};
+
+std::array<WaitDiagLane, 65>& waitDiagLanes() {
+    static std::array<WaitDiagLane, 65> lanes{};
+    return lanes;
+}
+
+std::atomic<std::int64_t>& waitDiagNextReportNs() {
+    static std::atomic<std::int64_t> next{0};
+    return next;
+}
+
+void reportWaitDiagLanes() {
+    const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto next = waitDiagNextReportNs().load(std::memory_order_relaxed);
+    if (next != 0 && nowNs < next) return;
+    if (!waitDiagNextReportNs().compare_exchange_strong(next, nowNs + std::int64_t{10} * 1000 * 1000 * 1000)) return;
+    if (next == 0) return;
+    auto& lanes = waitDiagLanes();
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        const auto waits = lanes[i].waits.exchange(0, std::memory_order_relaxed);
+        const auto over = lanes[i].over5ms.exchange(0, std::memory_order_relaxed);
+        const auto blockedUs = lanes[i].blockedUs.exchange(0, std::memory_order_relaxed);
+        const auto maxUs = lanes[i].maxUs.exchange(0, std::memory_order_relaxed);
+        if (waits == 0) continue;
+        char name[8];
+        if (i + 1 == lanes.size()) std::snprintf(name, sizeof(name), "other");
+        else std::snprintf(name, sizeof(name), "0x%x", static_cast<unsigned>(i));
+        AgcDriver::ProfilePrint_nid_no_patch("[waitdiag] queue %s (10 s): waitdiag_waits %llu, waitdiag_over5ms %llu, waitdiag_blocked_ms %.1f, waitdiag_max_ms %.1f\n", name,
+                                             static_cast<unsigned long long>(waits), static_cast<unsigned long long>(over), static_cast<double>(blockedUs) / 1000.0, static_cast<double>(maxUs) / 1000.0);
+    }
+}
+
+}
+
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
     auto start = std::chrono::steady_clock::now();
@@ -136,6 +212,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     } epochPoint;
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
+    const bool waitDiag = waitDiagEnabled();
+    std::uint64_t diagEntryValue = 0;
+    if (waitDiag) diagEntryValue = awaitedBytes == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+    WaitDiagReason diagReason = WaitDiagReason::ValueSatisfied;
+    WaitDiagAction diagLast = WaitDiagAction::None;
+    std::uint64_t diagSubmits = 0, diagReaps = 0, diagFlushes = 0;
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
         return;
@@ -256,6 +338,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             Graphics::Recorder::LabelRefusal refusal{};
             if (takeLabel(Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal), refusal, true, true)) {
                 if (pollProfile) ++poll.tableHits;
+                diagReason = WaitDiagReason::LabelTakenTable;
                 return true;
             }
             pollRefused(refusal);
@@ -293,6 +376,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 Graphics::Recorder::LabelRefusal refusal{};
                 if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, true, false)) {
                     if (pollProfile) ++poll.tableHits;
+                    diagReason = WaitDiagReason::LabelTakenPending;
                     return true;
                 }
                 pollRefused(refusal);
@@ -300,20 +384,25 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
                 localDevice->SubmitRecorded(false);
                 submitted = true;
+                diagLast = WaitDiagAction::OpenWriteSubmitted;
             }
         }
         if (labelDue && !submitted && Graphics::Recorder::PendingLabelSince().has_value()) {
             localDevice->SubmitRecorded(false);
             submitted = true;
+            diagLast = WaitDiagAction::LabelDueSubmitted;
         }
         if (submitted) {
             ++outcomes.pollSubmits;
+            ++diagSubmits;
             if (pollProfile) ++poll.submits;
         }
         if (reap) {
             const auto withWorkBefore = pollProfile ? Graphics::Recorder::ReapsWithWork() : 0;
             localDevice->ReapRecorded();
             ++outcomes.pollReaps;
+            ++diagReaps;
+            diagLast = WaitDiagAction::Reaped;
             if (pollProfile) {
                 ++poll.reaps;
                 ++(behindCompletion ? poll.reapsBehindCompletion : poll.reapsOther);
@@ -338,11 +427,72 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     const auto spinStart = std::chrono::steady_clock::now();
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
+    diagReason = WaitDiagReason::ValueSatisfied;
+    diagLast = WaitDiagAction::None;
+    diagSubmits = 0;
+    diagReaps = 0;
+    diagFlushes = 0;
+    struct WaitDiagPrint {
+        bool enabled;
+        std::uint32_t queue;
+        std::span<const std::uint32_t> packet;
+        std::uint64_t awaited;
+        std::size_t bytes;
+        std::uint64_t entryValue;
+        const std::uint32_t* polls;
+        WaitDiagReason* reason;
+        WaitDiagAction* last;
+        std::uint64_t* submits;
+        std::uint64_t* reaps;
+        std::uint64_t* flushes;
+        std::chrono::steady_clock::time_point begin;
+        ~WaitDiagPrint() {
+            if (!enabled) return;
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            auto& lanes = waitDiagLanes();
+            auto& lane = lanes[std::min<std::size_t>(queue, lanes.size() - 1)];
+            lane.waits.fetch_add(1, std::memory_order_relaxed);
+            const auto us = static_cast<std::uint64_t>(ms * 1000.0);
+            lane.blockedUs.fetch_add(us, std::memory_order_relaxed);
+            auto maxUs = lane.maxUs.load(std::memory_order_relaxed);
+            while (us > maxUs && !lane.maxUs.compare_exchange_weak(maxUs, us, std::memory_order_relaxed)) {
+            }
+            if (ms >= 5.0) lane.over5ms.fetch_add(1, std::memory_order_relaxed);
+            reportWaitDiagLanes();
+            if (ms < 5.0) return;
+            if (packet.size() < 6) return;
+            const bool wideWait = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+            const std::uint64_t reference = wideWait ? (packet.size() > 5 ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : 0u) : packet[4];
+            const std::uint64_t mask = wideWait ? (packet.size() > 7 ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : 0u) : packet[5];
+            const std::uint64_t exitValue = bytes == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+            char text[1024];
+            const auto used = std::snprintf(text, sizeof(text), "[waitdiag] queue 0x%x opcode 0x%x addr 0x%llx bytes %zu func %u ref 0x%llx mask 0x%llx blocked_ms %.1f polls %llu reason %s last %s submits %llu reaps %llu flushes %llu entry 0x%llx exit 0x%llx", queue,
+                                             static_cast<unsigned>((packet[0] >> 8u) & 0xffu), static_cast<unsigned long long>(awaited), bytes, packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), ms,
+                                             static_cast<unsigned long long>(*polls), WaitDiagReasonName(*reason), WaitDiagActionName(*last), static_cast<unsigned long long>(*submits), static_cast<unsigned long long>(*reaps),
+                                             static_cast<unsigned long long>(*flushes), static_cast<unsigned long long>(entryValue), static_cast<unsigned long long>(exitValue));
+            if (used < 0) return;
+            std::size_t size = std::min(static_cast<std::size_t>(used), sizeof(text) - 4);
+            std::size_t shown = 0;
+            for (const auto& record : Driver::writeHistory()) {
+                if (shown == 3) break;
+                if (record.length == 0 || record.target > awaited || awaited >= record.target + std::max<std::uint64_t>(record.length, 4)) continue;
+                const auto more = std::snprintf(text + size, sizeof(text) - size, " writer q0x%x:0x%x@0x%llx+0x%llx", record.queue, record.opcode, static_cast<unsigned long long>(record.target),
+                                                static_cast<unsigned long long>(record.length));
+                if (more <= 0) break;
+                size = std::min(size + static_cast<std::size_t>(more), sizeof(text) - 4);
+                ++shown;
+            }
+            text[size++] = '\n';
+            text[size] = '\0';
+            AgcDriver::ProfilePrint_nid_no_patch("%s", text);
+        }
+    } waitDiagPrint{waitDiag, queue, packet, awaited, awaitedBytes, diagEntryValue, &polls, &diagReason, &diagLast, &diagSubmits, &diagReaps, &diagFlushes, std::chrono::steady_clock::now()};
     StallWatch stall(queue);
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
+            diagReason = WaitDiagReason::CpuStore;
             return;
         }
         ++polls;
@@ -357,12 +507,19 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         CheckFailure();
         if (pollService(!spinning)) return;
-        if (storeHeldResults && !spinning && (polls & 31u) == 0) GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
+        if (storeHeldResults && !spinning && (polls & 31u) == 0) {
+            GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
+            diagLast = WaitDiagAction::WritesFlushed;
+            ++diagFlushes;
+        }
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    diagReason = WaitDiagReason::WritesSettled;
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
