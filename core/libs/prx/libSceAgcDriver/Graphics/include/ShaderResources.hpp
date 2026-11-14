@@ -231,6 +231,19 @@ struct DeferredDrawBuild {
     explicit DeferredDrawBuild() = default;
 };
 
+struct SnapshotPreread {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    DccKeys keys = DccKeys::Uncompressed;
+    std::uint64_t generation = 0;
+    std::uint64_t accounted = 0;
+    std::vector<std::byte> pixels;
+    std::vector<ContentHash::Hash128> hashes;
+    SnapshotPreread() = default;
+    SnapshotPreread(const SnapshotPreread&) = delete;
+    SnapshotPreread& operator=(const SnapshotPreread&) = delete;
+};
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
@@ -602,6 +615,8 @@ private:
         std::shared_ptr<StorageTexture> source;
         DccKeys entryKeys = DccKeys::Uncompressed;
         std::uint64_t entryGeneration = 0;
+        std::uint64_t entryBytes = 0;
+        std::shared_ptr<SnapshotPreread> preread;
         std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> entryCommitted;
     };
     std::vector<ImageRecord> imageRecords;

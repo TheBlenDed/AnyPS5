@@ -787,6 +787,13 @@ void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std:
     if (keys == DccKeys::ClearSingle) ExpandSingleBlocks(bytes, BytesPerElement(resource.format));
 }
 
+void ReadTextureSurfaceUnsynced(const GuestTextureResource& resource, DccKeys keys, std::span<std::byte> bytes) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureRead);
+    if (keys == DccKeys::Uncompressed || keys == DccKeys::ClearSingle) GuestMemory::ReadCommittedUnsynced(resource.baseAddress, bytes);
+    else FillDccClear(DccClearTextureFormat(resource.format), keys, resource.dccAlphaOnMsb, bytes);
+    if (keys == DccKeys::ClearSingle) ExpandSingleBlocks(bytes, BytesPerElement(resource.format));
+}
+
 bool SingleKeysReadable(const GuestTextureResource& resource) {
     return KeyBytes % BytesPerElement(resource.format) == 0;
 }

@@ -161,6 +161,12 @@ LookupOutcomes::Kind oneOffHashKind(GuestMemory::UnchangedSinceWhy verdict, OneO
     }
 }
 
+struct SampledKeyProof {
+    std::uint64_t metaAddress = 0;
+    std::uint64_t guestBytes = 0;
+    DccKeyProof proof;
+};
+
 struct CachedTexture {
     TextureKey key;
     std::uint64_t address;
@@ -189,6 +195,7 @@ struct CachedTexture {
     std::array<std::uint64_t, 2> blockGuard{};
     GuestMemory::Commitment blockLayout;
     OwnedProof owned;
+    SampledKeyProof keyProof;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -293,6 +300,9 @@ struct TextureCache {
         std::uint64_t oneOffOwnedReuses = 0;
         std::uint64_t refusedKeptReuses = 0;
         std::uint64_t refusedKeptOnReuse = 0;
+        std::uint64_t sizeRefused = 0;
+        std::uint64_t sizeRefusedBytes = 0;
+        std::uint64_t retainedReuses = 0;
         std::uint64_t made = 0;
         std::uint64_t spilledReuses = 0;
         std::uint64_t overflowDropped = 0;
@@ -598,6 +608,45 @@ std::uint64_t refusedKeepLimit(const TextureCacheBudgets& budgets) {
     return std::min({64ull << 20u, budgets.sampled / 32ull, budgets.share / 32ull});
 }
 
+bool ReplaceRefusedKeeps() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_SAMPLED_KEEP_REFUSED_LRU");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool RetainSampledOneOffs() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_TEXTURE_RETENTION");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::uint64_t retainedSurfaceLimit() {
+    static const std::uint64_t limit = [] {
+        const auto* value = std::getenv("APS5_TEXTURE_RETENTION_MAX_MIB");
+        const auto mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 8ull;
+        return mib << 20u;
+    }();
+    return limit;
+}
+
+bool AdmitsSampledSnapshot(std::uint64_t guestBytes, std::uint64_t allocationBytes) {
+    if (!RetainSampledOneOffs()) return true;
+    const auto limit = retainedSurfaceLimit();
+    return limit == 0 || (guestBytes != 0 ? guestBytes : allocationBytes) <= limit;
+}
+
+std::uint64_t retentionKeepLimit(const TextureCacheBudgets& budgets) {
+    static const std::uint64_t mib = [] {
+        const auto* value = std::getenv("APS5_TEXTURE_RETENTION_MIB");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull;
+    }();
+    return std::min({mib << 20u, budgets.sampled / 32ull, budgets.share / 32ull});
+}
+
 void unkeepRefused(TextureCache& cache, TextureCache::OneOff& entry) {
     cache.refusedKept -= entry.kept->AllocationBytes();
     cache.refusedLru.erase(entry.lru);
@@ -692,16 +741,14 @@ void eraseOneOff(TextureCache& cache, std::unordered_map<TextureKey, TextureCach
 }
 
 void tryKeepRefused(TextureCache& cache, const TextureKey& key, const std::shared_ptr<Texture>& texture, TextureCache::OneOff& oneOff, const TextureCacheBudgets& budgets) {
-    if (!KeepRefusedSnapshots() || oneOff.keys != DccKeys::Uncompressed || texture->InHostMemory() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    if (!(KeepRefusedSnapshots() || RetainSampledOneOffs()) || oneOff.keys != DccKeys::Uncompressed || texture->InHostMemory() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
     const auto present = Recorder::Presents();
-    const auto limit = refusedKeepLimit(budgets);
+    const auto limit = RetainSampledOneOffs() ? retentionKeepLimit(budgets) : refusedKeepLimit(budgets);
     const auto allocation = texture->AllocationBytes();
+    if (!AdmitsSampledSnapshot(oneOff.bytes, allocation)) return;
     if (present == 0 || allocation == 0 || allocation > limit || residentSampledBytes() > budgets.share) return;
     if (cache.refusedKept > limit - allocation) {
-        static const bool replace = [] {
-            const auto* value = std::getenv("APS5_SAMPLED_KEEP_REFUSED_LRU");
-            return value != nullptr && std::strcmp(value, "1") == 0;
-        }();
+        const bool replace = ReplaceRefusedKeeps();
         if (!replace) return;
         const auto needed = cache.refusedKept - (limit - allocation);
         std::uint64_t available = 0;
@@ -841,6 +888,37 @@ bool SnapshotMakeReasonsEnabled() {
     return enabled;
 }
 
+bool SnapshotPrereadEnabled() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_SNAPSHOT_PREREAD");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+std::atomic<std::uint64_t>& PrereadAccounted() {
+    static std::atomic<std::uint64_t> accounted{0};
+    return accounted;
+}
+
+constexpr std::uint64_t PrereadBudget = 48ull << 20;
+
+bool ReservePreread(std::uint64_t accounted) {
+    auto& held = PrereadAccounted();
+    auto current = held.load(std::memory_order_relaxed);
+    while (accounted <= PrereadBudget && current + accounted <= PrereadBudget) {
+        if (held.compare_exchange_weak(current, current + accounted, std::memory_order_relaxed)) return true;
+    }
+    return false;
+}
+
+std::shared_ptr<SnapshotPreread> MakePreread() {
+    return std::shared_ptr<SnapshotPreread>(new SnapshotPreread(), [](SnapshotPreread* entry) {
+        PrereadAccounted().fetch_sub(entry->accounted, std::memory_order_relaxed);
+        delete entry;
+    });
+}
+
 void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -885,6 +963,12 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
     if (counts.refusedKeptOnReuse != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) refused resident snapshots newly kept on reuse at present %llu: %llu\n",
             static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(counts.refusedKeptOnReuse));
+    }
+    if (counts.sizeRefused != 0 || counts.retainedReuses != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) retention: %llu snapshots above the surface cap (%llu MiB, 0 = none) left to the one-off path (%llu MiB), %llu one-off snapshots served from a retained entry; %zu retained (%llu MiB)\n",
+            static_cast<unsigned long long>(counts.sizeRefused), static_cast<unsigned long long>(retainedSurfaceLimit() >> 20u),
+            static_cast<unsigned long long>(counts.sizeRefusedBytes >> 20u), static_cast<unsigned long long>(counts.retainedReuses),
+            cache.refusedLru.size(), static_cast<unsigned long long>(cache.refusedKept >> 20u));
     }
     if (counts.previousFrameLaterUseRefusals != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu previous-frame later-use admission refusals\n", static_cast<unsigned long long>(counts.previousFrameLaterUseRefusals));
@@ -974,6 +1058,44 @@ std::list<CachedTexture>::iterator findSampledEntry(TextureCache& cache, VkDevic
     return it;
 }
 
+bool FastImageHits() {
+    static const bool enabled = [] {
+        const auto* value = std::getenv("APS5_FAST_IMAGE_HITS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+DccKeys provedSampledSnapshotKeys(const TextureKey& key, const GuestTextureResource& resource, std::uint64_t guestBytes, bool& proved, bool& candidate) {
+    proved = false;
+    candidate = false;
+    if (resource.dccAddress == 0 || !KeyFastPath() || !GuestMemory::GpuMutex().HeldByThisThread()) return TextureClearKeys(resource, guestBytes);
+    auto& cache = Textures();
+    SampledKeyProof taken;
+    bool known = false;
+    {
+        const SampledCacheLock lock(cache);
+        const auto it = findTexture(cache, key);
+        known = it != cache.entries.end() && it->source == nullptr && it->bytes == guestBytes && (it->keyProof.metaAddress == 0 || (it->keyProof.metaAddress == resource.dccAddress && it->keyProof.guestBytes == guestBytes));
+        if (known) {
+            taken = it->keyProof;
+            taken.metaAddress = resource.dccAddress;
+            taken.guestBytes = guestBytes;
+        }
+    }
+    if (!known) return TextureClearKeys(resource, guestBytes);
+    candidate = true;
+    const auto generation = taken.proof.generation;
+    const auto keys = ProvedClearKeys(resource, guestBytes, taken.proof);
+    proved = generation != 0 && taken.proof.generation == generation;
+    {
+        const SampledCacheLock lock(cache);
+        const auto it = findTexture(cache, key);
+        if (it != cache.entries.end() && it->source == nullptr && it->bytes == guestBytes && (it->keyProof.metaAddress == 0 || it->keyProof.metaAddress == resource.dccAddress)) it->keyProof = taken;
+    }
+    return keys;
+}
+
 // APS5_PROFILE_DRAW: what the sampled-texture and storage-image lookups did, printed as [textures]
 // every 10 s (cumulative). Storage-sourced sampled textures need no CPU read; snapshots do, and a
 // pending read is a snapshot compare or read made while recorded work still wrote the surface (the
@@ -1001,6 +1123,11 @@ struct TextureCounters {
     // by a byte compare.
     std::atomic<std::uint64_t> untrackedKept{0};
     std::atomic<std::uint64_t> untrackedCompared{0};
+    std::atomic<std::uint64_t> prereads{0};
+    std::atomic<std::uint64_t> prereadBytes{0};
+    std::atomic<std::uint64_t> prereadUsed{0};
+    std::atomic<std::uint64_t> keyProved{0};
+    std::atomic<std::uint64_t> keyRescanned{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1570,7 +1697,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared; stage-A snapshot pre-reads %llu (%llu bytes read ahead, %llu used); full-path DCC keys %llu proved by the cache entry, %llu re-scanned\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared), count(counters.prereads), count(counters.prereadBytes), count(counters.prereadUsed), count(counters.keyProved), count(counters.keyRescanned));
 }
 
 // APS5_PROFILE_DRAW: cachedTexture's slice copies (Texture::CopyPendingSlices), 10 s deltas: lookups
@@ -2193,7 +2320,7 @@ SnapshotLiveReason ObserveSnapshotLiveSource(const Context& context, const Guest
     return SnapshotLiveReason::LiveUnproven;
 }
 
-std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D, SnapshotPreread* preread = nullptr) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
     if (resource.dimension == TextureDimension::k2DMsaa) {
@@ -2260,16 +2387,23 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto& counters = TextureCounts();
+    const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::optional<DccKeys> scanned;
     const auto scanKeys = [&] {
         if (scanned.has_value()) return *scanned;
         const auto scanStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        scanned = TextureClearKeys(resource, guestBytes);
-        if (resource.dccAddress != 0) ++sampledLookupKeyScans;
+        bool proved = false;
+        bool candidate = false;
+        scanned = FastImageHits() ? provedSampledSnapshotKeys(key, resource, guestBytes, proved, candidate) : TextureClearKeys(resource, guestBytes);
+        if (resource.dccAddress != 0) {
+            ++sampledLookupKeyScans;
+            if (proved) counters.keyProved.fetch_add(1, std::memory_order_relaxed);
+            if (candidate && !proved) counters.keyRescanned.fetch_add(1, std::memory_order_relaxed);
+        }
         if (profile && resource.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
         return *scanned;
     };
-    auto& counters = TextureCounts();
     const auto address = resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
     const bool probe = LookupProbeEnabled();
@@ -2502,7 +2636,6 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     GuestMemory::UntrackedWhy untrackedWhy = GuestMemory::UntrackedWhy::NotApplicable;
     const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes, untrackedWhy) : std::array<std::uint64_t, 4>{};
     auto& cache = Textures();
-    const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     const DropReleasedDependents dropAfterUnlock;
     const SampledCacheLock lock(cache);
     dropUncachedViews(cache);
@@ -2760,6 +2893,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             if (compatible && current()) {
                 ++cache.counts.oneOffReuses;
                 ++cache.totals.oneOffReuses;
+                if (RetainSampledOneOffs() && oneOff.kept != nullptr && !oneOff.kept->Spilled()) {
+                    ++cache.counts.retainedReuses;
+                    ++cache.totals.retainedReuses;
+                }
                 if (oneOff.kept != nullptr) {
                     if (texture->Spilled()) {
                         ++cache.counts.spilledReuses;
@@ -2778,7 +2915,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const auto atoStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 const auto atoWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
                 const auto spilled = texture->Spilled();
-                const bool promoted = !spilled && admitTexture(cache, key, entry.accounted, budgets);
+                const bool admits = !spilled && AdmitsSampledSnapshot(guestBytes, entry.accounted);
+                const bool promoted = admits && admitTexture(cache, key, entry.accounted, budgets);
+                if (!spilled && !admits) {
+                    ++cache.counts.sizeRefused;
+                    ++cache.totals.sizeRefused;
+                    cache.counts.sizeRefusedBytes += guestBytes;
+                    cache.totals.sizeRefusedBytes += guestBytes;
+                }
                 if (probeSel && !spilled) LookupProbeAdd(LookupProbeKind::AdmitTexture, atoStart, atoWait);
                 if (profile) LookupOutcomes::Add(promoted ? LookupOutcomes::OneOffPromoted : LookupOutcomes::OneOffRefused, admitStart);
                 if (promoted) {
@@ -2901,9 +3045,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         std::vector<std::byte> zeroed;
         std::unique_ptr<std::byte[]> uninit;
         std::span<std::byte> snapshot;
+        const bool prereadTake = preread != nullptr && [&] {
+            if (preread->address != address || preread->bytes != bytes || preread->keys != *keys) return false;
+            if (preread->generation == 0 || generation == 0 || pending) return false;
+            if (Recorder::SnapshotWriteOverlaps(address, bytes) || PendingStorageOverlaps(address, bytes, nullptr) || GuestMemory::GpuOwned(address, bytes)) return false;
+            if (GuestMemory::ClassifyUnchangedSince(address, bytes, preread->generation) != GuestMemory::UnchangedSinceWhy::Unchanged) return false;
+            return *keys != DccKeys::Uncompressed || preread->hashes.size() == GuestMemory::HashBlockCount(address, bytes);
+        }();
         const auto bailStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto bailWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
-        if (directSnapshotStaging && *keys == DccKeys::Uncompressed) {
+        if (directSnapshotStaging && *keys == DccKeys::Uncompressed && !prereadTake) {
             const auto allocationStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             try {
                 const MemoryStats::OwnerScope owner(MemoryStats::Owner::TextureUpload);
@@ -2916,7 +3067,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 snapshot = preparedStaging.buffer->Bytes();
             }
         }
-        if (preparedStaging.buffer == nullptr) {
+        if (prereadTake) {
+            snapshot = std::span<std::byte>(preread->pixels);
+        } else if (preparedStaging.buffer == nullptr) {
             if (uninitializedSnapshot) {
                 uninit.reset(new std::byte[bytes]);
                 snapshot = std::span<std::byte>(uninit.get(), bytes);
@@ -2926,9 +3079,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             }
         }
         if (probeSel) LookupProbeAdd(LookupProbeKind::BufferAllocZeroInit, bailStart, bailWait);
-        const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        ReadTextureSurface(resource, *keys, snapshot);
-        if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotRead, readStart);
+        if (!prereadTake) {
+            const auto readStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            ReadTextureSurface(resource, *keys, snapshot);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotRead, readStart);
+        }
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
@@ -2942,7 +3097,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
             if (profile) LookupOutcomes::Add(LookupOutcomes::SnapshotHash, hashStart);
         };
-        if (preparedStaging.buffer != nullptr) hashSnapshot();
+        if (preparedStaging.buffer != nullptr && !prereadTake) hashSnapshot();
+        if (prereadTake) {
+            entry.hashes = preread->hashes;
+            entry.generation = preread->generation;
+            snapshotGeneration = preread->generation;
+            generation = preread->generation;
+        }
         const bool spill = [&] {
             if (!SpillEnabled()) return false;
             const auto mrStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2982,9 +3143,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             cache.counts.spilledBytes += entry.texture->AllocationBytes();
             cache.totals.spilledBytes += entry.texture->AllocationBytes();
         }
-        if (*keys == DccKeys::Uncompressed && preparedStaging.buffer == nullptr) hashSnapshot();
+        if (*keys == DccKeys::Uncompressed && preparedStaging.buffer == nullptr && !prereadTake) hashSnapshot();
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
+        if (prereadTake) counters.prereadUsed.fetch_add(1, std::memory_order_relaxed);
         if (clearReuse && !entry.texture->Spilled()) {
             clearSnapshots.push_front({key, *keys, guestBytes, entry.texture});
             if (clearSnapshots.size() > 8) clearSnapshots.pop_back();
@@ -3006,7 +3168,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const bool spilled = texture->Spilled();
     const auto atmStart = probeSel ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto atmWait = probeSel ? Recorder::ThreadWaitedMs() : 0.0;
-    const bool admitted = !spilled && admitTexture(cache, key, entry.accounted, budgets);
+    const bool admits = !spilled && (source != nullptr || AdmitsSampledSnapshot(guestBytes, entry.accounted));
+    const bool admitted = admits && admitTexture(cache, key, entry.accounted, budgets);
+    if (!spilled && source == nullptr && !admits) {
+        ++cache.counts.sizeRefused;
+        ++cache.totals.sizeRefused;
+        cache.counts.sizeRefusedBytes += guestBytes;
+        cache.totals.sizeRefusedBytes += guestBytes;
+    }
     if (probeSel && !spilled) LookupProbeAdd(LookupProbeKind::AdmitTexture, atmStart, atmWait);
     if (spilled || !admitted) {
         texture->SetSampledCacheState(Texture::CacheState::Released);
@@ -7426,15 +7595,48 @@ bool ShaderResources::precollectImages() {
                     std::copy(words.begin(), words.end(), record.words.begin());
                     record.components = memo->components;
                     record.keys = TextureClearKeys(record.resource, record.guestBytes);
-                    auto& cache = Textures();
-                    std::lock_guard lock(cache.mutex);
-                    if (const auto it = findSampledEntry(cache, context.device, record.words, record.components); it != cache.entries.end()) {
-                        record.texture = it->texture;
-                        record.source = it->source;
-                        record.entryKeys = it->keys;
-                        record.entryGeneration = it->generation;
-                        if (record.generation == 0 && it->source == nullptr && it->committed.has_value() && CommittedProofEnabled()) record.entryCommitted = it->committed;
-                        counters.records.fetch_add(1, std::memory_order_relaxed);
+                    {
+                        auto& cache = Textures();
+                        std::lock_guard lock(cache.mutex);
+                        if (const auto it = findSampledEntry(cache, context.device, record.words, record.components); it != cache.entries.end()) {
+                            record.texture = it->texture;
+                            record.source = it->source;
+                            record.entryKeys = it->keys;
+                            record.entryGeneration = it->generation;
+                            record.entryBytes = it->bytes;
+                            if (record.generation == 0 && it->source == nullptr && it->committed.has_value() && CommittedProofEnabled()) record.entryCommitted = it->committed;
+                            counters.records.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    const auto bytes = static_cast<std::size_t>(record.guestBytes);
+                    const auto realRead = record.keys == DccKeys::Uncompressed || record.keys == DccKeys::ClearSingle;
+                    const auto prereadWanted = [&] {
+                        if (!SnapshotPrereadEnabled() || !deferredDraw || record.generation == 0 || !realRead || bytes == 0) return false;
+                        if (record.texture != nullptr && (record.source != nullptr || (record.entryBytes == record.guestBytes && record.entryKeys == record.keys && GuestMemory::ClassifyUnchangedSince(record.resource.baseAddress, bytes, record.entryGeneration) == GuestMemory::UnchangedSinceWhy::Unchanged))) return false;
+                        if (Recorder::SnapshotWriteOverlaps(record.resource.baseAddress, bytes) || PendingStorageOverlaps(record.resource.baseAddress, bytes, nullptr) || GuestMemory::GpuOwned(record.resource.baseAddress, bytes)) return false;
+                        return !SampledFromStorageEligible(context, record.resource, record.guestBytes);
+                    }();
+                    if (prereadWanted) {
+                        auto preread = MakePreread();
+                        preread->address = record.resource.baseAddress;
+                        preread->bytes = bytes;
+                        preread->keys = record.keys;
+                        preread->generation = record.generation;
+                        const auto blocks = record.keys == DccKeys::Uncompressed ? GuestMemory::HashBlockCount(preread->address, bytes) : 0;
+                        const auto accounted = static_cast<std::uint64_t>(bytes) + static_cast<std::uint64_t>(blocks) * sizeof(ContentHash::Hash128);
+                        if (ReservePreread(accounted)) {
+                            preread->accounted = accounted;
+                            try {
+                                preread->pixels.resize(bytes);
+                                ReadTextureSurfaceUnsynced(record.resource, record.keys, preread->pixels);
+                                preread->hashes.resize(blocks);
+                                GuestMemory::HashBlocksOf(preread->address, preread->pixels, preread->hashes);
+                                record.preread = std::move(preread);
+                                counters.prereads.fetch_add(1, std::memory_order_relaxed);
+                                counters.prereadBytes.fetch_add(bytes, std::memory_order_relaxed);
+                            } catch (...) {
+                            }
+                        }
                     }
                 }
             }
@@ -7565,7 +7767,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 Require(!depthCompare && !DepthSurfaceAt(resource.baseAddress), "reading sample 0 of a multisampled depth surface through a 2D image is not implemented");
                 texture = MultisampleTargetFirstSample(context, resource, components);
             }
-            if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType);
+            if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare, multisampleViewType, record != nullptr ? record->preread.get() : nullptr);
             if (resource.dimension == TextureDimension::k2DMsaa) multisampleSources.push_back(resource.baseAddress);
             bool baseLevel = false;
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
