@@ -1053,6 +1053,19 @@ void oneOffOwnedProofTests(const Context& context) {
     Memory::EndCollectEpoch();
 }
 
+std::uint64_t retentionCapBytes(std::uint64_t budget) {
+    const auto* retention = std::getenv("APS5_TEXTURE_RETENTION");
+    const auto* value = retention != nullptr && std::strcmp(retention, "1") == 0 ? std::getenv("APS5_TEXTURE_RETENTION_MIB") : nullptr;
+    if (value == nullptr) return std::min<std::uint64_t>(64ull << 20u, budget / 32u);
+    return std::min<std::uint64_t>(std::strtoull(value, nullptr, 10) << 20u, budget / 8u);
+}
+
+std::uint64_t retentionKeepPresents() {
+    const auto* value = std::getenv("APS5_TEXTURE_RETENTION_PRESENTS");
+    const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    return parsed != 0 ? parsed : 1ull;
+}
+
 void oneOffRetentionLruTests(const Context& context) {
     namespace Memory = AgcDriver::GuestMemory;
     constexpr std::uint32_t FillSide = 2048;
@@ -1064,9 +1077,9 @@ void oneOffRetentionLruTests(const Context& context) {
     const auto smallBytes = Sampled(context, calibration.Address(), SmallSide)->AllocationBytes();
     const auto mediumBytes = Sampled(context, calibration.Address())->AllocationBytes();
     ClearCachedTextures(context.device);
-    const auto limit = std::min<std::uint64_t>(64ull << 20u, fillBytes / 32u);
+    const auto limit = retentionCapBytes(fillBytes);
     const auto capacity = static_cast<std::size_t>(limit / smallBytes);
-    Require(capacity >= 3u && capacity <= 64u && mediumBytes > smallBytes && mediumBytes <= limit,
+    Require(capacity >= 3u && capacity <= 512u && mediumBytes > smallBytes && mediumBytes <= limit,
         "the LRU fixture cannot exercise its fixed cap and insufficient-victim cases");
     const auto targetSpan = (capacity + 2u) * SurfaceBytes;
     WatchedSurface targets(context, targetSpan);
@@ -1170,7 +1183,7 @@ void oneOffRetentionTests(const Context& context) {
     const auto fillBytes = Sampled(context, filler.Address(), FillSide)->AllocationBytes();
     const auto smallBytes = Sampled(context, calibration.Address(), SmallSide)->AllocationBytes();
     ClearCachedTextures(context.device);
-    const auto capacity = static_cast<std::size_t>(std::min<std::uint64_t>(64ull << 20u, fillBytes / 32u) / smallBytes);
+    const auto capacity = static_cast<std::size_t>(retentionCapBytes(fillBytes) / smallBytes);
     Require(capacity >= 1u && capacity <= 64u, "the refused retention fixture does not fit the cap");
     const auto targetSpan = (capacity + 1u) * SurfaceBytes;
     WatchedSurface targets(context, targetSpan);
@@ -1209,19 +1222,24 @@ void oneOffRetentionTests(const Context& context) {
     Recorder::CountPresent();
     Require(Sampled(context, filler.Address(), FillSide) == fill, "the retained snapshots displaced the cached filler");
     Require(small(0) == retained.front().lock(), "the retained snapshot missed in the adjacent present");
-    Recorder::CountPresent();
+    const auto presents = retentionKeepPresents();
+    for (std::uint64_t advance = 1; advance <= presents; ++advance) {
+        Recorder::CountPresent();
+        Require(Sampled(context, filler.Address(), FillSide) == fill, "the cache filler was replaced while advancing the hold window");
+        if (advance == presents) Require(!retained.front().expired(), "a refused snapshot expired before its configured hold window");
+    }
     Recorder::CountPresent();
     Sampled(context, filler.Address(), FillSide);
     Require(std::all_of(retained.begin(), retained.end(), [](const auto& texture) { return texture.expired(); }),
-        "a refused snapshot survived two presents without use");
+        "a refused snapshot survived its configured hold window");
 
     for (std::size_t index = 0; index < capacity; ++index) small(index);
     auto unkept = small(capacity);
     const std::weak_ptr<Texture> unkeptWeak = unkept;
-    Recorder::CountPresent();
-    Require(Sampled(context, filler.Address(), FillSide) == fill, "the cache filler was replaced while advancing the hold window");
-    Recorder::CountPresent();
-    Require(Sampled(context, filler.Address(), FillSide) == fill, "the cache filler was replaced while expiring the holds");
+    for (std::uint64_t advance = 0; advance <= presents; ++advance) {
+        Recorder::CountPresent();
+        Require(Sampled(context, filler.Address(), FillSide) == fill, "the cache filler was replaced while expiring the holds");
+    }
     const auto beforeReuse = SampledCacheCounters().made;
     Require(small(capacity) == unkept && SampledCacheCounters().made == beforeReuse && TextureCacheUsage().sampledEntries == 1u,
         "the live weak snapshot was rebuilt or promoted during reuse");

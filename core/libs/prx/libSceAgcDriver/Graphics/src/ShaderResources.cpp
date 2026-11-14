@@ -639,12 +639,32 @@ bool AdmitsSampledSnapshot(std::uint64_t guestBytes, std::uint64_t allocationByt
     return limit == 0 || (guestBytes != 0 ? guestBytes : allocationBytes) <= limit;
 }
 
-std::uint64_t retentionKeepLimit(const TextureCacheBudgets& budgets) {
-    static const std::uint64_t mib = [] {
+std::optional<std::uint64_t> retainedKeepLimitOverride() {
+    static const std::optional<std::uint64_t> bytes = []() -> std::optional<std::uint64_t> {
         const auto* value = std::getenv("APS5_TEXTURE_RETENTION_MIB");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull;
+        if (value == nullptr) return std::nullopt;
+        return std::strtoull(value, nullptr, 10) << 20u;
     }();
-    return std::min({mib << 20u, budgets.sampled / 32ull, budgets.share / 32ull});
+    return bytes;
+}
+
+std::uint64_t retentionKeepLimit(const TextureCacheBudgets& budgets) {
+    const auto bytes = retainedKeepLimitOverride();
+    if (!bytes.has_value()) return refusedKeepLimit(budgets);
+    return std::min({*bytes, budgets.sampled / 8ull, budgets.share / 8ull});
+}
+
+std::uint64_t keepLimit(const TextureCacheBudgets& budgets) {
+    return RetainSampledOneOffs() ? retentionKeepLimit(budgets) : refusedKeepLimit(budgets);
+}
+
+std::uint64_t refusedKeepPresents() {
+    static const std::uint64_t presents = [] {
+        const auto* value = std::getenv("APS5_TEXTURE_RETENTION_PRESENTS");
+        const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+        return parsed != 0 ? parsed : 1ull;
+    }();
+    return presents;
 }
 
 void unkeepRefused(TextureCache& cache, TextureCache::OneOff& entry) {
@@ -658,7 +678,7 @@ void expireRefusedKeeps(TextureCache& cache) {
     const auto present = Recorder::Presents();
     while (!cache.refusedLru.empty()) {
         auto& entry = cache.oneOffs.at(cache.refusedLru.back());
-        if (present <= entry.keptPresent || present - entry.keptPresent <= 1u) return;
+        if (present <= entry.keptPresent || present - entry.keptPresent <= refusedKeepPresents()) return;
         unkeepRefused(cache, entry);
     }
 }
@@ -743,7 +763,7 @@ void eraseOneOff(TextureCache& cache, std::unordered_map<TextureKey, TextureCach
 void tryKeepRefused(TextureCache& cache, const TextureKey& key, const std::shared_ptr<Texture>& texture, TextureCache::OneOff& oneOff, const TextureCacheBudgets& budgets) {
     if (!(KeepRefusedSnapshots() || RetainSampledOneOffs()) || oneOff.keys != DccKeys::Uncompressed || texture->InHostMemory() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
     const auto present = Recorder::Presents();
-    const auto limit = RetainSampledOneOffs() ? retentionKeepLimit(budgets) : refusedKeepLimit(budgets);
+    const auto limit = keepLimit(budgets);
     const auto allocation = texture->AllocationBytes();
     if (!AdmitsSampledSnapshot(oneOff.bytes, allocation)) return;
     if (present == 0 || allocation == 0 || allocation > limit || residentSampledBytes() > budgets.share) return;
@@ -956,9 +976,10 @@ void reportCacheCounts(TextureCache& cache, const TextureCacheBudgets& budgets) 
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s): %llu one-off snapshots reused by owned write watch\n", static_cast<unsigned long long>(counts.oneOffOwnedReuses));
     }
     if (cache.refusedKept != 0 || counts.refusedKeptReuses != 0) {
-        AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) refused resident snapshots at present %llu: %zu kept (%llu bytes), %llu reused\n",
+        AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) refused resident snapshots at present %llu: %zu kept (%llu bytes), %llu reused, window %llu presents\n",
             static_cast<unsigned long long>(Recorder::Presents()), cache.refusedLru.size(),
-            static_cast<unsigned long long>(cache.refusedKept), static_cast<unsigned long long>(counts.refusedKeptReuses));
+            static_cast<unsigned long long>(cache.refusedKept), static_cast<unsigned long long>(counts.refusedKeptReuses),
+            static_cast<unsigned long long>(refusedKeepPresents()));
     }
     if (counts.refusedKeptOnReuse != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[texture-cache] (10 s) refused resident snapshots newly kept on reuse at present %llu: %llu\n",
@@ -2847,8 +2868,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
     };
     if (cache.refusedKept != 0) {
-        const auto keepLimit = refusedKeepLimit(budgets);
-        while (cache.refusedKept > keepLimit) unkeepRefused(cache, cache.oneOffs.at(cache.refusedLru.back()));
+        const auto limit = keepLimit(budgets);
+        while (cache.refusedKept > limit) unkeepRefused(cache, cache.oneOffs.at(cache.refusedLru.back()));
     }
     auto makeReason = SnapshotMakeReason::MissingKey;
     if (source == nullptr) {

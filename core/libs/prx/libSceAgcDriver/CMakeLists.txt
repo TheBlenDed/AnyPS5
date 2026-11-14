@@ -3604,6 +3604,14 @@ if(BUILD_TESTING)
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SAMPLED_LATER_USE_REFUSAL=1;APS5_SAMPLED_LATER_USE_PROTECT_PREVIOUS_FRAME=1;APS5_NO_SAMPLED_FROM_STORAGE=1;APS5_NO_TEXTURE_SPILL=1;APS5_SAMPLED_ONE_OFF_OWNED_PROOF=1;APS5_SAMPLED_KEEP_REFUSED=1"
             ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>"
             SKIP_RETURN_CODE 77 TIMEOUT 30)
+        foreach(retentionPresents IN ITEMS 2 4)
+            set(retentionPresentsTest agc_driver_sampled_cache_one_off_retention_presents_${retentionPresents})
+            add_test(NAME ${retentionPresentsTest} COMMAND agc_driver_sampled_cache_budget_tests one-off-retention)
+            set_tests_properties(${retentionPresentsTest} PROPERTIES
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SAMPLED_LATER_USE_REFUSAL=1;APS5_SAMPLED_LATER_USE_PROTECT_PREVIOUS_FRAME=1;APS5_NO_SAMPLED_FROM_STORAGE=1;APS5_NO_TEXTURE_SPILL=1;APS5_SAMPLED_ONE_OFF_OWNED_PROOF=1;APS5_SAMPLED_KEEP_REFUSED=1;APS5_TEXTURE_RETENTION_PRESENTS=${retentionPresents}"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>"
+                SKIP_RETURN_CODE 77 TIMEOUT 30)
+        endforeach()
         foreach(refusedLruMode IN ITEMS 0 1)
             set(refusedLruTest agc_driver_sampled_cache_one_off_retention_lru_${refusedLruMode})
             add_test(NAME ${refusedLruTest} COMMAND agc_driver_sampled_cache_budget_tests one-off-retention-lru)
