@@ -323,6 +323,8 @@ private:
 	[[nodiscard]] uint64_t ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64_t size) const;
 	void ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault);
 	void ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault, bool command_processor);
+	void StudyReadback(const Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t pages_begin, uint64_t pages_end,
+	                   uint64_t inflight, uint32_t kind);
 	[[nodiscard]] uint64_t InFlightReadbackTick(uint64_t begin, uint64_t end) const;
 	void ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin, uint64_t pages_end,
 	                     uint64_t tick, bool is_write);

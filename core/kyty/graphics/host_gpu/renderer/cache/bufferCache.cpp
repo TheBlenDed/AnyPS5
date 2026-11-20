@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/spscQueue.h"
+#include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -28,7 +29,10 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -118,6 +122,427 @@ int64_t SteadyNs() {
 	    .count();
 }
 
+bool ReadbackStudyOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_READBACK_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+struct ReadbackStudy {
+	static constexpr size_t   PageSlots      = size_t {1} << 16;
+	static constexpr size_t   PageLimit      = PageSlots / 4 * 3;
+	static constexpr size_t   BufferSlots    = 256;
+	static constexpr size_t   ThreadSlots    = 16;
+	static constexpr size_t   RecentPages    = 512;
+	static constexpr uint64_t RecentLifetime = 16384;
+	static constexpr size_t   WindowPages    = ReadAheadLimit / TRACKER_PAGE_SIZE;
+	enum : uint32_t { Read, Write, Other, Kinds };
+	enum : uint32_t { None, Queue, Timeline, Paths };
+	enum : uint32_t { Joined, NoQueue, PendingWrite, Unsubmitted, NoSlot, Rest, Reasons };
+	enum : uint32_t { Overlap, NotGpu, InFlight, Texture, NoBuffer, NotSubmitted, NotComplete, Carried, Rejects };
+	enum : uint32_t { NoPrevious, Same, Next, Near, Window, Far, Previous, NearBack, WindowBack, FarBack, Distances };
+	struct Page {
+		uint64_t page          = 0;
+		uint64_t last_seq      = 0;
+		uint64_t last_frame    = 0;
+		uint64_t carried       = 0;
+		uint32_t window_count  = 0;
+		uint32_t window_frames = 0;
+		bool     extra         = false;
+	};
+	struct Recent {
+		uint64_t page = 0;
+		uint64_t seq  = 0;
+	};
+	struct BufferSlot {
+		uint64_t buffer = 0;
+		uint64_t page   = 0;
+	};
+	struct ThreadSlot {
+		uint32_t tid   = 0;
+		uint64_t count = 0;
+		uint64_t ns    = 0;
+	};
+	struct Pending {
+		uint32_t                          kind         = Other;
+		uint32_t                          reason       = Rest;
+		bool                              ready        = false;
+		bool                              page_unknown = false;
+		uint64_t                          page         = 0;
+		uint64_t                          page_tick    = 0;
+		uint64_t                          pages_begin  = 0;
+		uint64_t                          pages_end    = 0;
+		uint64_t                          buffer       = 0;
+		uint64_t                          frame        = 0;
+		uint64_t                          window       = 0;
+		uint64_t                          extra        = 0;
+		uint64_t                          candidates   = 0;
+		uint32_t                          extra_gpu    = 0;
+		uint32_t                          followers    = 0;
+		std::array<uint64_t, Rejects>     rejects {};
+		std::array<uint64_t, WindowPages> extra_pages {};
+		std::array<Recent, RecentPages>   follower_pages {};
+	};
+	struct Counters {
+		uint64_t   count[Kinds][Paths] {};
+		uint64_t   ns[Kinds][Paths] {};
+		uint64_t   ready[Kinds][Paths] {};
+		uint64_t   phase[Kinds][3] {};
+		uint64_t   flushes[Kinds] {};
+		uint64_t   reason[Kinds][Reasons] {};
+		uint64_t   writes            = 0;
+		uint64_t   untracked         = 0;
+		uint64_t   first             = 0;
+		uint64_t   same_frame        = 0;
+		uint64_t   within_one        = 0;
+		uint64_t   within_two        = 0;
+		uint64_t   within_lifetime   = 0;
+		uint64_t   queue_writes      = 0;
+		uint64_t   candidates        = 0;
+		uint64_t   would_follow      = 0;
+		uint64_t   with_followers    = 0;
+		uint64_t   most_followers    = 0;
+		uint64_t   rejects[Rejects] {};
+		uint64_t   avoidable         = 0;
+		uint64_t   carried_rewritten = 0;
+		uint64_t   distance[Distances] {};
+		uint64_t   window_pages      = 0;
+		uint64_t   extra_pages       = 0;
+		uint64_t   extra_gpu         = 0;
+		uint64_t   with_extra        = 0;
+		uint64_t   window_saved      = 0;
+		uint64_t   window_rewritten  = 0;
+		ThreadSlot threads[ThreadSlots] {};
+		uint64_t   thread_count      = 0;
+	};
+
+	std::mutex                          mutex;
+	std::unique_ptr<Page[]>             pages;
+	size_t                              page_count   = 0;
+	uint64_t                            frame_seen   = 0;
+	uint64_t                            frame_logged = 0;
+	Counters                            counters;
+	std::vector<uint32_t>               sorted;
+	std::vector<Recent>                 recent;
+	std::array<BufferSlot, BufferSlots> buffers {};
+	uint64_t                            write_seq = 0;
+	Pending                             pending;
+
+	Page* FindPage(uint64_t page, bool insert) {
+		if (!pages) {
+			if (!insert) {
+				return nullptr;
+			}
+			pages = std::make_unique<Page[]>(PageSlots);
+		}
+		auto index = static_cast<size_t>(((page / TRACKER_PAGE_SIZE) * 0x9E3779B97F4A7C15ull) >> 48);
+		for (;; index = (index + 1) & (PageSlots - 1)) {
+			auto& entry = pages[index];
+			if (entry.page == page) {
+				return &entry;
+			}
+			if (entry.page == 0) {
+				if (!insert || page_count >= PageLimit) {
+					return nullptr;
+				}
+				page_count++;
+				entry.page = page;
+				return &entry;
+			}
+		}
+	}
+
+	uint64_t CarriedTick(uint64_t page) {
+		std::scoped_lock lock {mutex};
+		const auto*      known = FindPage(page, false);
+		return known != nullptr ? known->carried : 0;
+	}
+
+	template <typename Modified>
+	void NoteGuestWrite(uint64_t page, Modified&& gpu_modified) {
+		{
+			std::scoped_lock lock {mutex};
+			const auto*      known = FindPage(page, false);
+			if (known == nullptr || !known->extra) {
+				return;
+			}
+		}
+		if (gpu_modified()) {
+			return;
+		}
+		std::scoped_lock lock {mutex};
+		auto*            known = FindPage(page, false);
+		if (known != nullptr && known->extra) {
+			known->extra = false;
+			counters.window_saved++;
+		}
+	}
+
+	void Commit(uint32_t path) {
+		const auto&      sample = pending;
+		std::scoped_lock lock {mutex};
+		auto&            sums = counters;
+		if (sample.ready) {
+			sums.ready[sample.kind][path]++;
+		}
+		if (path == Timeline) {
+			sums.reason[sample.kind][sample.reason]++;
+		}
+		if (sample.kind != Write) {
+			return;
+		}
+		const auto seq = ++write_seq;
+		frame_seen     = std::max(frame_seen, sample.frame);
+		sums.writes++;
+		if (auto* page = FindPage(sample.page, true); page == nullptr) {
+			sums.untracked++;
+		} else {
+			if (std::exchange(page->extra, false)) {
+				sums.window_rewritten++;
+			}
+			if (const auto carried = std::exchange(page->carried, 0); carried != 0) {
+				(!sample.page_unknown && sample.page_tick <= carried ? sums.avoidable : sums.carried_rewritten)++;
+			}
+			if (page->last_seq == 0) {
+				sums.first++;
+			} else {
+				const auto frames = sample.frame - page->last_frame;
+				sums.same_frame      += frames == 0;
+				sums.within_one      += frames <= 1;
+				sums.within_two      += frames <= 2;
+				sums.within_lifetime += seq - page->last_seq <= RecentLifetime;
+			}
+			if (page->window_count++ == 0 || page->last_frame != sample.frame) {
+				page->window_frames++;
+			}
+			page->last_seq   = seq;
+			page->last_frame = sample.frame;
+		}
+		auto& slot = buffers[static_cast<size_t>((sample.buffer * 0x9E3779B97F4A7C15ull) >> 56)];
+		if (slot.buffer != sample.buffer) {
+			slot.buffer = sample.buffer;
+			sums.distance[NoPrevious]++;
+		} else {
+			const auto apart = (static_cast<int64_t>(sample.page) - static_cast<int64_t>(slot.page)) /
+			                   static_cast<int64_t>(TRACKER_PAGE_SIZE);
+			const auto limit = static_cast<int64_t>(WindowPages);
+			sums.distance[apart == 0       ? Same
+			              : apart == 1     ? Next
+			              : apart == -1    ? Previous
+			              : apart > limit  ? Far
+			              : apart < -limit ? FarBack
+			              : apart > 16     ? Window
+			              : apart < -16    ? WindowBack
+			              : apart > 0      ? Near
+			                               : NearBack]++;
+		}
+		slot.page          = sample.page;
+		sums.window_pages += sample.window;
+		sums.extra_pages  += sample.extra;
+		sums.extra_gpu    += sample.extra_gpu;
+		sums.with_extra   += sample.extra_gpu != 0;
+		if (path != None) {
+			for (uint32_t i = 0; i < sample.extra_gpu; i++) {
+				if (auto* extra = FindPage(sample.extra_pages[i], true); extra != nullptr) {
+					extra->extra = true;
+				} else {
+					sums.untracked++;
+				}
+			}
+		}
+		if (path == Queue) {
+			sums.queue_writes++;
+			sums.candidates     += sample.candidates;
+			sums.would_follow   += sample.followers;
+			sums.with_followers += sample.followers != 0;
+			sums.most_followers  = std::max<uint64_t>(sums.most_followers, sample.followers);
+			for (uint32_t i = 0; i < Rejects; i++) {
+				sums.rejects[i] += sample.rejects[i];
+			}
+			for (uint32_t i = 0; i < sample.followers; i++) {
+				if (auto* carried = FindPage(sample.follower_pages[i].page, true); carried != nullptr) {
+					carried->carried = sample.follower_pages[i].seq;
+				} else {
+					sums.untracked++;
+				}
+			}
+		}
+		for (auto page = sample.pages_begin; page < sample.pages_end; page += TRACKER_PAGE_SIZE) {
+			auto found = std::ranges::find(recent, page, &Recent::page);
+			if (found == recent.end()) {
+				if (recent.size() >= RecentPages) {
+					found = std::ranges::min_element(recent, {}, &Recent::seq);
+				} else {
+					found = recent.emplace(recent.end());
+				}
+				found->page = page;
+			}
+			found->seq = seq;
+		}
+	}
+
+	void NoteTimes(uint32_t kind, uint32_t path, const std::array<uint64_t, 3>& phases, bool flushed) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		static thread_local const uint32_t tid = ::GetCurrentThreadId();
+#else
+		static thread_local const uint32_t tid = static_cast<uint32_t>(Common::Thread::GetThreadIdUnique());
+#endif
+		const auto       total = phases[0] + phases[1] + phases[2];
+		std::scoped_lock lock {mutex};
+		auto&            sums = counters;
+		sums.count[kind][path]++;
+		sums.ns[kind][path] += total;
+		for (uint32_t i = 0; i < 3; i++) {
+			sums.phase[kind][i] += phases[i];
+		}
+		sums.flushes[kind] += flushed;
+		if (kind != Write) {
+			return;
+		}
+		uint64_t index = 0;
+		while (index < sums.thread_count && sums.threads[index].tid != tid) {
+			index++;
+		}
+		if (index == sums.thread_count) {
+			if (index >= ThreadSlots - 1) {
+				index = ThreadSlots - 1;
+			} else {
+				sums.thread_count++;
+				sums.threads[index].tid = tid;
+			}
+		}
+		sums.threads[index].count++;
+		sums.threads[index].ns += total;
+	}
+
+	void Log(double seconds) {
+		Counters sums;
+		uint64_t frames       = 0;
+		uint64_t distinct     = 0;
+		uint64_t half         = 0;
+		uint64_t half_pages   = 0;
+		uint64_t most         = 0;
+		uint64_t most_pages   = 0;
+		uint64_t half_count   = 0;
+		uint64_t ninety_count = 0;
+		uint64_t top          = 0;
+		size_t   tracked      = 0;
+		{
+			std::scoped_lock lock {mutex};
+			sums         = std::exchange(counters, {});
+			frames       = std::max<uint64_t>(frame_seen - frame_logged, 1);
+			frame_logged = frame_seen;
+			tracked      = page_count;
+			sorted.clear();
+			uint64_t total = 0;
+			for (size_t i = 0; pages && i < PageSlots; i++) {
+				auto& page = pages[i];
+				if (page.window_count == 0) {
+					continue;
+				}
+				sorted.push_back(page.window_count);
+				total += page.window_count;
+				if (uint64_t {page.window_frames} * 2 >= frames) {
+					half_pages++;
+					half += page.window_count;
+				}
+				if (uint64_t {page.window_frames} * 10 >= frames * 9) {
+					most_pages++;
+					most += page.window_count;
+				}
+				page.window_count  = 0;
+				page.window_frames = 0;
+			}
+			std::ranges::sort(sorted, std::greater {});
+			distinct     = sorted.size();
+			top          = sorted.empty() ? 0 : sorted.front();
+			uint64_t run = 0;
+			for (size_t i = 0; i < sorted.size(); i++) {
+				run += sorted[i];
+				if (half_count == 0 && run * 2 >= total) {
+					half_count = i + 1;
+				}
+				if (ninety_count == 0 && run * 10 >= total * 9) {
+					ninety_count = i + 1;
+				}
+			}
+		}
+		uint64_t all = 0;
+		for (uint32_t kind = 0; kind < Kinds; kind++) {
+			for (uint32_t path = 0; path < Paths; path++) {
+				all += sums.count[kind][path];
+			}
+		}
+		if (all == 0) {
+			return;
+		}
+		const auto  secs    = [](uint64_t ns) { return static_cast<double>(ns) / 1e9; };
+		const char* names[] = {"read faults", "write faults", "other"};
+		std::string line =
+		    fmt::format("[kyty-readback-stats] summary of the last {:.1f} s: guest threads, by kind", seconds);
+		for (uint32_t kind = 0; kind < Kinds; kind++) {
+			const auto& count  = sums.count[kind];
+			const auto& ns     = sums.ns[kind];
+			const auto& ready  = sums.ready[kind];
+			const auto& reason = sums.reason[kind];
+			line += fmt::format(
+			    "; {} {} readbacks in {:.3f} s: queue {} in {:.3f} s ({} with the GPU write complete at dispatch), "
+			    "timeline {} in {:.3f} s ({} complete at dispatch, {} forced flushes; not on the queue because: {} "
+			    "joined a copy in flight, {} no queue, {} write pending in the open command buffer, {} write not "
+			    "submitted, {} no free slot, {} other), no copy {} in {:.3f} s ({} complete at dispatch); handing "
+			    "{:.3f} s, GPU wait {:.3f} s, releasing {:.3f} s",
+			    names[kind], count[None] + count[Queue] + count[Timeline], secs(ns[None] + ns[Queue] + ns[Timeline]),
+			    count[Queue], secs(ns[Queue]), ready[Queue], count[Timeline], secs(ns[Timeline]), ready[Timeline],
+			    sums.flushes[kind], reason[Joined], reason[NoQueue], reason[PendingWrite], reason[Unsubmitted],
+			    reason[NoSlot], reason[Rest], count[None], secs(ns[None]), ready[None], secs(sums.phase[kind][0]),
+			    secs(sums.phase[kind][1]), secs(sums.phase[kind][2]));
+		}
+		line += "; write-fault readbacks by thread id";
+		std::sort(sums.threads, sums.threads + sums.thread_count,
+		          [](const ThreadSlot& a, const ThreadSlot& b) { return a.count > b.count; });
+		for (uint64_t i = 0; i < sums.thread_count; i++) {
+			line += fmt::format("{} {}: {} in {:.3f} s", i == 0 ? "" : ",", sums.threads[i].tid, sums.threads[i].count,
+			                    secs(sums.threads[i].ns));
+		}
+		if (const auto& rest = sums.threads[ThreadSlots - 1]; rest.count != 0) {
+			line += fmt::format(", further threads: {} in {:.3f} s", rest.count, secs(rest.ns));
+		}
+		line += "\n";
+		::Log::WriteToConsoleAndLog(line);
+		if (sums.writes == 0) {
+			return;
+		}
+		const auto& rejects  = sums.rejects;
+		const auto& distance = sums.distance;
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-readback-stats] summary of the last {:.1f} s: write-fault readbacks {} over {} suspend-point frames "
+		    "({} pages in the table of {}, {} lookups dropped); repeats: {} on a page not read back before, {} again in "
+		    "the same frame, {} in the same or the previous frame, {} within 2 frames, {} within the last {} write-fault "
+		    "readbacks; {} distinct pages, {} of them make 50 % and {} make 90 % of the readbacks, the top page {}; {} "
+		    "pages read back in at least half of the frames make {} readbacks, {} pages in at least 90 % of the frames "
+		    "make {}; followers dry run on {} queue readbacks: {} recent pages looked at, {} would be carried by {} "
+		    "readbacks (at most {} by one), not carried: {} in the read window, {} not GPU-written, {} copy in flight, "
+		    "{} under a GPU-written image, {} without a buffer, {} write not submitted, {} write not complete, {} "
+		    "carried before; {} readbacks avoidable (page carried before, no newer GPU write), {} on a carried page "
+		    "the GPU wrote again; pages from the previous write-fault readback in the same buffer: {} no previous, {} "
+		    "same page, {} +1, {} +2..+16, {} +17..+{}, {} beyond, {} -1, {} -2..-16, {} -17..-{}, {} beyond; read "
+		    "window: {} pages copied, {} after the faulted pages, {} of those GPU-written (in {} readbacks), {} of "
+		    "those later written by the guest without a readback, {} written again by the GPU and read back\n",
+		    seconds, sums.writes, frames, tracked, PageLimit, sums.untracked, sums.first, sums.same_frame, sums.within_one,
+		    sums.within_two, sums.within_lifetime, RecentLifetime, distinct, half_count, ninety_count, top, half_pages,
+		    half, most_pages, most, sums.queue_writes, sums.candidates, sums.would_follow, sums.with_followers,
+		    sums.most_followers, rejects[Overlap], rejects[NotGpu], rejects[InFlight], rejects[Texture], rejects[NoBuffer],
+		    rejects[NotSubmitted], rejects[NotComplete], rejects[Carried], sums.avoidable, sums.carried_rewritten,
+		    distance[NoPrevious], distance[Same], distance[Next], distance[Near], distance[Window], WindowPages,
+		    distance[Far], distance[Previous], distance[NearBack], distance[WindowBack], WindowPages, distance[FarBack],
+		    sums.window_pages, sums.extra_pages, sums.extra_gpu, sums.with_extra, sums.window_saved,
+		    sums.window_rewritten));
+	}
+};
+
+ReadbackStudy g_readback_study;
 
 }
 
@@ -560,6 +985,10 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) 
 	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
 	const auto page  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	auto       owner = WriteFaultOwner::Other;
+	if (ReadbackStudyOn() && !GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
+		g_readback_study.NoteGuestWrite(
+		    page, [&] { return m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE); });
+	}
 	if (GuestGpu::IsGpuThread() || GuestGpu::IsCommandProcessorThread() ||
 	    !GuestRange {Common::AlignDown(page, FaultBlockSize), FaultBlockSize}.Valid()) {
 		m_memory_tracker.NoteGuestWriteFault(page);
@@ -759,6 +1188,9 @@ void BufferCache::LogReadbackSummary() {
 	if (now - last < 10'000'000'000 || !stats.last_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
 		return;
 	}
+	if (ReadbackStudyOn()) {
+		g_readback_study.Log(static_cast<double>(now - last) / 1e9);
+	}
 	const auto cp_reads    = stats.cp_reads.exchange(0, std::memory_order_relaxed);
 	const auto other_reads = stats.other_reads.exchange(0, std::memory_order_relaxed);
 	const auto cp_ns       = stats.cp_ns.exchange(0, std::memory_order_relaxed);
@@ -815,9 +1247,17 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 	}
 	auto&      split          = g_readback_stats;
 	const auto dispatch_start = SteadyNs();
-	const auto note_split     = [&](std::atomic<uint64_t>& counter, int64_t since) {
+	const bool              study       = !command_processor && ReadbackStudyOn();
+	const uint32_t          study_kind  = !guest_fault ? ReadbackStudy::Other
+	                                      : is_write   ? ReadbackStudy::Write
+	                                                   : ReadbackStudy::Read;
+	uint32_t                study_path  = ReadbackStudy::None;
+	bool                    study_flush = false;
+	std::array<uint64_t, 3> phases {};
+	const auto              note_split  = [&](std::atomic<uint64_t>& counter, int64_t since, uint64_t& phase) {
 		if (!command_processor) {
-			counter.fetch_add(static_cast<uint64_t>(SteadyNs() - since), std::memory_order_relaxed);
+			phase = static_cast<uint64_t>(SteadyNs() - since);
+			counter.fetch_add(phase, std::memory_order_relaxed);
 		}
 	};
 	gpu.SendReadbackCommandSync([&] {
@@ -838,6 +1278,9 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		}
 		NoteReadbackWait(pages_begin, pages_end, false,
 		                 m_write_ticks.Latest(pages_begin, pages_end) >= m_scheduler.CurrentTick());
+		if (study) {
+			StudyReadback(buffer, vaddr, size, pages_begin, pages_end, tick, study_kind);
+		}
 		const bool guest_read = guest_fault && !is_write;
 		if (guest_read && !command_processor) {
 			(m_gpu_modified_ranges.Intersects(vaddr, size) ? g_readback_stats.other_gpu_bytes
@@ -853,6 +1296,12 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			m_inflight_readbacks.push_back({pages_begin, pages_end, recorded});
 			tick = std::max(tick, recorded);
 		}
+		if (study) {
+			study_path = queue_read.slot != nullptr ? ReadbackStudy::Queue
+			             : tick != 0                ? ReadbackStudy::Timeline
+			                                        : ReadbackStudy::None;
+			g_readback_study.Commit(study_path);
+		}
 		if (guest_read) {
 			NoteGuestReadPages(pages_begin, pages_end);
 		}
@@ -861,11 +1310,15 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			return;
 		}
 		if (queue_read.slot == nullptr && tick >= m_scheduler.CurrentTick()) {
+			study_flush = true;
 			m_scheduler.Flush();
 		}
 	});
-	note_split(split.other_dispatch_ns, dispatch_start);
+	note_split(split.other_dispatch_ns, dispatch_start, phases[0]);
 	if (tick == 0) {
+		if (study) {
+			g_readback_study.NoteTimes(study_kind, study_path, phases, study_flush);
+		}
 		return;
 	}
 	const bool replay_after = g_readback_replay.allowed && !is_write && !command_processor;
@@ -879,12 +1332,12 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		} else {
 			gpu.SendReadbackCommandSync(std::move(operation));
 		}
-		note_split(split.other_release_ns, release_start);
+		note_split(split.other_release_ns, release_start, phases[2]);
 	};
 	const auto wait_start = SteadyNs();
 	if (queue_read.slot != nullptr) {
 		FinishReadbackQueueRead(queue_read);
-		note_split(split.other_wait_ns, wait_start);
+		note_split(split.other_wait_ns, wait_start, phases[1]);
 		release([this, vaddr, size, pages_begin, pages_end, is_write, recorded = queue_read.recorded,
 		         followers = std::move(queue_read.followers)] {
 			const auto own = std::find_if(m_inflight_readbacks.begin(), m_inflight_readbacks.end(),
@@ -920,10 +1373,117 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
-		note_split(split.other_wait_ns, wait_start);
+		note_split(split.other_wait_ns, wait_start, phases[1]);
 		release([this, vaddr, size, pages_begin, pages_end, tick, is_write] {
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write);
 		});
+	}
+	if (study) {
+		g_readback_study.NoteTimes(study_kind, study_path, phases, study_flush);
+	}
+}
+
+void BufferCache::StudyReadback(const Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t pages_begin,
+                                uint64_t pages_end, uint64_t inflight, uint32_t kind) {
+	static_assert(ReadbackStudy::RecentPages == MaxGuestReadPages &&
+	              ReadbackStudy::RecentLifetime == GuestReadPageLifetime);
+	auto&      study        = g_readback_study;
+	auto&      sample       = study.pending;
+	const auto latest_write = [&](uint64_t begin, uint64_t bytes, uint64_t& latest, bool& unknown) {
+		bool written = false;
+		m_gpu_modified_ranges.ForEachInRange(begin, bytes, [&](uint64_t start, uint64_t end) {
+			const auto tick = m_write_ticks.Latest(start, end);
+			unknown |= tick == UINT64_MAX;
+			latest  = std::max(latest, tick);
+			written = true;
+			for (const auto& [pending, length]: m_pending_writes) {
+				unknown |= pending < end && start < pending + length;
+			}
+		});
+		return written;
+	};
+	uint64_t   needed    = m_device_address_tick;
+	bool       unknown   = false;
+	const bool written   = latest_write(pages_begin, pages_end - pages_begin, needed, unknown);
+	const bool free_slot = std::ranges::any_of(
+	    m_readback_slots, [](const auto& slot) { return !slot.busy.load(std::memory_order_acquire); });
+	sample.kind   = kind;
+	sample.ready  = written && !unknown && m_scheduler.IsFree(needed);
+	sample.reason = inflight != 0                                            ? ReadbackStudy::Joined
+	                : !m_graphics.readback_queue || m_device_address_pending ? ReadbackStudy::NoQueue
+	                : !written                                               ? ReadbackStudy::Rest
+	                : unknown                                                ? ReadbackStudy::PendingWrite
+	                : needed > m_scheduler.SubmittedTick()                   ? ReadbackStudy::Unsubmitted
+	                : !free_slot                                             ? ReadbackStudy::NoSlot
+	                                                                         : ReadbackStudy::Rest;
+	if (kind != ReadbackStudy::Write) {
+		return;
+	}
+	const auto faulted_end = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE), pages_end);
+	sample.page            = pages_begin;
+	sample.page_tick       = 0;
+	sample.page_unknown    = false;
+	(void)latest_write(pages_begin, TRACKER_PAGE_SIZE, sample.page_tick, sample.page_unknown);
+	sample.pages_begin = pages_begin;
+	sample.pages_end   = pages_end;
+	sample.buffer      = buffer.CpuAddress();
+	sample.frame       = m_scheduler.Context().FrameNumber();
+	sample.window      = (pages_end - pages_begin) / TRACKER_PAGE_SIZE;
+	sample.extra       = (pages_end - faulted_end) / TRACKER_PAGE_SIZE;
+	sample.extra_gpu   = 0;
+	sample.followers   = 0;
+	sample.rejects     = {};
+	for (auto page = faulted_end; page < pages_end && sample.extra_gpu < sample.extra_pages.size();
+	     page += TRACKER_PAGE_SIZE) {
+		if (m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			sample.extra_pages[sample.extra_gpu++] = page;
+		}
+	}
+	std::erase_if(study.recent, [&](const ReadbackStudy::Recent& entry) {
+		return entry.seq + ReadbackStudy::RecentLifetime < study.write_seq;
+	});
+	sample.candidates = study.recent.size();
+	for (const auto& entry: study.recent) {
+		const auto page = entry.page;
+		const auto end  = page + TRACKER_PAGE_SIZE;
+		if (page < pages_end && pages_begin < end) {
+			sample.rejects[ReadbackStudy::Overlap]++;
+			continue;
+		}
+		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			sample.rejects[ReadbackStudy::NotGpu]++;
+			continue;
+		}
+		if (InFlightReadbackTick(page, end) != 0) {
+			sample.rejects[ReadbackStudy::InFlight]++;
+			continue;
+		}
+		if (m_texture_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			sample.rejects[ReadbackStudy::Texture]++;
+			continue;
+		}
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(page, TRACKER_PAGE_SIZE)) {
+			sample.rejects[ReadbackStudy::NoBuffer]++;
+			continue;
+		}
+		uint64_t latest       = m_device_address_tick;
+		bool     page_unknown = false;
+		(void)latest_write(page, TRACKER_PAGE_SIZE, latest, page_unknown);
+		if (page_unknown || latest > m_scheduler.SubmittedTick()) {
+			sample.rejects[ReadbackStudy::NotSubmitted]++;
+			continue;
+		}
+		if (latest > needed && !m_scheduler.IsFree(latest)) {
+			sample.rejects[ReadbackStudy::NotComplete]++;
+			continue;
+		}
+		if (const auto carried = study.CarriedTick(page); carried != 0 && latest <= carried) {
+			sample.rejects[ReadbackStudy::Carried]++;
+			continue;
+		}
+		sample.follower_pages[sample.followers++] = {page, latest};
+		needed                                    = std::max(needed, latest);
 	}
 }
 
