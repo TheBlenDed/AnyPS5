@@ -3,6 +3,7 @@
 
 #include "common/debugCounters.h"
 #include "common/guardedCopy.h"
+#include "common/leverStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -151,6 +152,7 @@ bool ResolveFault(FaultContext& context, GpuAccess access, std::uint64_t address
         if (const auto length = Walker::SrtWalkerLoadLength(rip); length != 0) {
             std::uint32_t value = 0;
             if (Memory::MayFaultOnGpuRead(address, sizeof(value)) && Memory::TryReadAroundGpuWrites(address, &value, sizeof(value))) {
+                Common::LeverStats::MarkFault(Common::LeverStats::MarkAround);
                 CompleteWalkerLoad(context, length, value);
                 return true;
             }
@@ -178,6 +180,39 @@ bool ResolveFault(FaultContext& context, GpuAccess access, std::uint64_t address
     return false;
 }
 
+bool CountsExecutionFault() {
+    return Common::LeverStats::Enabled() && Libs::Graphics::GuestGpu::IsGpuThread();
+}
+
+bool ResolveCountedFault(FaultContext& context, GpuAccess access, std::uint64_t address, std::uint64_t rip) {
+    namespace Stats = Common::LeverStats;
+    if (!CountsExecutionFault()) return ResolveFault(context, access, address, rip);
+    auto& state       = Stats::State();
+    state.fault_marks = 0;
+    const auto start  = Stats::NowNs();
+    const bool handled = ResolveFault(context, access, address, rip);
+    const auto elapsed = static_cast<std::uint64_t>(Stats::NowNs() - start);
+    const auto marks   = state.fault_marks;
+    const auto path    = !handled                                 ? Stats::PathUnhandled
+                         : (marks & Stats::MarkFlush) != 0
+                             ? ((marks & Stats::MarkOpenWrite) != 0      ? Stats::PathFlushOpen
+                                : (marks & Stats::MarkPendingWrite) != 0 ? Stats::PathFlushPending
+                                                                         : Stats::PathFlushOther)
+                         : (marks & Stats::MarkQueue) != 0     ? Stats::PathQueue
+                         : (marks & Stats::MarkFeedback) != 0  ? Stats::PathFeedback
+                         : (marks & Stats::MarkWriteBack) != 0 ? Stats::PathWriteBack
+                         : (marks & Stats::MarkAround) != 0    ? Stats::PathAround
+                         : (marks & Stats::MarkTexture) != 0   ? Stats::PathTexture
+                                                               : Stats::PathPlain;
+    const std::uint32_t kind  = access == GpuAccess::Write ? Stats::FaultWrite : Stats::FaultRead;
+    const auto          phase = static_cast<std::uint32_t>(state.phase);
+    Stats::Add(Stats::FaultPhaseCount + kind * Stats::Phases + phase);
+    Stats::Add(Stats::FaultPhaseNs + kind * Stats::Phases + phase, elapsed);
+    Stats::Add(Stats::FaultPathCount + kind * Stats::FaultPaths + path);
+    Stats::Add(Stats::FaultPathNs + kind * Stats::FaultPaths + path, elapsed);
+    return handled;
+}
+
 }
 
 #ifdef _WIN32
@@ -189,9 +224,12 @@ bool HandleHostFault(void* exceptionPointers) {
     const bool guardPage = record.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION;
     if ((record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && !guardPage) || record.NumberParameters < 2) return false;
     const auto access = record.ExceptionInformation[0] == 8 ? GpuAccess::Execute : record.ExceptionInformation[0] == 1 ? GpuAccess::Write : GpuAccess::Read;
-    if (!guardPage && Common::ResumeGuardedCopy(exception->ContextRecord)) return true;
+    if (!guardPage && Common::ResumeGuardedCopy(exception->ContextRecord)) {
+        if (CountsExecutionFault()) Common::LeverStats::Add(Common::LeverStats::FaultGuardedCopy);
+        return true;
+    }
     const DWORD lastError = GetLastError();
-    const bool handled = ResolveFault(*exception->ContextRecord, access, static_cast<std::uint64_t>(record.ExceptionInformation[1]), static_cast<std::uint64_t>(exception->ContextRecord->Rip));
+    const bool handled = ResolveCountedFault(*exception->ContextRecord, access, static_cast<std::uint64_t>(record.ExceptionInformation[1]), static_cast<std::uint64_t>(exception->ContextRecord->Rip));
     if (handled && guardPage) RearmGuardPage(static_cast<std::uintptr_t>(record.ExceptionInformation[1]));
     SetLastError(lastError);
     return handled;
@@ -212,7 +250,7 @@ void RemoveFaultChain() {
 bool HandleHostFault(int signal, siginfo_t* info, void* native) {
     if ((signal != SIGSEGV && signal != SIGBUS) || info == nullptr || native == nullptr) return false;
     auto& context = *static_cast<ucontext_t*>(native);
-    return ResolveFault(context, DecodeAccess(context), reinterpret_cast<std::uint64_t>(info->si_addr), static_cast<std::uint64_t>(context.uc_mcontext.gregs[REG_RIP]));
+    return ResolveCountedFault(context, DecodeAccess(context), reinterpret_cast<std::uint64_t>(info->si_addr), static_cast<std::uint64_t>(context.uc_mcontext.gregs[REG_RIP]));
 }
 
 void InstallFaultChain() {

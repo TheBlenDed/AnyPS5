@@ -10,6 +10,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/leverStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/spscQueue.h"
@@ -491,6 +492,41 @@ static void PrepareDrawRayTracing(RenderContext& context, CommandBuffer& buffer,
 		native_rt->KeepPrepared(preparation);
 	}
 }
+
+#if defined(ANYPS5_KYTY)
+static Common::LeverStats::TemplateOutcome DrawTemplateRefusal(std::span<const ShaderStageRuntime* const> stages) {
+	namespace Stats = Common::LeverStats;
+	if (stages.size() > std::tuple_size_v<decltype(DrawTemplate::stages)>) {
+		return Stats::TemplateStages;
+	}
+	for (const auto* stage: stages) {
+		if (stage->module->info.info.uses_image_heap) {
+			return Stats::TemplateHeapProgram;
+		}
+	}
+	for (const auto* stage: stages) {
+		const auto& info = stage->module->info.info;
+		if (info.images.size() > 64u) {
+			return Stats::TemplateManyImages;
+		}
+		for (const auto& image: info.images) {
+			if (image.heap) {
+				return Stats::TemplateHeapImage;
+			}
+			if (image.table_capacity != 0u) {
+				return Stats::TemplateTable;
+			}
+			if (image.written) {
+				return Stats::TemplateWritten;
+			}
+			if (image.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+				return Stats::TemplateDynamicMip;
+			}
+		}
+	}
+	return Stats::TemplateMiss;
+}
+#endif
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
@@ -2104,6 +2140,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		return;
 	}
 	auto& pipeline = *pipeline_ptr;
+#if defined(ANYPS5_KYTY)
+	const bool lever_stats = Common::LeverStats::Enabled();
+#endif
 	if (pipeline.uses_image_heap) {
 		template_key   = 0;
 		draw_template  = nullptr;
@@ -2224,12 +2263,39 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
+#if defined(ANYPS5_KYTY)
+	if (lever_stats) {
+		namespace Stats = Common::LeverStats;
+		const bool eligible = !mesh_active && DrawTemplateEligible(runtimes);
+		const auto outcome  = template_held                                           ? Stats::TemplateHit
+		                      : !DrawTemplatesEnabled()                               ? Stats::TemplateOff
+		                      : m_draw_resource_key == 0                              ? Stats::TemplateNoKey
+		                      : mesh_active                                           ? Stats::TemplateMesh
+		                      : !eligible                                             ? DrawTemplateRefusal(runtimes)
+		                      : pipeline.uses_image_heap                              ? Stats::TemplateHeapPipeline
+		                      : draw_template != nullptr                              ? Stats::TemplatePartial
+		                      : template_key != 0 && DrawTemplateRefused(template_key) ? Stats::TemplateRefusedKey
+		                                                                              : Stats::TemplateMiss;
+		Stats::Add(Stats::Template + static_cast<uint32_t>(outcome));
+	}
+#endif
 	if (template_held && state_template != nullptr && state_template->commit_valid &&
 	    state_template->commit_layout == pipeline.pipeline_layout) {
+#if defined(ANYPS5_KYTY)
+		if (lever_stats) {
+			Common::LeverStats::Add(Common::LeverStats::CommitTemplate);
+		}
+#endif
 		CommitTemplateBindings(buffer, pipeline, stages, *state_template);
 	} else {
 		m_commit_capture =
 		    template_held && state_template != nullptr && TemplateCommitsSupported() ? state_template : nullptr;
+#if defined(ANYPS5_KYTY)
+		if (lever_stats) {
+			Common::LeverStats::Add(m_commit_capture != nullptr ? Common::LeverStats::CommitFullCaptured
+			                                                    : Common::LeverStats::CommitFull);
+		}
+#endif
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 		m_commit_capture = nullptr;
 	}

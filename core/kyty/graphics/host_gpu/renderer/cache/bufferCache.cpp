@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/hackNotice.h"
+#include "common/leverStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/spscQueue.h"
@@ -1137,8 +1138,14 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 	if constexpr (!async) {
 		if (DownloadOnReadbackQueue(buffer, copies, total_size)) {
+#if defined(ANYPS5_KYTY)
+			Common::LeverStats::MarkFault(Common::LeverStats::MarkQueue);
+#endif
 			return true;
 		}
+#if defined(ANYPS5_KYTY)
+		Common::LeverStats::MarkFault(Common::LeverStats::MarkFlush);
+#endif
 	}
 	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& copy: copies) {
@@ -1484,6 +1491,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			return;
 		}
 		if (TryGuestReadFromFeedback(vaddr, size, is_write)) {
+#if defined(ANYPS5_KYTY)
+			Common::LeverStats::MarkFault(Common::LeverStats::MarkFeedback);
+#endif
 			return;
 		}
 		if (const auto in_place = InPlaceGpuWriteTick(vaddr, size); in_place != 0) {
@@ -3826,6 +3836,9 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 		for (const auto& [vaddr, size]: m_pending_writes) {
 			if (vaddr < end && begin < vaddr + size) {
 				NoteReadbackWait(readback_begin, readback_end, false, true);
+#if defined(ANYPS5_KYTY)
+				Common::LeverStats::MarkFault(Common::LeverStats::MarkPendingWrite);
+#endif
 				return false;
 			}
 		}
@@ -3834,6 +3847,9 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	const bool device_address = needed != 0 && needed == m_device_address_tick;
 	if (needed >= m_scheduler.CurrentTick()) {
 		NoteReadbackWait(readback_begin, readback_end, device_address, true);
+#if defined(ANYPS5_KYTY)
+		Common::LeverStats::MarkFault(Common::LeverStats::MarkOpenWrite);
+#endif
 		return false;
 	}
 	NoteReadbackWait(readback_begin, readback_end, device_address, false);

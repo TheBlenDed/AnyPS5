@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/leverStats.h"
 #include "common/runtimeSwitches.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
@@ -269,12 +270,39 @@ void NoteAheadStop(SrtAheadStop stop, uint32_t slot) {
 	if (use == SrtLoadUse::Flat && stop != SrtAheadStop::Fault) stops.flat_stops++;
 }
 
+uint64_t NoteUnreadableLoad(uint64_t address, uint64_t result) {
+	auto& stops = t_ahead_stops;
+	if (!stops.active || g_guest_memory.line == nullptr) return result;
+	uint32_t   value = 0;
+	const auto line  = g_guest_memory.line(address, value);
+	if (stops.unreadable++ == 0) stops.first_line = line;
+	if (line != Common::LeverStats::LineClean) return result;
+	stops.clean++;
+	return uint64_t {1} << 32u | value;
+}
+
+void NoteExecutionLoad(uint64_t address, uint64_t result) {
+	constexpr uint64_t PageSize = 4096;
+	auto&              state    = Common::LeverStats::State();
+	if (t_walker_ahead || !state.redo) return;
+	state.probe_loads++;
+	if (address < GuestMemoryStart || !g_guest_memory_set.load(std::memory_order_acquire)) return;
+	const auto  page   = address & ~(PageSize - 1);
+	const auto& answer = t_page_answers[(page / PageSize) % t_page_answers.size()];
+	if (answer.walk != t_walk || answer.page != page || answer.kind != SrtWalkerPage::PerLoad) return;
+	((result >> 32u) & 1u) != 0 ? state.around_loads++ : state.direct_loads++;
+}
+
 uint64_t KYTY_SYSV_ABI ProbeGuestLoadCounted(uint64_t address, WalkerCachedPage* cache, uint32_t slot) {
 	const bool before = t_walker_faulted;
 	t_walker_faulted  = false;
-	const auto result = ProbeGuestLoad(address, cache);
-	if (t_walker_faulted) NoteAheadStop(SrtAheadStop::Unreadable, slot);
+	auto result = ProbeGuestLoad(address, cache);
+	if (t_walker_faulted) {
+		NoteAheadStop(SrtAheadStop::Unreadable, slot);
+		result = NoteUnreadableLoad(address, result);
+	}
 	t_walker_faulted = t_walker_faulted || before;
+	NoteExecutionLoad(address, result);
 	return result;
 }
 
@@ -306,6 +334,14 @@ uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* ca
 	}
 	if (t_walker_faulted) NoteAheadStop(SrtAheadStop::Unreadable, slot);
 	t_walker_faulted = t_walker_faulted || before;
+	return result;
+}
+
+uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoadCounted(uint64_t address, WalkerCachedPage* cache, uint32_t slot) {
+	const auto stops  = t_ahead_stops.stops;
+	auto       result = ProbeFlatGuestLoad(address, cache, slot);
+	if (t_ahead_stops.stops != stops) result = NoteUnreadableLoad(address, result);
+	NoteExecutionLoad(address, result);
 	return result;
 }
 #endif
@@ -340,7 +376,7 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_
 #if defined(ANYPS5_KYTY)
 	if (DefersFlatLoad(slot)) {
 		code.mov(code.edx, slot);
-		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeFlatGuestLoad));
+		code.mov(code.rax, reinterpret_cast<uint64_t>(AheadStopStats() ? &ProbeFlatGuestLoadCounted : &ProbeFlatGuestLoad));
 	} else if (AheadStopStats()) {
 		code.mov(code.edx, slot);
 		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoadCounted));
@@ -1798,7 +1834,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		t_ahead_stops = {.active = true, .walked = true, .guest_writes = runtime.pending_write != nullptr};
 	} else if (counted) {
 		g_walks_not_ahead.fetch_add(1, std::memory_order_relaxed);
+		if (Common::LeverStats::State().redo) Common::LeverStats::State().walks++;
 	}
+	const Common::LeverStats::PhaseScope lever_phase(Common::LeverStats::Phase::Walk, counted && !t_walker_ahead);
 #endif
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),

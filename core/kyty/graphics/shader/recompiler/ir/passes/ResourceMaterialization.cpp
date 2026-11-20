@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/leverStats.h"
 #include "common/runtimeSwitches.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -2417,6 +2418,10 @@ bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snap
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+#if defined(ANYPS5_KYTY)
+	const Common::LeverStats::PhaseScope lever_phase(Common::LeverStats::Phase::Materialize,
+	                                                 runtime.record_load == nullptr && Common::LeverStats::Enabled());
+#endif
 	t_record_blocks.clear();
 	for (auto& keys: PlanScratch(program).selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;

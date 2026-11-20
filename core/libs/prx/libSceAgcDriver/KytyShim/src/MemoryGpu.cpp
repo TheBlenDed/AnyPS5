@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
+#include "common/leverStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -256,6 +257,13 @@ bool WalkerGuestRead(uint64_t address, uint32_t& value, bool ahead, const uint8_
 	return !ahead && MayFaultOnGpuRead(address, sizeof(value)) && TryReadAroundGpuWrites(address, &value, sizeof(value));
 }
 
+uint8_t WalkerGuestLine(uint64_t address, uint32_t& value) {
+	if (g_gpu_resources == nullptr) return Common::LeverStats::LineGpuBytes;
+	if (!GetGpuResources().GetBufferCache().NoGpuBytesNow(address, sizeof(value))) return Common::LeverStats::LineGpuBytes;
+	if (GetGpuResources().GetTextureCache().IsRegionGpuModified(address, sizeof(value))) return Common::LeverStats::LineImage;
+	return TryReadBacking(address, &value, sizeof(value)) ? Common::LeverStats::LineClean : Common::LeverStats::LineUnbacked;
+}
+
 }
 #endif
 
@@ -266,7 +274,7 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	if (resources != nullptr) Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange);
 #if defined(ANYPS5_KYTY)
 	if (resources != nullptr && WalkerProbeEnabled()) {
-		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead});
+		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead, &WalkerGuestLine});
 	}
 #endif
 }

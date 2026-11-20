@@ -11,6 +11,7 @@
 #endif
 #include "common/file.h"
 #include "common/hackNotice.h"
+#include "common/leverStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -579,10 +580,88 @@ std::atomic<uint64_t>                                    g_ahead_stop_line {0};
 thread_local AheadStopStats::Slot                        t_ahead_stop_reason = AheadStopStats::Slots;
 thread_local AheadStopStats::Slot                        t_ahead_stop_extra  = AheadStopStats::Slots;
 
+void NoteUnreadableWalk(const ShaderRecompiler::IR::SrtAheadWalkStops& stops) {
+	namespace Stats = Common::LeverStats;
+	if (stops.first != ShaderRecompiler::IR::SrtAheadStop::Unreadable || stops.unreadable == 0) return;
+	Stats::Add(Stats::StopFirst + stops.first_line * Stats::Uses + static_cast<uint32_t>(stops.first_use));
+	const bool clean = stops.clean == stops.unreadable;
+	const bool only  = stops.stops == stops.unreadable;
+	Stats::Add(!clean ? Stats::StopDirty : !only ? Stats::StopOtherKind : Stats::StopAllClean);
+	if (clean && only && stops.ended) Stats::Add(Stats::StopAllCleanEnded);
+	if (stops.stops == 1) {
+		Stats::Add(Stats::StopSingle);
+		if (clean) Stats::Add(Stats::StopSingleClean);
+	}
+	Stats::Add(Stats::StopLoads, stops.unreadable);
+	Stats::Add(Stats::StopLoadsClean, stops.clean);
+}
+
+class LeverRedo final {
+public:
+	explicit LeverRedo(Common::LeverStats::RedoKind kind): m_kind(kind) {
+		namespace Stats = Common::LeverStats;
+		if (!Stats::Enabled() || !GuestGpu::IsGpuThread() || Stats::State().redo) return;
+		auto&      state = Stats::State();
+		const auto marks = state.fault_marks;
+		state            = {.redo = true, .phase = Stats::Phase::Resolve, .fault_marks = marks};
+		m_start          = Stats::NowNs();
+	}
+	~LeverRedo() {
+		namespace Stats = Common::LeverStats;
+		if (m_start == 0) return;
+		auto&      state = Stats::State();
+		const auto total = Stats::NowNs() - m_start;
+		const auto group = state.slow        ? Stats::RedoSlow
+		                   : state.no_module ? Stats::RedoNoModule
+		                   : state.heap      ? Stats::RedoHeap
+		                                     : Stats::RedoPlain;
+		const auto base  = Stats::Redo + (m_kind * Stats::RedoClasses + group) * Stats::RedoFields;
+		Stats::Add(base + Stats::RedoCount);
+		Stats::Add(base + Stats::RedoStages, state.stages);
+		Stats::Add(base + Stats::RedoTotalNs, static_cast<uint64_t>(total));
+		Stats::Add(base + Stats::RedoProgramNs, static_cast<uint64_t>(state.program_ns));
+		Stats::Add(base + Stats::RedoMaterializeNs, static_cast<uint64_t>(state.materialize_ns - state.inner_walk_ns));
+		Stats::Add(base + Stats::RedoWalkNs, static_cast<uint64_t>(state.walk_ns));
+		Stats::Add(Stats::RedoWalks, state.walks);
+		Stats::Add(Stats::RedoProbeLoads, state.probe_loads);
+		Stats::Add(Stats::RedoAroundLoads, state.around_loads);
+		Stats::Add(Stats::RedoDirectLoads, state.direct_loads);
+		state.redo  = false;
+		state.phase = Stats::Phase::Elsewhere;
+	}
+	LeverRedo(const LeverRedo&)            = delete;
+	LeverRedo& operator=(const LeverRedo&) = delete;
+
+private:
+	Common::LeverStats::RedoKind m_kind;
+	int64_t                      m_start = 0;
+};
+
+class LeverStage final {
+public:
+	LeverStage(): m_start(Common::LeverStats::Enabled() && Common::LeverStats::State().redo ? Common::LeverStats::NowNs() : 0) {}
+	const ShaderModule* Done(const ShaderModule* module) const {
+		if (m_start == 0) return module;
+		auto& state = Common::LeverStats::State();
+		state.program_ns += Common::LeverStats::NowNs() - m_start;
+		state.stages++;
+		if (module == nullptr) {
+			state.no_module = true;
+		} else if (module->info.info.uses_image_heap) {
+			state.heap = true;
+		}
+		return module;
+	}
+
+private:
+	int64_t m_start;
+};
+
 void NoteAheadWalkStop() {
 	using ShaderRecompiler::IR::SrtAheadStop;
 	using ShaderRecompiler::IR::SrtLoadUse;
 	const auto& stops = ShaderRecompiler::IR::SrtAheadWalkStopsOfThread();
+	NoteUnreadableWalk(stops);
 	if (stops.first == SrtAheadStop::None) {
 		AheadStopStats::Note(!stops.walked  ? AheadStopStats::BeforeWalk
 		                     : !stops.ended ? AheadStopStats::WalkEnded
@@ -601,6 +680,81 @@ void NoteAheadWalkStop() {
 		}
 	}
 	AheadStopStats::Note(reason, extra);
+}
+
+void LogLeverStats() {
+	namespace Stats = Common::LeverStats;
+	std::array<uint64_t, Stats::Slots> c {};
+	for (uint32_t i = 0; i < Stats::Slots; i++) c[i] = Stats::Take(i);
+	const auto ms    = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	const auto first = [&](uint32_t line) {
+		const auto* use = c.data() + Stats::StopFirst + line * Stats::Uses;
+		return fmt::format("{} ({} value, {} flat, {} descriptor word, {} zero-test)", use[0] + use[1] + use[2] + use[3], use[0],
+		                   use[1], use[2], use[3]);
+	};
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-lever] A ahead walks stopped first at an unreadable load: first load on a clean line {}; line holds GPU "
+	    "bytes {}; GPU-modified image {}; no backing {}; walks with every unreadable load on a clean line and no other "
+	    "stop {} ({} ran to the end), with a dirty-line load {}, clean lines but another stop kind {}; single-stop walks "
+	    "{} ({} clean); unreadable loads {} ({} clean)\n",
+	    first(Stats::LineClean), first(Stats::LineGpuBytes), first(Stats::LineImage), first(Stats::LineUnbacked),
+	    c[Stats::StopAllClean], c[Stats::StopAllCleanEnded], c[Stats::StopDirty], c[Stats::StopOtherKind], c[Stats::StopSingle],
+	    c[Stats::StopSingleClean], c[Stats::StopLoads], c[Stats::StopLoadsClean]));
+	const auto redo = [&](uint32_t kind, uint32_t group) {
+		const auto* f = c.data() + Stats::Redo + (kind * Stats::RedoClasses + group) * Stats::RedoFields;
+		return fmt::format("{} ({} stages) {:.1f} ms = walk {:.1f} + materialize {:.1f} + program {:.1f} + outside {:.1f}",
+		                   f[Stats::RedoCount], f[Stats::RedoStages], ms(f[Stats::RedoTotalNs]), ms(f[Stats::RedoWalkNs]),
+		                   ms(f[Stats::RedoMaterializeNs]),
+		                   ms(f[Stats::RedoProgramNs]) - ms(f[Stats::RedoMaterializeNs]) - ms(f[Stats::RedoWalkNs]),
+		                   ms(f[Stats::RedoTotalNs]) - ms(f[Stats::RedoProgramNs]));
+	};
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-lever] B execution thread resolutions: draws no heap {}; heap {}; no module {}; compile path {}; dispatches "
+	    "no heap {}; heap {}; no module {}; compile path {}; {} walks, {} probed loads, {} read around GPU writes, {} "
+	    "left to a direct load\n",
+	    redo(Stats::RedoDraw, Stats::RedoPlain), redo(Stats::RedoDraw, Stats::RedoHeap),
+	    redo(Stats::RedoDraw, Stats::RedoNoModule), redo(Stats::RedoDraw, Stats::RedoSlow),
+	    redo(Stats::RedoDispatch, Stats::RedoPlain), redo(Stats::RedoDispatch, Stats::RedoHeap),
+	    redo(Stats::RedoDispatch, Stats::RedoNoModule), redo(Stats::RedoDispatch, Stats::RedoSlow), c[Stats::RedoWalks],
+	    c[Stats::RedoProbeLoads], c[Stats::RedoAroundLoads], c[Stats::RedoDirectLoads]));
+	const auto fault = [&](uint32_t access) {
+		const auto* n    = c.data() + Stats::FaultPhaseCount + access * Stats::Phases;
+		const auto* t    = c.data() + Stats::FaultPhaseNs + access * Stats::Phases;
+		const auto* pn   = c.data() + Stats::FaultPathCount + access * Stats::FaultPaths;
+		const auto* pt   = c.data() + Stats::FaultPathNs + access * Stats::FaultPaths;
+		const auto  pair = [&](const uint64_t* count, const uint64_t* time, uint32_t index) {
+			return fmt::format("{}/{:.1f}", count[index], ms(time[index]));
+		};
+		return fmt::format(
+		    "{}/{:.1f} (walk {}, materialize {}, resolve {}, elsewhere {}; around {}, write-back wait {}, feedback {}, "
+		    "queue {}, flush open-buffer write {}, flush pending write {}, flush other {}, image {}, no readback {}, "
+		    "unhandled {})",
+		    n[0] + n[1] + n[2] + n[3], ms(t[0] + t[1] + t[2] + t[3]), pair(n, t, 3), pair(n, t, 2), pair(n, t, 1),
+		    pair(n, t, 0), pair(pn, pt, Stats::PathAround), pair(pn, pt, Stats::PathWriteBack),
+		    pair(pn, pt, Stats::PathFeedback), pair(pn, pt, Stats::PathQueue), pair(pn, pt, Stats::PathFlushOpen),
+		    pair(pn, pt, Stats::PathFlushPending), pair(pn, pt, Stats::PathFlushOther), pair(pn, pt, Stats::PathTexture),
+		    pair(pn, pt, Stats::PathPlain), pair(pn, pt, Stats::PathUnhandled));
+	};
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-lever] C execution thread faults (count/ms): read {}; write {}; {} resumed guarded copies\n",
+	    fault(Stats::FaultRead), fault(Stats::FaultWrite), c[Stats::FaultGuardedCopy]));
+	const auto* draws = c.data() + Stats::Template;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-lever] D draw templates: {} hit, {} partial, {} miss, {} refused key, {} off, {} no resource key, {} mesh, "
+	    "{} image heap program, {} heap image, {} table, {} written image, {} dynamic mip, {} over 64 images, {} image "
+	    "heap pipeline, {} stage count; commits {} template, {} full captured, {} full\n",
+	    draws[Stats::TemplateHit], draws[Stats::TemplatePartial], draws[Stats::TemplateMiss],
+	    draws[Stats::TemplateRefusedKey], draws[Stats::TemplateOff], draws[Stats::TemplateNoKey], draws[Stats::TemplateMesh],
+	    draws[Stats::TemplateHeapProgram], draws[Stats::TemplateHeapImage], draws[Stats::TemplateTable],
+	    draws[Stats::TemplateWritten], draws[Stats::TemplateDynamicMip], draws[Stats::TemplateManyImages],
+	    draws[Stats::TemplateHeapPipeline], draws[Stats::TemplateStages], c[Stats::CommitTemplate],
+	    c[Stats::CommitFullCaptured], c[Stats::CommitFull]));
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-lever] E waits: {} PFP_SYNC_ME, {} fetch waits {:.1f} ms, {} fetch readbacks {:.1f} ms, {} host copy drains "
+	    "{:.1f} ms, {} blocking queue pops {:.1f} ms\n",
+	    c[Stats::SyncPackets], c[Stats::FetchWaits], ms(c[Stats::FetchWaitNs]), c[Stats::FetchReads],
+	    ms(c[Stats::FetchReadNs]), c[Stats::CopyDrains], ms(c[Stats::CopyDrainNs]), c[Stats::QueuePops],
+	    ms(c[Stats::QueuePopNs])));
 }
 
 void LogAheadStops(double seconds) {
@@ -634,6 +788,7 @@ void LogAheadStops(double seconds) {
 	    c[AheadStopStats::ImageHeap], c[SkipDispatch], c[NotCompiled], c[MaxStages], c[BeforeWalk], c[Other], skipped, c[TableDraw],
 	    c[XprDraw], c[NoOffsets], c[TableDispatch], ShaderRecompiler::IR::TakeSrtWalksNotAhead(), c[DrawHit],
 	    c[DrawStale], c[DrawMismatch], c[DrawNone], c[DispatchHit], c[DispatchStale], c[DispatchNone]));
+	LogLeverStats();
 }
 #endif
 
@@ -1872,6 +2027,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			}
 		}
 	} const translate_scope {params.hash};
+	if (Common::LeverStats::Enabled() && Common::LeverStats::State().redo) Common::LeverStats::State().slow = true;
 #endif
 	if (m_queue_only) {
 		if (!m_in_flight.contains(m_lookup_key)) {
@@ -2341,6 +2497,9 @@ void PipelineCache::WriteDriverCache() {
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+#if defined(ANYPS5_KYTY)
+	const LeverRedo lever_redo(Common::LeverStats::RedoDraw);
+#endif
 	ResolveGraphicsPrograms(command.GetRegisters(), command.GetUserConfig(), command.GetShaders(),
 	                        state, nullptr);
 }
@@ -2804,7 +2963,12 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		return true;
 	}
 	if (pixel_active) {
+#if defined(ANYPS5_KYTY)
+		const LeverStage lever_stage;
+		const auto*      pixel_module = lever_stage.Done(GetProgram(pixel_params, pixel_info, push_data_cursor));
+#else
 		const auto* pixel_module = GetProgram(pixel_params, pixel_info, push_data_cursor);
+#endif
 		if (pixel_module == nullptr) {
 			vertex_info[0].stage = {};
 			return true;
@@ -2818,7 +2982,12 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		state.mrt_mask &= color_output_mask;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
+#if defined(ANYPS5_KYTY)
+		const LeverStage lever_stage;
+		lever_stage.Done(GetProgram(vertex_params[i], vertex_info[i], push_data_cursor));
+#else
 		GetProgram(vertex_params[i], vertex_info[i], push_data_cursor);
+#endif
 	}
 	return true;
 }
@@ -3844,6 +4013,9 @@ PipelineCache::TableProgram PipelineCache::GetPixelProgramTable(
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info,
                                                      bool                         guest_traversal) {
+#if defined(ANYPS5_KYTY)
+	const LeverRedo lever_redo(Common::LeverStats::RedoDispatch);
+#endif
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 #if defined(ANYPS5_KYTY)
 	ShaderParams params;
@@ -3860,7 +4032,12 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	const ProgramLockGuard lock(m_program_lock);
 	m_guest_traversal             = guest_traversal;
+#if defined(ANYPS5_KYTY)
+	const LeverStage       lever_stage;
+	const auto*            module = lever_stage.Done(GetProgram(params, input_info, push_data_cursor));
+#else
 	const auto*            module = GetProgram(params, input_info, push_data_cursor);
+#endif
 	m_guest_traversal             = false;
 	return module;
 }

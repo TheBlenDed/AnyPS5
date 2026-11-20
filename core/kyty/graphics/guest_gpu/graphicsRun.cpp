@@ -7,6 +7,7 @@
 #include "common/runtimeSwitches.h"
 #endif
 #include "common/hackNotice.h"
+#include "common/leverStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -467,6 +468,10 @@ void GuestGpu::ExecutionThread() {
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
+#if defined(ANYPS5_KYTY)
+			const Common::LeverStats::Timer lever_pop(Common::LeverStats::QueuePops, Common::LeverStats::QueuePopNs,
+			                                          Common::LeverStats::Enabled());
+#endif
 			operation  = operations.Pop();
 			if (!operation) {
 				if (operations.IsStopped()) {
@@ -810,6 +815,10 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		executor.InvalidateRenderTargetMemo();
 		if (auto* copies = GetScheduler().HostCopies();
 		    copies != nullptr && operation.kind == GpuOperationKind::Callback) {
+#if defined(ANYPS5_KYTY)
+			const Common::LeverStats::Timer lever_drain(Common::LeverStats::CopyDrains, Common::LeverStats::CopyDrainNs,
+			                                            Common::LeverStats::Enabled());
+#endif
 			copies->Drain();
 		}
 	}
@@ -1597,6 +1606,11 @@ void CommandProcessor::SyncFetchWithExecution() {
 	if (m_pipeline != nullptr) {
 		m_fetch_sync_sequence = m_pipeline->NextSequence() - 1;
 		m_pipeline->NoteOrderedSequence(m_fetch_sync_sequence);
+#if defined(ANYPS5_KYTY)
+		if (Common::LeverStats::Enabled()) {
+			Common::LeverStats::Add(Common::LeverStats::SyncPackets);
+		}
+#endif
 	}
 }
 
@@ -1632,12 +1646,24 @@ void CommandProcessor::PrepareCommandFetch(std::span<const uint32_t> commands) {
 	if (m_fetch_sync_sequence == 0 || m_pipeline == nullptr) {
 		return;
 	}
+#if defined(ANYPS5_KYTY)
+	{
+		const Common::LeverStats::Timer lever_wait(Common::LeverStats::FetchWaits, Common::LeverStats::FetchWaitNs,
+		                                           Common::LeverStats::Enabled());
+		m_pipeline->WaitForExecution(std::exchange(m_fetch_sync_sequence, 0));
+	}
+#else
 	m_pipeline->WaitForExecution(std::exchange(m_fetch_sync_sequence, 0));
+#endif
 	const auto address = reinterpret_cast<uint64_t>(commands.data());
 	const auto size    = commands.size_bytes();
 	auto&      buffers = m_renderer.GetBufferCache();
 	if (size != 0 && GuestRange {address, size}.Valid() && buffers.MayBeGpuModified(address, size) &&
 	    buffers.IsRegionGpuModified(address, size)) {
+#if defined(ANYPS5_KYTY)
+		const Common::LeverStats::Timer lever_read(Common::LeverStats::FetchReads, Common::LeverStats::FetchReadNs,
+		                                           Common::LeverStats::Enabled());
+#endif
 		buffers.ReadMemory(address, size);
 	}
 }

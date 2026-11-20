@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/emulatorConfig.h"
 #include "common/hackNotice.h"
+#include "common/leverStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/bdaDirtyRegions.h"
@@ -98,6 +99,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		}
 	}
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
+#if defined(ANYPS5_KYTY)
+		Common::LeverStats::MarkFault(Common::LeverStats::MarkWriteBack);
+#endif
 		return true;
 	}
 	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
@@ -108,6 +112,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		const bool texture = m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		const bool heap    = m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 		m_strict_watch.InvalidateMemory(fault_vaddr, fault_size);
+#if defined(ANYPS5_KYTY)
+		if (texture || heap) {
+			Common::LeverStats::MarkFault(Common::LeverStats::MarkTexture);
+		}
+#endif
 		if (!GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
 			m_page_manager.NoteWriteFault(fault_vaddr);
 			BufferCache::CountWriteFault(owner, texture || heap);
