@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "graphics/host_gpu/renderer/cache/eagerReadbackWindows.h"
 #include "common/alignment.h"
 #include "gpu_tiler_shaders/buffer_scatter_spv.h"
 #include "common/assert.h"
@@ -544,6 +545,341 @@ struct ReadbackStudy {
 
 ReadbackStudy g_readback_study;
 
+bool EagerReadbackOn() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_EAGER_READBACK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
+struct EagerReadbackStats {
+	std::atomic<uint64_t> hot {0};
+	std::atomic<uint64_t> faults {0};
+	std::atomic<uint64_t> woken {0};
+	std::atomic<uint64_t> slept {0};
+	std::atomic<uint64_t> blocked {0};
+	std::atomic<uint64_t> dropped {0};
+	std::atomic<uint64_t> issued {0};
+	std::atomic<uint64_t> bytes {0};
+	std::atomic<uint64_t> pages {0};
+	std::atomic<uint64_t> skipped_command {0};
+	std::atomic<uint64_t> skipped_busy {0};
+	std::atomic<uint64_t> skipped_slots {0};
+	std::atomic<uint64_t> skipped_image_pages {0};
+	std::atomic<uint64_t> windows_published {0};
+	std::atomic<uint64_t> published {0};
+	std::atomic<uint64_t> released {0};
+	std::atomic<uint64_t> rewritten {0};
+	std::atomic<uint64_t> returned {0};
+	std::atomic<uint64_t> left {0};
+	std::atomic<uint64_t> orphaned {0};
+	std::atomic<uint64_t> waited {0};
+	std::atomic<uint64_t> idle {0};
+	std::atomic<uint64_t> around {0};
+	std::atomic<uint64_t> settled {0};
+	std::atomic<uint64_t> reclaimed {0};
+	std::atomic<uint64_t> skipped_device {0};
+};
+
+EagerReadbackStats g_eager_stats;
+
+constexpr uint64_t BufferCacheEagerDeviceFrames = 2;
+
+void Count(std::atomic<uint64_t>& counter, uint64_t value = 1) {
+	counter.fetch_add(value, std::memory_order_relaxed);
+}
+
+void LogEagerReadbackSummary(double seconds) {
+	auto&      stats               = g_eager_stats;
+	const auto take                = [](std::atomic<uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+	const auto hot                 = stats.hot.load(std::memory_order_relaxed);
+	const auto faults              = take(stats.faults);
+	const auto woken               = take(stats.woken);
+	const auto slept               = take(stats.slept);
+	const auto blocked             = take(stats.blocked);
+	const auto dropped             = take(stats.dropped);
+	const auto issued              = take(stats.issued);
+	const auto bytes               = take(stats.bytes);
+	const auto pages               = take(stats.pages);
+	const auto skipped_command     = take(stats.skipped_command);
+	const auto skipped_busy        = take(stats.skipped_busy);
+	const auto skipped_slots       = take(stats.skipped_slots);
+	const auto skipped_image_pages = take(stats.skipped_image_pages);
+	const auto windows_published   = take(stats.windows_published);
+	const auto published           = take(stats.published);
+	const auto released            = take(stats.released);
+	const auto rewritten           = take(stats.rewritten);
+	const auto returned            = take(stats.returned);
+	const auto left                = take(stats.left);
+	const auto orphaned            = take(stats.orphaned);
+	const auto waited              = take(stats.waited);
+	const auto idle                = take(stats.idle);
+	const auto around              = take(stats.around);
+	const auto settled             = take(stats.settled);
+	const auto reclaimed           = take(stats.reclaimed);
+	const auto skipped_device      = take(stats.skipped_device);
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-eager-readback] summary of the last {:.1f} s: {} windows hot now ({} guest fault readbacks counted, {} "
+	    "windows woken by a fault, {} put to sleep after {} idle publications in a row, {} blocked by a command "
+	    "processor readback, {} faults without a table slot); {} eager copies issued with {} bytes of {} pages, not "
+	    "issued: {} windows in command buffer memory, {} with a readback in flight, {} without a free slot, {} within "
+	    "{} frames of a draw with device address stores, {} pages under an image; {} windows published with {} pages "
+	    "handed to the CPU side, {} of those publications idle (no fault and no guest write seen since the one "
+	    "before); pages not handed over: {} discarded because a newer GPU write was recorded, {} returned to the GPU "
+	    "side (device address stores after the copy, an image, command buffer memory or a command processor "
+	    "readback), {} already released, {} left to another readback in flight, {} without a buffer; {} pages taken "
+	    "back from the CPU side before device address stores or after a command processor readback; {} faults waited "
+	    "for an eager copy in flight, {} copies taken back for a fault of the execution thread, {} label writes sent "
+	    "to the fault path because of a copy in flight\n",
+	    seconds, hot, faults, woken, slept, EagerReadbackWindows::IdleLimit, blocked, dropped, issued, bytes, pages,
+	    skipped_command, skipped_busy, skipped_slots, skipped_device, BufferCacheEagerDeviceFrames, skipped_image_pages,
+	    windows_published, published, idle, rewritten, returned, released, left, orphaned, reclaimed, waited, settled,
+	    around));
+}
+
+}
+
+struct BufferCache::EagerReadback {
+	static constexpr size_t   SlotCount      = 128;
+	static constexpr uint64_t SlotSize       = EagerReadbackWindows::WindowSize;
+	static constexpr uint64_t PagesPerWindow = SlotSize / TRACKER_PAGE_SIZE;
+	static_assert(PagesPerWindow <= 32);
+	struct Entry {
+		size_t                                     window     = 0;
+		uint32_t                                   slot       = 0;
+		uint32_t                                   pages      = 0;
+		uint64_t                                   begin      = 0;
+		uint64_t                                   span_begin = 0;
+		uint64_t                                   span_end   = 0;
+		uint64_t                                   tick       = 0;
+		bool                                       finished   = false;
+		std::vector<std::pair<uint64_t, uint64_t>> bytes;
+	};
+	struct Batch {
+		uint64_t                           device_uses = 0;
+		std::shared_ptr<std::atomic<bool>> done;
+		std::vector<Entry>                 entries;
+	};
+	struct Part {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t offset  = 0;
+	};
+	struct Released {
+		uint32_t                                   pages = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> bytes;
+	};
+	static constexpr size_t MaxReleased     = 1024;
+	static constexpr size_t MaxInFlightRuns = 4;
+
+	EagerReadbackWindows                   windows;
+	std::unique_ptr<Buffer>                staging;
+	std::vector<uint32_t>                  free_slots;
+	std::vector<size_t>                    queued;
+	std::vector<Batch>                     batches;
+	std::atomic<uint32_t>                  ready {0};
+	std::unordered_map<uint64_t, Released> released;
+	uint64_t                               device_frame = 0;
+	bool                                   device_seen  = false;
+
+	EagerReadback() {
+		free_slots.reserve(SlotCount);
+		for (uint32_t slot = SlotCount; slot-- > 0;) {
+			free_slots.push_back(slot);
+		}
+	}
+
+	[[nodiscard]] bool InFlight(uint64_t begin, uint64_t end) const noexcept {
+		for (const auto& batch: batches) {
+			for (const auto& entry: batch.entries) {
+				if (!entry.finished && entry.span_begin < end && begin < entry.span_end) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	[[nodiscard]] bool CopyPending(uint64_t begin, uint64_t end, bool bytes) const noexcept {
+		for (const auto& batch: batches) {
+			if (batch.done->load(std::memory_order_acquire)) {
+				continue;
+			}
+			for (const auto& entry: batch.entries) {
+				if (entry.finished || entry.span_begin >= end || begin >= entry.span_end) {
+					continue;
+				}
+				if (!bytes) {
+					return true;
+				}
+				for (const auto& [from, to]: entry.bytes) {
+					if (from < end && begin < to) {
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	void Queue(size_t index) {
+		auto& window = windows.At(index);
+		if (window.in_flight) {
+			window.again = true;
+		} else if (!window.queued) {
+			window.queued = true;
+			queued.push_back(index);
+		}
+	}
+
+	void Finish(BufferCache& cache, Entry& entry, bool give_back, uint64_t frame);
+	void Reclaim(BufferCache& cache, uint64_t begin, const Released& record);
+	void ReclaimAll(BufferCache& cache);
+	void ReclaimWindows(BufferCache& cache, uint64_t begin, uint64_t end);
+};
+
+void BufferCache::EagerReadback::Reclaim(BufferCache& cache, uint64_t begin, const Released& record) {
+	for (uint64_t bit = 0; bit < PagesPerWindow; bit++) {
+		if ((record.pages >> bit & 1u) == 0) {
+			continue;
+		}
+		const auto page = begin + bit * TRACKER_PAGE_SIZE;
+		if (cache.m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		const auto* owner = cache.m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || !cache.m_slot_buffers[*owner].IsInBounds(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		bool marked = false;
+		cache.m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(page, TRACKER_PAGE_SIZE,
+		                                                             [&](uint64_t, uint64_t) { marked = true; });
+		if (!marked) {
+			continue;
+		}
+		for (const auto& [from, to]: record.bytes) {
+			const auto first = std::max(from, page);
+			const auto last  = std::min(to, page + TRACKER_PAGE_SIZE);
+			if (first < last && cache.m_gpu_modified_ranges.Add(first, last - first)) {
+				cache.NoteGpuModifiedChange(first, last - first, true);
+			}
+		}
+		Count(g_eager_stats.reclaimed);
+	}
+}
+
+void BufferCache::EagerReadback::ReclaimAll(BufferCache& cache) {
+	for (const auto& [begin, record]: released) {
+		Reclaim(cache, begin, record);
+	}
+	released.clear();
+}
+
+void BufferCache::EagerReadback::ReclaimWindows(BufferCache& cache, uint64_t begin, uint64_t end) {
+	for (auto window = EagerReadbackWindows::Start(begin); window < end && !released.empty(); window += SlotSize) {
+		if (const auto record = released.find(window); record != released.end()) {
+			Reclaim(cache, window, record->second);
+			released.erase(record);
+		}
+	}
+}
+
+void BufferCache::EagerReadback::Finish(BufferCache& cache, Entry& entry, bool give_back, uint64_t frame) {
+	auto& stats    = g_eager_stats;
+	auto& window   = windows.At(entry.window);
+	entry.finished = true;
+	std::erase_if(cache.m_inflight_readbacks, [&](const InFlightReadback& readback) {
+		return readback.eager && readback.tick == entry.tick && readback.begin >= entry.span_begin &&
+		       readback.end <= entry.span_end;
+	});
+	give_back = give_back || window.blocked || cache.m_memory_tracker.IsCommandBlock(entry.begin) ||
+	            cache.m_memory_tracker.IsSegmentBlock(entry.begin);
+	const bool images    = !give_back && cache.m_texture_cache.IsRegionRegistered(entry.begin, SlotSize);
+	uint64_t   run_begin = 0;
+	uint64_t   run_end   = 0;
+	uint64_t   published = 0;
+	uint32_t   handed    = 0;
+	const auto flush     = [&] {
+		if (run_begin < run_end) {
+			cache.UnmarkGpuModified(run_begin, run_end - run_begin);
+		}
+		run_begin = 0;
+		run_end   = 0;
+	};
+	for (uint64_t bit = 0; bit < PagesPerWindow; bit++) {
+		if ((entry.pages >> bit & 1u) == 0) {
+			continue;
+		}
+		const auto page = entry.begin + bit * TRACKER_PAGE_SIZE;
+		if (!cache.m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			Count(stats.released);
+			continue;
+		}
+		if (give_back || (images && cache.m_texture_cache.IsRegionRegistered(page, TRACKER_PAGE_SIZE))) {
+			const auto* owner = cache.m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner || !cache.m_slot_buffers[*owner].IsInBounds(page, TRACKER_PAGE_SIZE)) {
+				Count(stats.orphaned);
+				continue;
+			}
+			for (const auto& [from, to]: entry.bytes) {
+				const auto first = std::max(from, page);
+				const auto last  = std::min(to, page + TRACKER_PAGE_SIZE);
+				if (first < last && cache.m_gpu_modified_ranges.Add(first, last - first)) {
+					cache.NoteGpuModifiedChange(first, last - first, true);
+				}
+			}
+			Count(stats.returned);
+			continue;
+		}
+		if (cache.InFlightReadbackTick(page, page + TRACKER_PAGE_SIZE) != 0) {
+			Count(stats.left);
+			continue;
+		}
+		if (cache.m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			Count(stats.rewritten);
+			continue;
+		}
+		if (page != run_end) {
+			flush();
+			run_begin = page;
+		}
+		run_end = page + TRACKER_PAGE_SIZE;
+		handed |= 1u << bit;
+		published++;
+	}
+	flush();
+	window.in_flight = false;
+	free_slots.push_back(entry.slot);
+	if (published != 0) {
+		if (released.size() >= MaxReleased && !released.contains(entry.begin)) {
+			ReclaimAll(cache);
+		}
+		auto& record = released[entry.begin];
+		std::erase_if(record.bytes, [&](const std::pair<uint64_t, uint64_t>& bytes) {
+			return (handed >> ((bytes.first - entry.begin) / TRACKER_PAGE_SIZE) & 1u) != 0;
+		});
+		for (const auto& [from, to]: entry.bytes) {
+			for (auto page = Common::AlignDown(from, TRACKER_PAGE_SIZE); page < to; page += TRACKER_PAGE_SIZE) {
+				if ((handed >> ((page - entry.begin) / TRACKER_PAGE_SIZE) & 1u) != 0) {
+					record.bytes.emplace_back(std::max(from, page), std::min(to, page + TRACKER_PAGE_SIZE));
+				}
+			}
+		}
+		record.pages |= handed;
+		Count(stats.windows_published);
+		Count(stats.published, published);
+		const auto state = windows.NotePublished(entry.window, frame);
+		if (state != EagerReadbackWindows::Published::Touched) {
+			Count(stats.idle);
+		}
+		if (state == EagerReadbackWindows::Published::Asleep) {
+			Count(stats.slept);
+		}
+	}
+	if (std::exchange(window.again, false) && windows.Active(entry.window)) {
+		Queue(entry.window);
+	}
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -832,6 +1168,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		    static_cast<BufferCache*>(self)->RecordMirrorCopies(command);
 	    },
 	    this);
+	if (EagerReadbackOn()) {
+		m_eager = std::make_unique<EagerReadback>();
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -913,7 +1252,11 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (const auto inflight = InFlightReadbackTick(first, last); inflight != 0) {
 		m_scheduler.Wait(inflight);
 		m_scheduler.WaitPriorityOperations(inflight);
-		std::erase_if(m_inflight_readbacks, [inflight](const InFlightReadback& readback) { return readback.tick <= inflight; });
+		std::erase_if(m_inflight_readbacks,
+		              [inflight](const InFlightReadback& readback) { return readback.tick <= inflight && !readback.eager; });
+	}
+	if (m_eager) {
+		SettleEagerReadbacks(first, last);
 	}
 	for (const auto& [begin, stop]: {std::pair {first, vaddr}, std::pair {end, last}}) {
 		if (begin >= stop || !m_gpu_modified_ranges.Intersects(begin, stop - begin)) continue;
@@ -985,6 +1328,9 @@ BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) 
 	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
 	const auto page  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	auto       owner = WriteFaultOwner::Other;
+	if (m_eager && !GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
+		m_eager->windows.NoteGuestWrite(vaddr);
+	}
 	if (ReadbackStudyOn() && !GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
 		g_readback_study.NoteGuestWrite(
 		    page, [&] { return m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE); });
@@ -1069,8 +1415,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			m_scheduler.Wait(inflight);
 			m_scheduler.WaitPriorityOperations(inflight);
 			std::erase_if(m_inflight_readbacks, [inflight](const InFlightReadback& readback) {
-				return readback.tick <= inflight;
+				return readback.tick <= inflight && !readback.eager;
 			});
+		}
+		if (m_eager) {
+			SettleEagerReadbacks(pages_begin, pages_end);
 		}
 		if (DownloadBufferMemory<false>(buffer, vaddr, read_size) ||
 		    !m_gpu_modified_ranges.Intersects(pages_begin, pages_end - pages_begin)) {
@@ -1191,6 +1540,9 @@ void BufferCache::LogReadbackSummary() {
 	if (ReadbackStudyOn()) {
 		g_readback_study.Log(static_cast<double>(now - last) / 1e9);
 	}
+	if (EagerReadbackOn()) {
+		LogEagerReadbackSummary(static_cast<double>(now - last) / 1e9);
+	}
 	const auto cp_reads    = stats.cp_reads.exchange(0, std::memory_order_relaxed);
 	const auto other_reads = stats.other_reads.exchange(0, std::memory_order_relaxed);
 	const auto cp_ns       = stats.cp_ns.exchange(0, std::memory_order_relaxed);
@@ -1264,6 +1616,9 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
+		if (m_eager) {
+			NoteEagerFault(vaddr, size, guest_fault, command_processor);
+		}
 		if (TryGuestReadFromFeedback(vaddr, size, is_write)) {
 			return;
 		}
@@ -1272,6 +1627,9 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		pages_begin  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 		pages_end    = Common::AlignUp(vaddr + read_size, TRACKER_PAGE_SIZE);
 		tick         = InFlightReadbackTick(pages_begin, pages_end);
+		if (m_eager && tick != 0 && m_eager->CopyPending(pages_begin, pages_end, false)) {
+			Count(g_eager_stats.waited);
+		}
 		if (const auto in_place = InPlaceGpuWriteTick(pages_begin, pages_end - pages_begin); in_place != 0) {
 			InPlaceMemory::NoteReadWait();
 			tick = std::max(tick, in_place);
@@ -1723,6 +2081,346 @@ uint64_t BufferCache::InFlightReadbackTick(uint64_t begin, uint64_t end) const {
 	return tick;
 }
 
+[[gnu::noinline]] void BufferCache::QueueEagerWrites() {
+	if (!m_eager) {
+		return;
+	}
+	auto& eager = *m_eager;
+	for (const auto& [vaddr, size]: m_pending_writes) {
+		eager.windows.ForEachActiveIn(vaddr, size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size,
+		                              [&](size_t index) { eager.Queue(index); });
+	}
+}
+
+void BufferCache::NoteEagerFault(uint64_t vaddr, uint64_t size, bool guest_fault, bool command_processor) {
+	using Windows = EagerReadbackWindows;
+	auto&      eager = *m_eager;
+	auto&      stats = g_eager_stats;
+	const auto frame = m_scheduler.Context().FrameNumber();
+	ApplyEagerReadbacks(true);
+	if (command_processor) {
+		const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto end   = std::min(Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) + ReadAheadLimit,
+		                            begin + Windows::Slots / Windows::Probes * Windows::WindowSize);
+		Count(stats.blocked, eager.windows.Block(begin, end, frame));
+		eager.ReclaimWindows(*this, begin, end);
+		stats.hot.store(eager.windows.ActiveCount(), std::memory_order_relaxed);
+		return;
+	}
+	if (!guest_fault) {
+		return;
+	}
+	size_t     index  = Windows::None;
+	const auto result = eager.windows.NoteFault(vaddr, frame, index);
+	Count(stats.faults);
+	if (result == Windows::Fault::Dropped) {
+		Count(stats.dropped);
+		return;
+	}
+	if (result == Windows::Fault::Woken) {
+		Count(stats.woken);
+	}
+	if (result == Windows::Fault::Hot || result == Windows::Fault::Woken) {
+		eager.Queue(index);
+		stats.hot.store(eager.windows.ActiveCount(), std::memory_order_relaxed);
+	}
+}
+
+[[gnu::noinline]] void BufferCache::ReclaimEagerReadbacks() {
+	if (!m_eager) {
+		return;
+	}
+	m_eager->device_seen  = true;
+	m_eager->device_frame = m_scheduler.Context().FrameNumber();
+	m_eager->ReclaimAll(*this);
+}
+
+[[gnu::noinline]] void BufferCache::RunEagerReadbacks() {
+	if (!m_eager) {
+		return;
+	}
+	ApplyEagerReadbacks(false);
+	if (!m_eager->queued.empty()) {
+		IssueEagerReadbacks();
+	}
+}
+
+void BufferCache::ApplyEagerReadbacks(bool all) {
+	auto& eager = *m_eager;
+	if (eager.ready.exchange(0, std::memory_order_acquire) == 0 && (!all || eager.batches.empty())) {
+		return;
+	}
+	const auto frame = m_scheduler.Context().FrameNumber();
+	bool       any   = false;
+	for (size_t i = 0; i < eager.batches.size();) {
+		auto& batch = eager.batches[i];
+		if (!batch.done->load(std::memory_order_acquire)) {
+			i++;
+			continue;
+		}
+		const bool device = m_device_address_pending || m_device_address_uses != batch.device_uses;
+		for (auto& entry: batch.entries) {
+			eager.Finish(*this, entry, device, frame);
+		}
+		if (i + 1 != eager.batches.size()) {
+			batch = std::move(eager.batches.back());
+		}
+		eager.batches.pop_back();
+		any = true;
+	}
+	if (any) {
+		g_eager_stats.hot.store(eager.windows.ActiveCount(), std::memory_order_relaxed);
+	}
+}
+
+void BufferCache::SettleEagerReadbacks(uint64_t begin, uint64_t end) {
+	auto& eager = *m_eager;
+	if (eager.batches.empty()) {
+		return;
+	}
+	const auto frame = m_scheduler.Context().FrameNumber();
+	for (size_t i = 0; i < eager.batches.size();) {
+		auto& batch = eager.batches[i];
+		if (batch.done->load(std::memory_order_acquire)) {
+			for (size_t j = 0; j < batch.entries.size();) {
+				auto& entry = batch.entries[j];
+				if (entry.span_begin >= end || begin >= entry.span_end) {
+					j++;
+					continue;
+				}
+				eager.Finish(*this, entry, true, frame);
+				Count(g_eager_stats.settled);
+				if (j + 1 != batch.entries.size()) {
+					entry = std::move(batch.entries.back());
+				}
+				batch.entries.pop_back();
+			}
+			if (batch.entries.empty()) {
+				if (i + 1 != eager.batches.size()) {
+					batch = std::move(eager.batches.back());
+				}
+				eager.batches.pop_back();
+				continue;
+			}
+		}
+		i++;
+	}
+}
+
+void BufferCache::IssueEagerReadbacks() {
+	using Eager = EagerReadback;
+	auto& eager = *m_eager;
+	auto& stats = g_eager_stats;
+	if (!m_scheduler.Active() || m_device_address_pending || !m_pending_writes.empty()) {
+		return;
+	}
+	if (eager.device_seen && m_scheduler.Context().FrameNumber() - eager.device_frame < BufferCacheEagerDeviceFrames) {
+		for (const auto index: eager.queued) {
+			eager.windows.At(index).queued = false;
+		}
+		Count(stats.skipped_device, eager.queued.size());
+		eager.queued.clear();
+		return;
+	}
+	struct Piece {
+		vk::Buffer buffer = nullptr;
+		uint64_t   size   = 0;
+		size_t     first  = 0;
+		size_t     count  = 0;
+	};
+	Eager::Batch                               batch;
+	std::vector<Eager::Part>                   parts;
+	std::vector<uint64_t>                      offsets;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> runs;
+	std::vector<vk::BufferCopy>                copies;
+	std::vector<Piece>                         pieces;
+	std::vector<uint64_t>                      taken;
+	bool                                       recording = false;
+	const auto                                 tick      = m_scheduler.CurrentTick();
+	for (const auto index: eager.queued) {
+		auto& window  = eager.windows.At(index);
+		window.queued = false;
+		if (!eager.windows.Active(index) || window.in_flight) {
+			continue;
+		}
+		const auto begin = eager.windows.Begin(index);
+		const auto end   = begin + Eager::SlotSize;
+		if (!m_gpu_modified_ranges.Intersects(begin, Eager::SlotSize)) {
+			continue;
+		}
+		if (m_memory_tracker.IsCommandBlock(begin) || m_memory_tracker.IsSegmentBlock(begin)) {
+			Count(stats.skipped_command);
+			continue;
+		}
+		if (InFlightReadbackTick(begin, end) != 0) {
+			Count(stats.skipped_busy);
+			continue;
+		}
+		if (eager.free_slots.empty()) {
+			Count(stats.skipped_slots);
+			continue;
+		}
+		const uint32_t slot        = eager.free_slots.back();
+		const uint64_t slot_offset = uint64_t {slot} * Eager::SlotSize;
+		Eager::Entry   entry;
+		uint64_t       total = 0;
+		copies.clear();
+		pieces.clear();
+		taken.clear();
+		auto it = m_buffers.upper_bound(begin);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			const auto& buffer  = m_slot_buffers[it->second];
+			const auto  address = buffer.CpuAddress();
+			const auto  first   = Common::AlignUp(std::max(address, begin), TRACKER_PAGE_SIZE);
+			const auto  last    = Common::AlignDown(std::min(address + buffer.Size(), end), TRACKER_PAGE_SIZE);
+			if (first >= last) {
+				continue;
+			}
+			runs.clear();
+			m_memory_tracker.ForEachDownloadRange<false>(
+			    first, last - first, [&](uint64_t from, uint64_t bytes) noexcept { runs.emplace_back(from, bytes); });
+			const auto first_copy = copies.size();
+			for (const auto& [from, bytes]: runs) {
+				const bool images = m_texture_cache.IsRegionRegistered(from, bytes);
+				for (auto page = from; page < from + bytes; page += TRACKER_PAGE_SIZE) {
+					if (images && m_texture_cache.IsRegionRegistered(page, TRACKER_PAGE_SIZE)) {
+						Count(stats.skipped_image_pages);
+						continue;
+					}
+					bool any = false;
+					m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t stop) {
+						any    = true;
+						total += stop - start;
+						if (!entry.bytes.empty() && entry.bytes.back().second == start) {
+							entry.bytes.back().second = stop;
+						} else {
+							entry.bytes.emplace_back(start, stop);
+						}
+						if (copies.size() > first_copy && copies.back().srcOffset + copies.back().size == start - address) {
+							copies.back().size += stop - start;
+						} else {
+							copies.emplace_back(start - address, slot_offset + (start - begin), stop - start);
+						}
+					});
+					if (any) {
+						entry.pages |= 1u << ((page - begin) / TRACKER_PAGE_SIZE);
+						taken.push_back(page);
+					}
+				}
+			}
+			if (copies.size() != first_copy) {
+				pieces.push_back({buffer.Handle(), buffer.Size(), first_copy, copies.size() - first_copy});
+			}
+		}
+		if (copies.empty()) {
+			continue;
+		}
+		if (!eager.staging) {
+			const auto atom = m_graphics.physical_device_properties.limits.nonCoherentAtomSize;
+			EXIT_IF(atom == 0 || Eager::SlotSize % atom != 0);
+			eager.staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+			                                         vk::BufferUsageFlagBits::eTransferDst,
+			                                         Eager::SlotCount * Eager::SlotSize);
+		}
+		if (!std::exchange(recording, true)) {
+			auto& executor = m_scheduler.Context().GetRenderExecutor();
+			executor.InvalidateRenderTargetMemo();
+			executor.FlushDeferredDispatchBarrier();
+		}
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		for (const auto& piece: pieces) {
+			vk::BufferMemoryBarrier before {};
+			before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+			before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.buffer              = piece.buffer;
+			before.offset              = 0;
+			before.size                = piece.size;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+			                       nullptr, 1, &before, 0, nullptr);
+			native.copyBuffer(piece.buffer, eager.staging->Handle(), static_cast<uint32_t>(piece.count),
+			                  copies.data() + piece.first);
+		}
+		vk::BufferMemoryBarrier after {};
+		after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.buffer              = eager.staging->Handle();
+		after.offset              = slot_offset;
+		after.size                = Eager::SlotSize;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+		                       1, &after, 0, nullptr);
+		for (size_t i = 0; i < taken.size();) {
+			auto next = i + 1;
+			while (next < taken.size() && taken[next] == taken[next - 1] + TRACKER_PAGE_SIZE) {
+				next++;
+			}
+			const auto bytes = (next - i) * TRACKER_PAGE_SIZE;
+			if (m_gpu_modified_ranges.Subtract(taken[i], bytes)) {
+				NoteGpuModifiedChange(taken[i], bytes, false);
+			}
+			ForgetColorMetadataChecks(taken[i], bytes);
+			i = next;
+		}
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total);
+		eager.free_slots.pop_back();
+		entry.window     = index;
+		entry.slot       = slot;
+		entry.begin      = begin;
+		entry.span_begin = taken.front();
+		entry.span_end   = taken.back() + TRACKER_PAGE_SIZE;
+		entry.tick       = tick;
+		window.in_flight = true;
+		window.again     = false;
+		for (const auto& [from, to]: entry.bytes) {
+			parts.push_back({from, to - from, slot_offset + (from - begin)});
+		}
+		offsets.push_back(slot_offset);
+		ranges.emplace_back(entry.span_begin, entry.span_end - entry.span_begin);
+		Count(stats.issued);
+		Count(stats.bytes, total);
+		Count(stats.pages, taken.size());
+		if (entry.bytes.size() <= Eager::MaxInFlightRuns) {
+			for (const auto& [from, to]: entry.bytes) {
+				m_inflight_readbacks.push_back({from, to, tick, true});
+			}
+		} else {
+			m_inflight_readbacks.push_back({entry.span_begin, entry.span_end, tick, true});
+		}
+		batch.entries.push_back(std::move(entry));
+	}
+	eager.queued.clear();
+	if (batch.entries.empty()) {
+		return;
+	}
+	batch.device_uses = m_device_address_uses;
+	batch.done        = std::make_shared<std::atomic<bool>>(false);
+	m_scheduler.DeferPriorityOperation(
+	    [staging = eager.staging.get(), parts = std::move(parts), offsets = std::move(offsets), done = batch.done,
+	     ready = &eager.ready] {
+		    for (const auto offset: offsets) {
+			    staging->Invalidate(offset, Eager::SlotSize);
+		    }
+		    const auto* mapped = staging->Mapped().data();
+		    for (const auto& part: parts) {
+			    Libs::LibKernel::Memory::WriteBacking(part.address, mapped + part.offset, part.size);
+		    }
+		    done->store(true, std::memory_order_release);
+		    ready->fetch_add(1, std::memory_order_release);
+	    },
+	    ranges);
+	eager.batches.push_back(std::move(batch));
+}
+
 struct BufferCache::CopyFeedback {
 	static constexpr uint64_t SlotSize  = 64 * 1024;
 	static constexpr size_t   SlotCount = 512;
@@ -1946,7 +2644,10 @@ bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool i
 void BufferCache::ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_begin,
                                   uint64_t pages_end, uint64_t tick, bool is_write) {
 	std::erase_if(m_inflight_readbacks,
-	              [tick](const InFlightReadback& readback) { return readback.tick <= tick; });
+	              [tick](const InFlightReadback& readback) { return readback.tick <= tick && !readback.eager; });
+	if (m_eager) {
+		ApplyEagerReadbacks(true);
+	}
 	if (InFlightReadbackTick(pages_begin, pages_end) != 0 ||
 	    m_gpu_modified_ranges.Intersects(pages_begin, pages_end - pages_begin)) {
 		return;
@@ -2808,6 +3509,7 @@ bool BufferCache::TakeFlushRequest() {
 
 bool BufferCache::CommitWriteTicks() {
 	if (m_pending_writes.empty() && !m_device_address_pending) {
+		RunEagerReadbacks();
 		return TakeFlushRequest();
 	}
 	const auto tick = m_scheduler.CurrentTick();
@@ -2819,11 +3521,13 @@ bool BufferCache::CommitWriteTicks() {
 			MarkMirrorLinesWritten(vaddr, size, tick);
 		}
 	}
+	QueueEagerWrites();
 	m_pending_writes.clear();
 	if (m_device_address_pending) {
 		m_device_address_pending = false;
 		m_device_address_tick    = tick;
 	}
+	RunEagerReadbacks();
 	return TakeFlushRequest();
 }
 
@@ -3248,6 +3952,10 @@ bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_
 		return false;
 	}
 	if (buffer == nullptr && HasGpuDirtyBytes(vaddr, size)) {
+		return false;
+	}
+	if (m_eager && m_eager->CopyPending(vaddr, vaddr + size, true)) {
+		Count(g_eager_stats.around);
 		return false;
 	}
 	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
@@ -3715,6 +4423,7 @@ uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBl
 			at            = to;
 		}
 		if (owned_outside || (stop > at && m_gpu_modified_ranges.Intersects(at, stop - at))) continue;
+		if (m_eager && m_eager->InFlight(begin, stop)) continue;
 		std::vector<BufferId> ids;
 		for (const auto& [from, to]: pieces) {
 			ids.push_back(m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, from,
@@ -3750,6 +4459,9 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQu
 
 void BufferCache::RunGarbageCollector() {
 	ServeInPlaceConversions();
+	if (m_eager) {
+		ApplyEagerReadbacks(true);
+	}
 	const auto tick = m_gc_tick++;
 	CollectStaleBuffers(tick);
 	if (m_graphics.CanReportMemoryUsage()) {
@@ -3771,6 +4483,9 @@ void BufferCache::RunGarbageCollector() {
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
+			return false;
+		}
+		if (dirty && m_eager && m_eager->InFlight(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size())) {
 			return false;
 		}
 		if (dirty) {

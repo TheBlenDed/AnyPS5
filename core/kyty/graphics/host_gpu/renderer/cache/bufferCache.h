@@ -272,6 +272,8 @@ public:
 	}
 	void NoteDeviceAddressUse() noexcept {
 		m_device_address_pending = true;
+		m_device_address_uses++;
+		ReclaimEagerReadbacks();
 		if (m_device_address_hot != 0 &&
 		    m_readback_count - m_device_address_hot < HotReadbackLifetime) {
 			m_flush_requested = true;
@@ -369,6 +371,15 @@ private:
 		}
 	}
 	void NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address, bool drained);
+	struct EagerReadback;
+	std::unique_ptr<EagerReadback> m_eager;
+	void               QueueEagerWrites();
+	void               ReclaimEagerReadbacks();
+	void               NoteEagerFault(uint64_t vaddr, uint64_t size, bool guest_fault, bool command_processor);
+	void               RunEagerReadbacks();
+	void               IssueEagerReadbacks();
+	void               ApplyEagerReadbacks(bool all);
+	void               SettleEagerReadbacks(uint64_t begin, uint64_t end);
 	[[nodiscard]] bool TakeFlushRequest();
 
 	class WriteTicks {
@@ -446,10 +457,12 @@ private:
 		uint64_t begin = 0;
 		uint64_t end   = 0;
 		uint64_t tick  = 0;
+		bool     eager = false;
 	};
 	std::vector<InFlightReadback>                     m_inflight_readbacks;
 	uint64_t                                          m_device_address_tick    = 0;
 	bool                                              m_device_address_pending = false;
+	uint64_t                                          m_device_address_uses    = 0;
 	struct HotReadback {
 		uint64_t begin    = 0;
 		uint64_t end      = 0;
