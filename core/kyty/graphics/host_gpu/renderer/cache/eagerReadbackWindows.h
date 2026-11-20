@@ -17,20 +17,32 @@ public:
 	static constexpr uint32_t HotHits       = 2;
 	static constexpr uint64_t HitFrames     = 16;
 	static constexpr uint32_t IdleLimit     = 8;
+	static constexpr uint32_t WakeHits      = 1;
 	static constexpr uint64_t HotFrames     = 64;
 	static constexpr uint64_t BlockedFrames = 4096;
 	static constexpr uint64_t ScanWindows   = 8;
 	static constexpr size_t   None          = SIZE_MAX;
 
-	enum class Fault : uint8_t { Cold, Hot, Woken, Blocked, Dropped };
+	enum class Fault : uint8_t { Cold, Hot, Woken, Asleep, Blocked, Dropped };
 	enum class Published : uint8_t { Touched, Idle, Asleep };
+
+	struct Settings {
+		uint32_t hot_hits   = HotHits;
+		uint64_t hit_frames = HitFrames;
+		uint32_t idle_limit = IdleLimit;
+		uint32_t wake_hits  = WakeHits;
+		size_t   probes     = Probes;
+	};
 
 	struct Window {
 		std::atomic<uint64_t> key {0};
 		std::atomic<uint8_t>  touched {0};
 		uint64_t              last_frame = 0;
+		uint64_t              hit_frame  = 0;
 		uint32_t              hits       = 0;
 		uint32_t              idle       = 0;
+		uint32_t              wake       = 0;
+		bool                  last_idle  = false;
 		bool                  asleep     = false;
 		bool                  blocked    = false;
 		bool                  queued     = false;
@@ -38,7 +50,13 @@ public:
 		bool                  again      = false;
 	};
 
-	EagerReadbackWindows()                                       = default;
+	EagerReadbackWindows() = default;
+	explicit EagerReadbackWindows(const Settings& settings) noexcept: m_settings(settings) {
+		m_settings.hot_hits   = std::max<uint32_t>(settings.hot_hits, 1);
+		m_settings.idle_limit = std::max<uint32_t>(settings.idle_limit, 1);
+		m_settings.wake_hits  = std::max<uint32_t>(settings.wake_hits, 1);
+		m_settings.probes     = std::clamp<size_t>(settings.probes, 1, Slots);
+	}
 	EagerReadbackWindows(const EagerReadbackWindows&)            = delete;
 	EagerReadbackWindows& operator=(const EagerReadbackWindows&) = delete;
 
@@ -47,6 +65,7 @@ public:
 		return static_cast<size_t>(((address / WindowSize) * 0x9E3779B97F4A7C15ull) >> 56) % Slots;
 	}
 
+	[[nodiscard]] const Settings& Parameters() const noexcept { return m_settings; }
 	[[nodiscard]] Window&       At(size_t index) noexcept { return m_windows[index]; }
 	[[nodiscard]] const Window& At(size_t index) const noexcept { return m_windows[index]; }
 	[[nodiscard]] uint64_t      Begin(size_t index) const noexcept {
@@ -56,7 +75,7 @@ public:
 	[[nodiscard]] size_t Find(uint64_t address) const noexcept {
 		const auto key  = Start(address) + 1;
 		const auto home = Home(address);
-		for (size_t probe = 0; probe < Probes; probe++) {
+		for (size_t probe = 0; probe < m_settings.probes; probe++) {
 			const auto index = (home + probe) % Slots;
 			if (m_windows[index].key.load(std::memory_order_relaxed) == key) {
 				return index;
@@ -67,7 +86,7 @@ public:
 
 	[[nodiscard]] bool Active(size_t index) const noexcept {
 		const auto& window = m_windows[index];
-		return window.key.load(std::memory_order_relaxed) != 0 && window.hits >= HotHits && !window.asleep && !window.blocked;
+		return window.key.load(std::memory_order_relaxed) != 0 && window.hits >= m_settings.hot_hits && !window.asleep && !window.blocked;
 	}
 
 	[[nodiscard]] size_t ActiveCount() const noexcept {
@@ -93,19 +112,43 @@ public:
 		}
 		window.touched.store(1, std::memory_order_relaxed);
 		if (window.asleep) {
-			window.asleep     = false;
-			window.idle       = 0;
-			window.hits       = HotHits;
+			if (window.wake != 0 && frame - std::min(frame, window.hit_frame) > m_settings.hit_frames) {
+				window.wake = 0;
+			}
+			if (window.wake == 0) {
+				window.hit_frame = frame;
+			}
 			window.last_frame = frame;
+			if (++window.wake < m_settings.wake_hits) {
+				return Fault::Asleep;
+			}
+			window.asleep = false;
+			window.wake   = 0;
+			window.idle   = 0;
+			window.hits   = m_settings.hot_hits;
 			return Fault::Woken;
 		}
-		if (window.hits < HotHits && window.hits != 0 && frame - window.last_frame > HitFrames) {
-			window.hits = 0;
+		if (window.hits < m_settings.hot_hits) {
+			if (window.hits != 0 && frame - std::min(frame, window.hit_frame) > m_settings.hit_frames) {
+				window.hits = 0;
+			}
+			if (window.hits == 0) {
+				window.hit_frame = frame;
+			}
+			window.hits++;
 		}
-		window.hits       = std::min(window.hits + 1, HotHits);
 		window.idle       = 0;
 		window.last_frame = frame;
-		return window.hits >= HotHits ? Fault::Hot : Fault::Cold;
+		return window.hits >= m_settings.hot_hits ? Fault::Hot : Fault::Cold;
+	}
+
+	[[nodiscard]] bool Full(uint64_t frame) const noexcept {
+		for (const auto& window: m_windows) {
+			if (window.key.load(std::memory_order_relaxed) == 0 || Evictable(window, frame)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	size_t Block(uint64_t begin, uint64_t end, uint64_t frame) {
@@ -124,6 +167,7 @@ public:
 			window.asleep      = false;
 			window.hits        = 0;
 			window.idle        = 0;
+			window.wake        = 0;
 			window.last_frame  = frame;
 		}
 		return blocked;
@@ -132,7 +176,7 @@ public:
 	void NoteGuestWrite(uint64_t address) noexcept {
 		const auto key  = Start(address) + 1;
 		const auto home = Home(address);
-		for (size_t probe = 0; probe < Probes; probe++) {
+		for (size_t probe = 0; probe < m_settings.probes; probe++) {
 			auto& window = m_windows[(home + probe) % Slots];
 			if (window.key.load(std::memory_order_relaxed) == key) {
 				if (window.touched.load(std::memory_order_relaxed) == 0) {
@@ -147,14 +191,17 @@ public:
 		auto& window = m_windows[index];
 		if (window.touched.exchange(0, std::memory_order_relaxed) != 0) {
 			window.idle       = 0;
+			window.last_idle  = false;
 			window.last_frame = frame;
 			return Published::Touched;
 		}
-		if (window.asleep || window.blocked || ++window.idle < IdleLimit) {
+		window.last_idle = true;
+		if (window.asleep || window.blocked || ++window.idle < m_settings.idle_limit) {
 			return Published::Idle;
 		}
 		window.asleep = true;
 		window.idle   = 0;
+		window.wake   = 0;
 		return Published::Asleep;
 	}
 
@@ -192,7 +239,7 @@ private:
 		if (window.blocked) {
 			return age > BlockedFrames;
 		}
-		if (window.hits >= HotHits && !window.asleep) {
+		if (window.hits >= m_settings.hot_hits && !window.asleep) {
 			return age > HotFrames;
 		}
 		return true;
@@ -201,7 +248,7 @@ private:
 	size_t Insert(uint64_t address, uint64_t frame) {
 		const auto home   = Home(address);
 		size_t     victim = None;
-		for (size_t probe = 0; probe < Probes; probe++) {
+		for (size_t probe = 0; probe < m_settings.probes; probe++) {
 			const auto  index  = (home + probe) % Slots;
 			const auto& window = m_windows[index];
 			if (window.key.load(std::memory_order_relaxed) == 0) {
@@ -219,14 +266,18 @@ private:
 		window.key.store(Start(address) + 1, std::memory_order_relaxed);
 		window.touched.store(0, std::memory_order_relaxed);
 		window.last_frame = frame;
+		window.hit_frame  = frame;
 		window.hits       = 0;
 		window.idle       = 0;
+		window.wake       = 0;
+		window.last_idle  = false;
 		window.asleep     = false;
 		window.blocked    = false;
 		window.again      = false;
 		return victim;
 	}
 
+	Settings                  m_settings {};
 	std::array<Window, Slots> m_windows {};
 };
 

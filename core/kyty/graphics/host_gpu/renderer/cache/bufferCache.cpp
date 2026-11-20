@@ -553,6 +553,35 @@ bool EagerReadbackOn() {
 	return on;
 }
 
+uint64_t EagerReadbackNumber(const char* name, uint64_t fallback, uint64_t low, uint64_t high) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || value[0] == '\0') {
+		return fallback;
+	}
+	char*      end    = nullptr;
+	const auto number = std::strtoull(value, &end, 10);
+	if (end == value || *end != '\0') {
+		return fallback;
+	}
+	return std::clamp<uint64_t>(number, low, high);
+}
+
+EagerReadbackWindows::Settings ReadEagerReadbackSettings() {
+	using Windows = EagerReadbackWindows;
+	Windows::Settings settings;
+	settings.hot_hits   = static_cast<uint32_t>(EagerReadbackNumber("KYTY_EAGER_READBACK_HOT", Windows::HotHits, 1, 1000000));
+	settings.hit_frames = EagerReadbackNumber("KYTY_EAGER_READBACK_FRAMES", Windows::HitFrames, 0, 1000000000);
+	settings.idle_limit = static_cast<uint32_t>(EagerReadbackNumber("KYTY_EAGER_READBACK_IDLE", Windows::IdleLimit, 1, 1000000));
+	settings.wake_hits  = static_cast<uint32_t>(EagerReadbackNumber("KYTY_EAGER_READBACK_WAKE", Windows::WakeHits, 1, 1000000));
+	settings.probes     = EagerReadbackNumber("KYTY_EAGER_READBACK_PROBES", Windows::Probes, 1, Windows::Slots);
+	return settings;
+}
+
+const EagerReadbackWindows::Settings& EagerReadbackSettings() {
+	static const EagerReadbackWindows::Settings settings = ReadEagerReadbackSettings();
+	return settings;
+}
+
 struct EagerReadbackStats {
 	std::atomic<uint64_t> hot {0};
 	std::atomic<uint64_t> faults {0};
@@ -580,6 +609,17 @@ struct EagerReadbackStats {
 	std::atomic<uint64_t> settled {0};
 	std::atomic<uint64_t> reclaimed {0};
 	std::atomic<uint64_t> skipped_device {0};
+	std::atomic<uint64_t> dropped_full {0};
+	std::atomic<uint64_t> asleep {0};
+	std::atomic<uint64_t> deferred {0};
+	std::atomic<uint64_t> issued_idle {0};
+	std::atomic<uint64_t> empty {0};
+	std::atomic<uint64_t> empty_idle {0};
+	std::atomic<uint64_t> scan_ns {0};
+	std::atomic<uint64_t> issue_ns {0};
+	std::atomic<uint64_t> apply_ns {0};
+	std::atomic<uint64_t> apply_other_ns {0};
+	std::atomic<uint64_t> write_ns {0};
 };
 
 EagerReadbackStats g_eager_stats;
@@ -590,7 +630,25 @@ void Count(std::atomic<uint64_t>& counter, uint64_t value = 1) {
 	counter.fetch_add(value, std::memory_order_relaxed);
 }
 
-void LogEagerReadbackSummary(double seconds) {
+struct EagerReadbackTimer {
+	std::atomic<uint64_t>& total;
+	int64_t                start = SteadyNs();
+	explicit EagerReadbackTimer(std::atomic<uint64_t>& counter): total(counter) {}
+	EagerReadbackTimer(const EagerReadbackTimer&)            = delete;
+	EagerReadbackTimer& operator=(const EagerReadbackTimer&) = delete;
+	~EagerReadbackTimer() { Count(total, static_cast<uint64_t>(SteadyNs() - start)); }
+};
+
+void LogEagerReadbackSettings(const EagerReadbackWindows::Settings& settings, size_t copies) {
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-eager-readback] settings: KYTY_EAGER_READBACK_HOT={} KYTY_EAGER_READBACK_FRAMES={} "
+	    "KYTY_EAGER_READBACK_IDLE={} KYTY_EAGER_READBACK_WAKE={} KYTY_EAGER_READBACK_PROBES={}; {} windows of {} KiB, "
+	    "{} copies in flight\n",
+	    settings.hot_hits, settings.hit_frames, settings.idle_limit, settings.wake_hits, settings.probes,
+	    EagerReadbackWindows::Slots, EagerReadbackWindows::WindowSize / 1024, copies));
+}
+
+void LogEagerReadbackSummary(double seconds, const EagerReadbackWindows::Settings& settings) {
 	auto&      stats               = g_eager_stats;
 	const auto take                = [](std::atomic<uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
 	const auto hot                 = stats.hot.load(std::memory_order_relaxed);
@@ -619,6 +677,17 @@ void LogEagerReadbackSummary(double seconds) {
 	const auto settled             = take(stats.settled);
 	const auto reclaimed           = take(stats.reclaimed);
 	const auto skipped_device      = take(stats.skipped_device);
+	const auto dropped_full        = take(stats.dropped_full);
+	const auto asleep              = take(stats.asleep);
+	const auto deferred            = take(stats.deferred);
+	const auto issued_idle         = take(stats.issued_idle);
+	const auto empty               = take(stats.empty);
+	const auto empty_idle          = take(stats.empty_idle);
+	const auto scan_ms             = static_cast<double>(take(stats.scan_ns)) / 1e6;
+	const auto issue_ms            = static_cast<double>(take(stats.issue_ns)) / 1e6;
+	const auto apply_ms            = static_cast<double>(take(stats.apply_ns)) / 1e6;
+	const auto apply_other_ms      = static_cast<double>(take(stats.apply_other_ns)) / 1e6;
+	const auto write_ms            = static_cast<double>(take(stats.write_ns)) / 1e6;
 	::Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-eager-readback] summary of the last {:.1f} s: {} windows hot now ({} guest fault readbacks counted, {} "
 	    "windows woken by a fault, {} put to sleep after {} idle publications in a row, {} blocked by a command "
@@ -631,11 +700,18 @@ void LogEagerReadbackSummary(double seconds) {
 	    "readback), {} already released, {} left to another readback in flight, {} without a buffer; {} pages taken "
 	    "back from the CPU side before device address stores or after a command processor readback; {} faults waited "
 	    "for an eager copy in flight, {} copies taken back for a fault of the execution thread, {} label writes sent "
-	    "to the fault path because of a copy in flight\n",
-	    seconds, hot, faults, woken, slept, EagerReadbackWindows::IdleLimit, blocked, dropped, issued, bytes, pages,
-	    skipped_command, skipped_busy, skipped_slots, skipped_device, BufferCacheEagerDeviceFrames, skipped_image_pages,
-	    windows_published, published, idle, rewritten, returned, released, left, orphaned, reclaimed, waited, settled,
-	    around));
+	    "to the fault path because of a copy in flight; {} of the faults without a table slot found no slot to take in "
+	    "the whole table (the others only within {} probes), {} faults on a sleeping window below the {} faults that "
+	    "wake it; {} copies issued for windows whose last publication was idle, {} copies put off because the copy of "
+	    "the window before was not published yet, {} copies finished without a page handed over ({} of them with no "
+	    "fault and no guest write seen); execution thread time: {:.1f} ms looking up written windows, {:.1f} ms "
+	    "issuing copies, {:.1f} ms publishing; {:.1f} ms publishing on other threads, {:.1f} ms writing guest memory "
+	    "on the priority operations thread\n",
+	    seconds, hot, faults, woken, slept, settings.idle_limit, blocked, dropped, issued, bytes, pages, skipped_command,
+	    skipped_busy, skipped_slots, skipped_device, BufferCacheEagerDeviceFrames, skipped_image_pages, windows_published,
+	    published, idle, rewritten, returned, released, left, orphaned, reclaimed, waited, settled, around, dropped_full,
+	    settings.probes, asleep, settings.wake_hits, issued_idle, deferred, empty, empty_idle, scan_ms, issue_ms, apply_ms,
+	    apply_other_ms, write_ms));
 }
 
 }
@@ -673,7 +749,7 @@ struct BufferCache::EagerReadback {
 	static constexpr size_t MaxReleased     = 1024;
 	static constexpr size_t MaxInFlightRuns = 4;
 
-	EagerReadbackWindows                   windows;
+	EagerReadbackWindows                   windows {EagerReadbackSettings()};
 	std::unique_ptr<Buffer>                staging;
 	std::vector<uint32_t>                  free_slots;
 	std::vector<size_t>                    queued;
@@ -726,7 +802,9 @@ struct BufferCache::EagerReadback {
 	void Queue(size_t index) {
 		auto& window = windows.At(index);
 		if (window.in_flight) {
-			window.again = true;
+			if (!std::exchange(window.again, true)) {
+				Count(g_eager_stats.deferred);
+			}
 		} else if (!window.queued) {
 			window.queued = true;
 			queued.push_back(index);
@@ -875,6 +953,11 @@ void BufferCache::EagerReadback::Finish(BufferCache& cache, Entry& entry, bool g
 		}
 		if (state == EagerReadbackWindows::Published::Asleep) {
 			Count(stats.slept);
+		}
+	} else {
+		Count(stats.empty);
+		if (window.touched.load(std::memory_order_relaxed) == 0) {
+			Count(stats.empty_idle);
 		}
 	}
 	if (std::exchange(window.again, false) && windows.Active(entry.window)) {
@@ -1170,6 +1253,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    this);
 	if (EagerReadbackOn()) {
 		m_eager = std::make_unique<EagerReadback>();
+		LogEagerReadbackSettings(m_eager->windows.Parameters(), EagerReadback::SlotCount);
 	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
@@ -1541,7 +1625,7 @@ void BufferCache::LogReadbackSummary() {
 		g_readback_study.Log(static_cast<double>(now - last) / 1e9);
 	}
 	if (EagerReadbackOn()) {
-		LogEagerReadbackSummary(static_cast<double>(now - last) / 1e9);
+		LogEagerReadbackSummary(static_cast<double>(now - last) / 1e9, EagerReadbackSettings());
 	}
 	const auto cp_reads    = stats.cp_reads.exchange(0, std::memory_order_relaxed);
 	const auto other_reads = stats.other_reads.exchange(0, std::memory_order_relaxed);
@@ -2085,7 +2169,8 @@ uint64_t BufferCache::InFlightReadbackTick(uint64_t begin, uint64_t end) const {
 	if (!m_eager) {
 		return;
 	}
-	auto& eager = *m_eager;
+	auto&                    eager = *m_eager;
+	const EagerReadbackTimer timer(g_eager_stats.scan_ns);
 	for (const auto& [vaddr, size]: m_pending_writes) {
 		eager.windows.ForEachActiveIn(vaddr, size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size,
 		                              [&](size_t index) { eager.Queue(index); });
@@ -2115,7 +2200,13 @@ void BufferCache::NoteEagerFault(uint64_t vaddr, uint64_t size, bool guest_fault
 	Count(stats.faults);
 	if (result == Windows::Fault::Dropped) {
 		Count(stats.dropped);
+		if (eager.windows.Full(frame)) {
+			Count(stats.dropped_full);
+		}
 		return;
+	}
+	if (result == Windows::Fault::Asleep) {
+		Count(stats.asleep);
 	}
 	if (result == Windows::Fault::Woken) {
 		Count(stats.woken);
@@ -2150,8 +2241,9 @@ void BufferCache::ApplyEagerReadbacks(bool all) {
 	if (eager.ready.exchange(0, std::memory_order_acquire) == 0 && (!all || eager.batches.empty())) {
 		return;
 	}
-	const auto frame = m_scheduler.Context().FrameNumber();
-	bool       any   = false;
+	const EagerReadbackTimer timer(GuestGpu::IsGpuThread() ? g_eager_stats.apply_ns : g_eager_stats.apply_other_ns);
+	const auto               frame = m_scheduler.Context().FrameNumber();
+	bool                     any   = false;
 	for (size_t i = 0; i < eager.batches.size();) {
 		auto& batch = eager.batches[i];
 		if (!batch.done->load(std::memory_order_acquire)) {
@@ -2178,7 +2270,8 @@ void BufferCache::SettleEagerReadbacks(uint64_t begin, uint64_t end) {
 	if (eager.batches.empty()) {
 		return;
 	}
-	const auto frame = m_scheduler.Context().FrameNumber();
+	const EagerReadbackTimer timer(GuestGpu::IsGpuThread() ? g_eager_stats.apply_ns : g_eager_stats.apply_other_ns);
+	const auto               frame = m_scheduler.Context().FrameNumber();
 	for (size_t i = 0; i < eager.batches.size();) {
 		auto& batch = eager.batches[i];
 		if (batch.done->load(std::memory_order_acquire)) {
@@ -2209,8 +2302,9 @@ void BufferCache::SettleEagerReadbacks(uint64_t begin, uint64_t end) {
 
 void BufferCache::IssueEagerReadbacks() {
 	using Eager = EagerReadback;
-	auto& eager = *m_eager;
-	auto& stats = g_eager_stats;
+	auto&                    eager = *m_eager;
+	auto&                    stats = g_eager_stats;
+	const EagerReadbackTimer timer(stats.issue_ns);
 	if (!m_scheduler.Active() || m_device_address_pending || !m_pending_writes.empty()) {
 		return;
 	}
@@ -2387,6 +2481,9 @@ void BufferCache::IssueEagerReadbacks() {
 		offsets.push_back(slot_offset);
 		ranges.emplace_back(entry.span_begin, entry.span_end - entry.span_begin);
 		Count(stats.issued);
+		if (window.last_idle) {
+			Count(stats.issued_idle);
+		}
 		Count(stats.bytes, total);
 		Count(stats.pages, taken.size());
 		if (entry.bytes.size() <= Eager::MaxInFlightRuns) {
@@ -2407,6 +2504,7 @@ void BufferCache::IssueEagerReadbacks() {
 	m_scheduler.DeferPriorityOperation(
 	    [staging = eager.staging.get(), parts = std::move(parts), offsets = std::move(offsets), done = batch.done,
 	     ready = &eager.ready] {
+		    const EagerReadbackTimer timer(g_eager_stats.write_ns);
 		    for (const auto offset: offsets) {
 			    staging->Invalidate(offset, Eager::SlotSize);
 		    }

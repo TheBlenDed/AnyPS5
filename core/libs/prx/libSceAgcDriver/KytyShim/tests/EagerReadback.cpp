@@ -187,6 +187,95 @@ void GuestThreads() {
 	Require(windows->NotePublished(index, 4) == Published::Idle, "and are taken once");
 }
 
+void Thresholds() {
+	const auto defaults = std::make_unique<EagerReadbackWindows>();
+	Require(defaults->Parameters().hot_hits == EagerReadbackWindows::HotHits &&
+	            defaults->Parameters().hit_frames == EagerReadbackWindows::HitFrames &&
+	            defaults->Parameters().idle_limit == EagerReadbackWindows::IdleLimit &&
+	            defaults->Parameters().wake_hits == EagerReadbackWindows::WakeHits &&
+	            defaults->Parameters().probes == EagerReadbackWindows::Probes,
+	        "a table without settings uses the defaults");
+	EagerReadbackWindows::Settings zero;
+	zero.hot_hits   = 0;
+	zero.hit_frames = 0;
+	zero.idle_limit = 0;
+	zero.wake_hits  = 0;
+	zero.probes     = 0;
+	auto   lowest = std::make_unique<EagerReadbackWindows>(zero);
+	size_t index  = None;
+	Require(lowest->Parameters().hot_hits == 1 && lowest->Parameters().idle_limit == 1 &&
+	            lowest->Parameters().wake_hits == 1 && lowest->Parameters().probes == 1,
+	        "settings below one count as one");
+	Require(lowest->NoteFault(Pool, 1, index) == Fault::Hot, "with one hit the first fault makes a window hot");
+	zero.probes = 100000;
+	Require(std::make_unique<EagerReadbackWindows>(zero)->Parameters().probes == EagerReadbackWindows::Slots,
+	        "no more probes than slots");
+
+	EagerReadbackWindows::Settings settings;
+	settings.hot_hits   = 3;
+	settings.hit_frames = 3;
+	settings.idle_limit = 1;
+	settings.wake_hits  = 2;
+	settings.probes     = 8;
+	auto windows = std::make_unique<EagerReadbackWindows>(settings);
+	Require(windows->NoteFault(Pool, 10, index) == Fault::Cold, "the first of three faults leaves the window cold");
+	Require(windows->NoteFault(Pool, 12, index) == Fault::Cold && !windows->Active(index), "so does the second");
+	Require(windows->NoteFault(Pool, 13, index) == Fault::Hot && windows->Active(index),
+	        "the third within the frame span makes it hot");
+	size_t other = None;
+	Require(windows->NoteFault(Pool + Window, 10, other) == Fault::Cold, "the neighbour takes its first fault");
+	Require(windows->NoteFault(Pool + Window, 12, other) == Fault::Cold, "and its second");
+	Require(windows->NoteFault(Pool + Window, 14, other) == Fault::Cold,
+	        "a third fault after the frame span of the first starts the count again");
+	Require(windows->NoteFault(Pool + Window, 16, other) == Fault::Cold, "the span is counted from that fault");
+	Require(windows->NoteFault(Pool + Window, 17, other) == Fault::Hot, "three faults within it make the window hot");
+
+	Require(windows->NotePublished(index, 14) == Published::Touched && !windows->At(index).last_idle,
+	        "the publication after the faults is not idle");
+	Require(windows->NotePublished(index, 15) == Published::Asleep && windows->At(index).last_idle,
+	        "with an idle limit of one the first idle publication puts the window to sleep");
+	Require(windows->NoteFault(Pool, 100, index) == Fault::Asleep && !windows->Active(index),
+	        "one fault does not wake a window that needs two");
+	Require(windows->NoteFault(Pool, 104, index) == Fault::Asleep && !windows->Active(index),
+	        "nor does a second one after the frame span");
+	Require(windows->NoteFault(Pool, 105, index) == Fault::Woken && windows->Active(index),
+	        "two faults within the frame span wake it");
+	Require(windows->At(index).last_idle, "a woken window still has an idle last publication");
+	Require(windows->NotePublished(index, 106) == Published::Touched && !windows->At(index).last_idle,
+	        "the waking faults count as an access");
+	Require(windows->NotePublished(index, 107) == Published::Asleep, "the window sleeps again");
+	Require(windows->NoteFault(Pool, 108, index) == Fault::Asleep, "and counts its waking faults from zero");
+	Require(windows->Block(Pool, Pool + 1, 109) == 1 && windows->NoteFault(Pool, 110, index) == Fault::Blocked,
+	        "a blocked sleeping window is blocked");
+
+	const auto same = SameHome(10);
+	auto       wide = std::make_unique<EagerReadbackWindows>(settings);
+	for (size_t i = 0; i < 8; i++) {
+		(void)wide->NoteFault(same[i], 100, index);
+		(void)wide->NoteFault(same[i], 100, index);
+		Require(wide->NoteFault(same[i], 100, index) == Fault::Hot, "eight probes hold eight hot windows of one home");
+	}
+	Require(wide->NoteFault(same[8], 101, index) == Fault::Dropped, "the ninth finds no slot");
+	Require(!wide->Full(101), "while the table is not full");
+	wide->NoteGuestWrite(same[7]);
+	Require(wide->NotePublished(wide->Find(same[7]), 102) == Published::Touched,
+	        "a guest write finds a window at the last probe");
+
+	settings.hot_hits = 1;
+	settings.probes   = EagerReadbackWindows::Slots;
+	auto   full  = std::make_unique<EagerReadbackWindows>(settings);
+	size_t count = 0;
+	for (; count < EagerReadbackWindows::Slots; count++) {
+		Require(!full->Full(200), "a table with a free slot is not full");
+		Require(full->NoteFault(Pool + count * Window, 200, index) == Fault::Hot, "every slot takes a window");
+	}
+	Require(full->ActiveCount() == EagerReadbackWindows::Slots && full->Full(200), "a table of recent hot windows is full");
+	Require(full->NoteFault(Pool + count * Window, 200, index) == Fault::Dropped, "and takes no new window");
+	Require(!full->Full(201 + EagerReadbackWindows::HotFrames), "until a hot window had no access for the hot frames");
+	Require(full->NoteFault(Pool + count * Window, 201 + EagerReadbackWindows::HotFrames, index) == Fault::Hot,
+	        "then the new window gets a slot");
+}
+
 }
 
 int main() {
@@ -196,6 +285,7 @@ int main() {
 	Eviction();
 	Ranges();
 	GuestThreads();
+	Thresholds();
 	std::puts("kyty_shim_eager_readback: ok");
 	return 0;
 }
