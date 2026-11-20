@@ -206,7 +206,9 @@ SrtCleanLines CleanLinesMode() {
 	static const SrtCleanLines mode = [] {
 		const char*            value = std::getenv("KYTY_AHEAD_CLEAN_LINES");
 		const std::string_view text {value == nullptr ? "" : value};
-		return text == "1" ? SrtCleanLines::On : text == "verify" ? SrtCleanLines::Verify : SrtCleanLines::Off;
+		return text.empty() || text == "1" ? SrtCleanLines::On
+		       : text == "verify"          ? SrtCleanLines::Verify
+		                                   : SrtCleanLines::Off;
 	}();
 	return mode;
 }
