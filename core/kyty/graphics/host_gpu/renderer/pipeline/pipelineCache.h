@@ -160,6 +160,49 @@ private:
 #endif
 };
 
+#if defined(ANYPS5_KYTY)
+namespace AheadStopStats {
+enum Slot : uint32_t {
+	Attempted,
+	Finished,
+	StageWalks,
+	GuestWriteWalks,
+	FirstStop,
+	LastStop = FirstStop + 15,
+	OnlyFlatStops,
+	FlatThenOtherStop,
+	WalkEnded,
+	BeforeWalk,
+	AfterWalk,
+	Variant,
+	VariantUnread,
+	NotCompiled,
+	CallSource,
+	ImageHeap,
+	SkipDispatch,
+	MaxStages,
+	Other,
+	TableDraw,
+	XprDraw,
+	NoOffsets,
+	TableDispatch,
+	DrawHit,
+	DrawStale,
+	DrawMismatch,
+	DrawNone,
+	DispatchHit,
+	DispatchStale,
+	DispatchNone,
+	Slots
+};
+[[nodiscard]] bool Enabled();
+void               Add(Slot slot);
+void               Note(Slot reason, Slot extra = Slots);
+void               Begin();
+void               End(bool finished);
+}
+#endif
+
 struct ProgramResolution {
 	static constexpr uint32_t MaxStages = 4;
 

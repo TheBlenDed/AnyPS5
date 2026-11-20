@@ -926,6 +926,17 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	                   resolved->storage.state.indirect_draw == indirect_draw &&
 	                   resolved->programs.Revalidate();
 #if defined(ANYPS5_KYTY)
+	if (AheadStopStats::Enabled()) {
+		AheadStopStats::Add(shaders_resolved     ? AheadStopStats::DrawHit
+		                    : resolved == nullptr ? AheadStopStats::DrawNone
+		                    : resolved->compute_module == nullptr &&
+		                              resolved->storage.state.indirect_offsets == indirect_offsets &&
+		                              resolved->storage.state.indirect_draw == indirect_draw
+		                        ? AheadStopStats::DrawStale
+		                        : AheadStopStats::DrawMismatch);
+	}
+#endif
+#if defined(ANYPS5_KYTY)
 	m_flat_defer_check = nullptr;
 	if (shaders_resolved) {
 		if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
@@ -1691,16 +1702,22 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	m_flat_defer_check = nullptr;
 	if (resolved == nullptr || resolved->compute_module == nullptr ||
 	    !resolved->programs.Revalidate(true, &resolved->compute_module->info)) {
-		return false;
-	}
-	if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
-		NoteFlatDefer(words, resolved->programs.reads.DeferredGpuWords());
-		if (FlatDeferVerifies()) m_flat_defer_check = resolved;
-	}
 #else
 	if (resolved == nullptr || resolved->compute_module == nullptr ||
 	    !resolved->programs.Revalidate(true)) {
+#endif
+#if defined(ANYPS5_KYTY)
+		AheadStopStats::Add(resolved == nullptr || resolved->compute_module == nullptr
+		                        ? AheadStopStats::DispatchNone
+		                        : AheadStopStats::DispatchStale);
+#endif
 		return false;
+	}
+#if defined(ANYPS5_KYTY)
+	AheadStopStats::Add(AheadStopStats::DispatchHit);
+	if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
+		NoteFlatDefer(words, resolved->programs.reads.DeferredGpuWords());
+		if (FlatDeferVerifies()) m_flat_defer_check = resolved;
 	}
 #endif
 	input_info = resolved->compute;

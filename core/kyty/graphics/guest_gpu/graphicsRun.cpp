@@ -557,6 +557,9 @@ void GuestGpu::ResolveThread() {
 		if ((operation->kind == GpuOperationKind::DrawIndex ||
 		     operation->kind == GpuOperationKind::DrawIndirect) &&
 		    table_hint == 1u) {
+#if defined(ANYPS5_KYTY)
+			AheadStopStats::Add(AheadStopStats::TableDraw);
+#endif
 		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		           operation->kind == GpuOperationKind::DrawAuto) {
 			operation->resolved =
@@ -570,6 +573,10 @@ void GuestGpu::ResolveThread() {
 				    *operation->state.context, *operation->state.user_config,
 				    *operation->state.shaders, offsets, true, operation->state.context_id,
 				    operation->state.user_config_id);
+#if defined(ANYPS5_KYTY)
+			} else {
+				AheadStopStats::Add(AheadStopStats::NoOffsets);
+#endif
 			}
 		} else if (operation->kind == GpuOperationKind::DispatchDirect ||
 		           operation->kind == GpuOperationKind::DispatchIndirect) {

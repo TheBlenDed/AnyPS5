@@ -344,6 +344,11 @@ void LearnGpuProducedBound(uint64_t address) {
 bool AheadGpuProduced(uint64_t address) {
 	if (!ThreadAheadWrites().Contains(address) && !g_gpu_produced_bounds.Contains(address)) return false;
 	t_ahead_unread_load = true;
+#if defined(ANYPS5_KYTY)
+	if (AheadStopStats::Enabled()) {
+		ShaderRecompiler::IR::SrtAheadWalkStopsOfThread().pending_range = ThreadAheadWrites().Contains(address);
+	}
+#endif
 	return true;
 }
 
@@ -568,7 +573,120 @@ void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSourc
 	                           "PipelineCache::GetProgram", hash, 0, source.refresh_failure);
 }
 
+#if defined(ANYPS5_KYTY)
+std::array<std::atomic<uint64_t>, AheadStopStats::Slots> g_ahead_stop_counts {};
+std::atomic<uint64_t>                                    g_ahead_stop_line {0};
+thread_local AheadStopStats::Slot                        t_ahead_stop_reason = AheadStopStats::Slots;
+thread_local AheadStopStats::Slot                        t_ahead_stop_extra  = AheadStopStats::Slots;
+
+void NoteAheadWalkStop() {
+	using ShaderRecompiler::IR::SrtAheadStop;
+	using ShaderRecompiler::IR::SrtLoadUse;
+	const auto& stops = ShaderRecompiler::IR::SrtAheadWalkStopsOfThread();
+	if (stops.first == SrtAheadStop::None) {
+		AheadStopStats::Note(!stops.walked  ? AheadStopStats::BeforeWalk
+		                     : !stops.ended ? AheadStopStats::WalkEnded
+		                                    : AheadStopStats::AfterWalk);
+		return;
+	}
+	const auto reason = static_cast<AheadStopStats::Slot>(
+	    AheadStopStats::FirstStop + (static_cast<uint32_t>(stops.first) - 1u) * 4u +
+	    static_cast<uint32_t>(stops.first_use));
+	auto extra = AheadStopStats::Slots;
+	if (stops.first_use == SrtLoadUse::Flat && stops.first != SrtAheadStop::Fault) {
+		if (stops.stops != stops.flat_stops) {
+			extra = AheadStopStats::FlatThenOtherStop;
+		} else if (stops.ended) {
+			extra = AheadStopStats::OnlyFlatStops;
+		}
+	}
+	AheadStopStats::Note(reason, extra);
 }
+
+void LogAheadStops(double seconds) {
+	using namespace AheadStopStats;
+	std::array<uint64_t, Slots> c {};
+	for (uint32_t i = 0; i < Slots; i++) c[i] = g_ahead_stop_counts[i].exchange(0, std::memory_order_relaxed);
+	const auto kind = [&](uint32_t index) {
+		const auto* first = c.data() + FirstStop + index * 4u;
+		return fmt::format("{}: {} flat-only, {} descriptor word, {} zero-test, {} value", first[0] + first[1] + first[2] + first[3],
+		                   first[1], first[2], first[3], first[0]);
+	};
+	uint64_t stopped = 0;
+	uint64_t flat    = 0;
+	for (uint32_t i = FirstStop; i <= LastStop; i++) stopped += c[i];
+	for (uint32_t index = 0; index < 3u; index++) flat += c[FirstStop + index * 4u + 1u];
+	const auto after   = c[AfterWalk] + c[Variant];
+	const auto unable  = c[CallSource] + c[AheadStopStats::ImageHeap] + c[SkipDispatch] + c[NotCompiled] + c[MaxStages] + c[Other] + c[BeforeWalk];
+	const auto skipped = c[TableDraw] + c[XprDraw] + c[NoOffsets] + c[TableDispatch];
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-ahead-stops] summary of the last {:.1f} s: {} ahead resolutions ({} stage walks, {} with guest writes "
+	    "pending), {} finished, {} stopped at a load (unreadable page {}; gpu-produced zero-tested {}; pending-write "
+	    "zero-tested {}; fault {}), first stop flat-only {} ({} only flat-only stops and the walk ran to its end, {} "
+	    "a later stop that is not flat-only), {} walk ended without a load stop, {} failed after the walk ({} "
+	    "variant, {} of them with unread loads, {} other), {} not resolvable ahead ({} call tables, {} image heap, "
+	    "{} skipped dispatch, {} not compiled, {} stage limit, {} before the walk, {} other); {} not attempted ({} "
+	    "table draws, {} native xpr draws, {} without indirect offsets, {} table dispatches); execution thread: {} "
+	    "walks not ahead, draws {} hit, {} stale, {} mismatch, {} none, dispatches {} hit, {} stale, {} none\n",
+	    seconds, c[Attempted], c[StageWalks], c[GuestWriteWalks], c[Finished], stopped, kind(0), kind(1), kind(2),
+	    c[FirstStop + 12u] + c[FirstStop + 13u] + c[FirstStop + 14u] + c[FirstStop + 15u], flat, c[OnlyFlatStops],
+	    c[FlatThenOtherStop], c[WalkEnded], after, c[Variant], c[VariantUnread], c[AfterWalk], unable, c[CallSource],
+	    c[AheadStopStats::ImageHeap], c[SkipDispatch], c[NotCompiled], c[MaxStages], c[BeforeWalk], c[Other], skipped, c[TableDraw],
+	    c[XprDraw], c[NoOffsets], c[TableDispatch], ShaderRecompiler::IR::TakeSrtWalksNotAhead(), c[DrawHit],
+	    c[DrawStale], c[DrawMismatch], c[DrawNone], c[DispatchHit], c[DispatchStale], c[DispatchNone]));
+}
+#endif
+
+}
+
+#if defined(ANYPS5_KYTY)
+namespace AheadStopStats {
+bool Enabled() {
+	static const bool enabled = ShaderRecompiler::IR::SrtAheadStopStats();
+	return enabled;
+}
+
+void Add(Slot slot) {
+	if (Enabled() && slot < Slots) g_ahead_stop_counts[slot].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Note(Slot reason, Slot extra) {
+	if (t_ahead_stop_reason != Slots) return;
+	t_ahead_stop_reason = reason;
+	t_ahead_stop_extra  = extra;
+}
+
+void Begin() {
+	t_ahead_stop_reason = Slots;
+	t_ahead_stop_extra  = Slots;
+}
+
+void End(bool finished) {
+	if (!Enabled()) return;
+	Add(Attempted);
+	if (finished) {
+		Add(Finished);
+	} else {
+		Add(t_ahead_stop_reason != Slots ? t_ahead_stop_reason : Other);
+		Add(t_ahead_stop_extra);
+	}
+	Begin();
+	const auto now = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	        .count());
+	auto last = g_ahead_stop_line.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_ahead_stop_line.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull ||
+	    !g_ahead_stop_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	LogAheadStops(static_cast<double>(now - last) / 1e9);
+}
+}
+#endif
 
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
 	if (native && stage == ShaderType::Pixel && RayTracing::NativeTraversals() && Config::RayTracingOracle() != 0) {
@@ -2231,6 +2349,14 @@ bool PipelineCache::GetGraphicsProgramsAhead(const HW::Context&    context,
                                              const HW::UserConfig& user_config,
                                              const HW::Shader& shaders, DrawRenderState& state,
                                              ProgramResolution& ahead) {
+#if defined(ANYPS5_KYTY)
+	if (AheadStopStats::Enabled()) {
+		AheadStopStats::Begin();
+		const bool resolved = ResolveGraphicsPrograms(context, user_config, shaders, state, &ahead);
+		AheadStopStats::End(resolved && !ahead.reads.Failed() && state.vertex_info[0].stage.module != nullptr);
+		return resolved;
+	}
+#endif
 	return ResolveGraphicsPrograms(context, user_config, shaders, state, &ahead);
 }
 
@@ -2729,6 +2855,15 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		    std::ranges::any_of(entry->second.modules, [](const ShaderModule& module) {
 			    return module.info.info.uses_image_heap;
 		    })) {
+#if defined(ANYPS5_KYTY)
+			if (AheadStopStats::Enabled()) {
+				AheadStopStats::Note(entry == m_program_cache.end()                 ? AheadStopStats::NotCompiled
+				                     : ahead.stages == ProgramResolution::MaxStages ? AheadStopStats::MaxStages
+				                     : entry->second.skip_dispatch                  ? AheadStopStats::SkipDispatch
+				                     : entry->second.call_source                    ? AheadStopStats::CallSource
+				                                                                    : AheadStopStats::ImageHeap);
+			}
+#endif
 			ahead.reads.Fail();
 			return nullptr;
 		}
@@ -2763,15 +2898,28 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	const bool defers = ShaderRecompiler::IR::SrtFlatDeferMode() != ShaderRecompiler::IR::SrtFlatDefer::Off;
 	runtime.defer_flat_loads = defers;
 	if (defers) ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
-#endif
+	const bool counted = AheadStopStats::Enabled();
+	if (counted) ShaderRecompiler::IR::SrtAheadWalkStopsOfThread() = {};
+	const bool materialized =
+	    ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources, specialization);
+	if (counted) {
+		const auto& stops = ShaderRecompiler::IR::SrtAheadWalkStopsOfThread();
+		if (stops.walked) AheadStopStats::Add(AheadStopStats::StageWalks);
+		if (stops.walked && stops.guest_writes) AheadStopStats::Add(AheadStopStats::GuestWriteWalks);
+		if (!materialized) NoteAheadWalkStop();
+	}
+	if (!materialized) {
+		ahead.reads.Fail();
+		return nullptr;
+	}
+	if (defers && !ShaderRecompiler::IR::SrtDeferredLoadsOfThread().empty()) {
+		ahead.reads.NoteDeferredLoads(ShaderRecompiler::IR::SrtDeferredLoadsOfThread());
+	}
+#else
 	if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
 	                                                specialization)) {
 		ahead.reads.Fail();
 		return nullptr;
-	}
-#if defined(ANYPS5_KYTY)
-	if (defers && !ShaderRecompiler::IR::SrtDeferredLoadsOfThread().empty()) {
-		ahead.reads.NoteDeferredLoads(ShaderRecompiler::IR::SrtDeferredLoadsOfThread());
 	}
 #endif
 	NoteAheadWrites(program->resource_plan, resources);
@@ -2799,6 +2947,12 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 #endif
 	if (module == modules.end()) {
 #if defined(ANYPS5_KYTY)
+		if (counted) {
+			AheadStopStats::Note(AheadStopStats::Variant,
+			                     ahead.reads.MayHaveReadGpuWrites() || t_ahead_unread_load
+			                         ? AheadStopStats::VariantUnread
+			                         : AheadStopStats::Slots);
+		}
 		if (!program->failed_variants.empty() && program->Failed(specialization, push_data_cursor)) {
 			ahead.reads.Fail();
 			return nullptr;
@@ -3815,10 +3969,12 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
                                                           ProgramResolution&           ahead) KYTY_NO_THREAD_SAFETY_ANALYSIS {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 #if defined(ANYPS5_KYTY)
+	if (AheadStopStats::Enabled()) AheadStopStats::Begin();
 	ShaderParams params;
 	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::GetComputeProgramAhead", 0, regs.cs_regs.data_addr,
 	                           [&] { params = PrepareProgram(regs, input_info); })) {
 		ahead.reads.Fail();
+		AheadStopStats::End(false);
 		return nullptr;
 	}
 #else
@@ -3839,6 +3995,7 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 		const ProgramLockMaybe lock(m_program_lock, !t_ahead_unlocked);
 		module = GetAhead(params, input_info, push_data_cursor, ahead);
 	}
+	AheadStopStats::End(module != nullptr && !ahead.reads.Failed());
 	if (module != nullptr) {
 		RequestComputePipelineAhead(*module);
 	}

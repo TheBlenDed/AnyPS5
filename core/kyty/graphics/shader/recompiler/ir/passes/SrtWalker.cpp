@@ -243,6 +243,41 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 }
 
 #if defined(ANYPS5_KYTY)
+thread_local SrtAheadWalkStops t_ahead_stops;
+std::atomic<uint64_t>          g_walks_not_ahead {0};
+
+bool AheadStopStats() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_AHEAD_STOP_STATS");
+		return value != nullptr && value[0] == '1' && value[1] == 0;
+	}();
+	return enabled;
+}
+
+void NoteAheadStop(SrtAheadStop stop, uint32_t slot) {
+	auto& stops = t_ahead_stops;
+	if (!stops.active) return;
+	const auto use = slot == NoFlatSlot       ? SrtLoadUse::Value
+	                 : slot == ZeroTestSlot   ? SrtLoadUse::ZeroTest
+	                 : IsDescriptorSlot(slot) ? SrtLoadUse::DescriptorWord
+	                                          : SrtLoadUse::Flat;
+	if (stops.first == SrtAheadStop::None) {
+		stops.first     = stop;
+		stops.first_use = use;
+	}
+	stops.stops++;
+	if (use == SrtLoadUse::Flat && stop != SrtAheadStop::Fault) stops.flat_stops++;
+}
+
+uint64_t KYTY_SYSV_ABI ProbeGuestLoadCounted(uint64_t address, WalkerCachedPage* cache, uint32_t slot) {
+	const bool before = t_walker_faulted;
+	t_walker_faulted  = false;
+	const auto result = ProbeGuestLoad(address, cache);
+	if (t_walker_faulted) NoteAheadStop(SrtAheadStop::Unreadable, slot);
+	t_walker_faulted = t_walker_faulted || before;
+	return result;
+}
+
 thread_local bool                  t_walker_defer = false;
 thread_local std::vector<uint64_t> t_deferred_loads;
 
@@ -260,7 +295,7 @@ bool DefersFlatLoad(uint32_t slot) {
 	       (FlatDeferMode() != SrtFlatDefer::Off || Common::Ab::Listed(Common::RuntimeSwitches::Switch::FlatDefer));
 }
 
-uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache) {
+uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache, uint32_t slot) {
 	const bool before = t_walker_faulted;
 	t_walker_faulted  = false;
 	const auto result = ProbeGuestLoad(address, cache);
@@ -269,6 +304,7 @@ uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* ca
 		t_walker_faulted = before;
 		return result;
 	}
+	if (t_walker_faulted) NoteAheadStop(SrtAheadStop::Unreadable, slot);
 	t_walker_faulted = t_walker_faulted || before;
 	return result;
 }
@@ -302,7 +338,15 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_
 	code.mov(code.rdi, code.r10);
 	code.lea(code.rsi, code.ptr[code.rdx + cache]);
 #if defined(ANYPS5_KYTY)
-	code.mov(code.rax, reinterpret_cast<uint64_t>(DefersFlatLoad(slot) ? &ProbeFlatGuestLoad : &ProbeGuestLoad));
+	if (DefersFlatLoad(slot)) {
+		code.mov(code.edx, slot);
+		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeFlatGuestLoad));
+	} else if (AheadStopStats()) {
+		code.mov(code.edx, slot);
+		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoadCounted));
+	} else {
+		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoad));
+	}
 #else
 	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoad));
 #endif
@@ -326,7 +370,19 @@ uint64_t KYTY_SYSV_ABI ProbeZeroTestedLoad(uint64_t address) {
 	           : 0u;
 }
 
-void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& skip) {
+#if defined(ANYPS5_KYTY)
+uint64_t KYTY_SYSV_ABI ProbeZeroTestedLoadCounted(uint64_t address, uint32_t slot) {
+	t_ahead_stops.pending_range = false;
+	const auto result           = ProbeZeroTestedLoad(address);
+	if (result != 0) {
+		NoteAheadStop(t_ahead_stops.pending_range ? SrtAheadStop::PendingWrite : SrtAheadStop::GpuProduced, slot);
+	}
+	return result;
+}
+#endif
+
+void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label& skip,
+                        [[maybe_unused]] uint32_t slot) {
 	code.lea(code.r10, code.ptr[address]);
 	for (const auto& reg: {code.rax, code.rcx, code.rdx, code.rsi, code.rdi, code.r8, code.r9, code.r10,
 	                       code.r11, code.rbp}) {
@@ -335,7 +391,16 @@ void SkipZeroTestedLoad(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address
 	code.mov(code.rbp, code.rsp);
 	code.and_(code.rsp, -16);
 	code.mov(code.rdi, code.r10);
+#if defined(ANYPS5_KYTY)
+	if (AheadStopStats()) {
+		code.mov(code.esi, slot);
+		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeZeroTestedLoadCounted));
+	} else {
+		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeZeroTestedLoad));
+	}
+#else
 	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeZeroTestedLoad));
+#endif
 	code.call(code.rax);
 	code.mov(code.rsp, code.rbp);
 	code.test(code.rax, code.rax);
@@ -1211,7 +1276,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, c.rax, m_ret);
+			if (index < m_zero_tested.size() && m_zero_tested[index]) SkipZeroTestedLoad(c, c.rax, m_ret, flat_slot);
 			LoadGuest(c, c.rax, m_page_cache, flat_slot);
 		} else {
 			Load(c.r11, args[1]);
@@ -1242,7 +1307,7 @@ void WalkerCompiler::EmitRead(const Node& node, uint32_t index) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 			if (index < m_zero_tested.size() && m_zero_tested[index]) {
-				SkipZeroTestedLoad(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_ret);
+				SkipZeroTestedLoad(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_ret, flat_slot);
 			}
 			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_page_cache, flat_slot);
 		}
@@ -1727,7 +1792,13 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_gpu_produced   = runtime.gpu_produced;
 	t_pending_write  = runtime.pending_write;
 #if defined(ANYPS5_KYTY)
-	t_walker_defer = t_walker_ahead && runtime.defer_flat_loads;
+	t_walker_defer     = t_walker_ahead && runtime.defer_flat_loads;
+	const bool counted = AheadStopStats();
+	if (counted && t_walker_ahead) {
+		t_ahead_stops = {.active = true, .walked = true, .guest_writes = runtime.pending_write != nullptr};
+	} else if (counted) {
+		g_walks_not_ahead.fetch_add(1, std::memory_order_relaxed);
+	}
 #endif
 	++t_walk;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
@@ -1738,6 +1809,10 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_pending_write  = nullptr;
 #if defined(ANYPS5_KYTY)
 	t_walker_defer = false;
+	if (counted && t_ahead_stops.active) {
+		t_ahead_stops.active = false;
+		t_ahead_stops.ended  = end != nullptr;
+	}
 #endif
 	if (end == nullptr || t_walker_faulted) return false;
 	const auto* first = scratch.data() + plan.srt_captures / 8u;
@@ -1803,10 +1878,25 @@ uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address) {
 	if (!t_walker_ahead || address < GuestMemoryStart) return 0;
 	const auto length = SrtWalkerLoadLength(rip);
 	if (length != 0) t_walker_faulted = true;
+#if defined(ANYPS5_KYTY)
+	if (length != 0) NoteAheadStop(SrtAheadStop::Fault, NoFlatSlot);
+#endif
 	return length;
 }
 
 #if defined(ANYPS5_KYTY)
+bool SrtAheadStopStats() {
+	return AheadStopStats();
+}
+
+SrtAheadWalkStops& SrtAheadWalkStopsOfThread() {
+	return t_ahead_stops;
+}
+
+uint64_t TakeSrtWalksNotAhead() {
+	return g_walks_not_ahead.exchange(0, std::memory_order_relaxed);
+}
+
 SrtFlatDefer SrtFlatDeferMode() {
 	return FlatDeferMode();
 }

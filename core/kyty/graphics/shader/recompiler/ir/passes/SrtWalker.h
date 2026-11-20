@@ -115,6 +115,22 @@ struct SrtWalkerGuestMemory {
 };
 void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
 #if defined(ANYPS5_KYTY)
+enum class SrtAheadStop : uint8_t { None, Unreadable, GpuProduced, PendingWrite, Fault };
+enum class SrtLoadUse : uint8_t { Value, Flat, DescriptorWord, ZeroTest };
+struct SrtAheadWalkStops {
+	bool         active        = false;
+	bool         walked        = false;
+	bool         ended         = false;
+	bool         guest_writes  = false;
+	bool         pending_range = false;
+	SrtAheadStop first         = SrtAheadStop::None;
+	SrtLoadUse   first_use     = SrtLoadUse::Value;
+	uint32_t     stops         = 0;
+	uint32_t     flat_stops    = 0;
+};
+[[nodiscard]] bool               SrtAheadStopStats();
+[[nodiscard]] SrtAheadWalkStops& SrtAheadWalkStopsOfThread();
+[[nodiscard]] uint64_t           TakeSrtWalksNotAhead();
 enum class SrtFlatDefer : uint8_t { Off, On, Verify };
 [[nodiscard]] SrtFlatDefer           SrtFlatDeferMode();
 [[nodiscard]] std::vector<uint64_t>& SrtDeferredLoadsOfThread();
