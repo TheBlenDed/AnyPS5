@@ -651,6 +651,8 @@ private:
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 #if defined(ANYPS5_KYTY)
 	ResolvedDraw* m_flat_defer_check = nullptr;
+	bool          m_flat_defer_due   = false;
+	bool          m_clean_lines_due  = false;
 #endif
 	uint64_t                                                       m_context_id    = 0;
 	uint64_t                                                       m_user_config_id = 0;

@@ -92,6 +92,9 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasGpuWrittenImages(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+#if defined(ANYPS5_KYTY)
+	[[nodiscard]] bool NoGpuImageNow(uint64_t address, uint64_t size) noexcept;
+#endif
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);

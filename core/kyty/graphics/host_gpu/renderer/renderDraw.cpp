@@ -665,6 +665,15 @@ bool SameResolvedStage(const ShaderStageRuntime& ahead, const ShaderStageRuntime
 	return true;
 }
 
+void ReportCleanLines(const char* kind, uint64_t shader, uint32_t stage, bool same, const FlatDeferDifference& difference) {
+	const AheadCleanLines::Difference found {.what    = difference.what,
+	                                         .slot    = difference.slot,
+	                                         .address = difference.address,
+	                                         .ahead   = difference.deferred,
+	                                         .full    = difference.full};
+	AheadCleanLines::NoteCompared(kind, shader, stage, same ? nullptr : &found);
+}
+
 void ReportFlatDeferMismatch(const char* kind, uint64_t shader, uint32_t stage, const FlatDeferDifference& difference) {
 	g_flat_defer_mismatches.fetch_add(1, std::memory_order_relaxed);
 	const auto report = g_flat_defer_reports.fetch_add(1, std::memory_order_relaxed);
@@ -678,7 +687,9 @@ void ReportFlatDeferMismatch(const char* kind, uint64_t shader, uint32_t stage, 
 }
 
 void RenderExecutor::CheckDeferredDraw(CommandBuffer& buffer, const DrawRenderState& state) {
-	m_flat_defer_check = nullptr;
+	m_flat_defer_check     = nullptr;
+	const bool flat_defer  = std::exchange(m_flat_defer_due, false);
+	const bool clean_lines = std::exchange(m_clean_lines_due, false);
 	if (m_draw_state == nullptr) {
 		m_draw_state = {new DrawRenderStorage {}, [](DrawRenderStorage* storage) { delete storage; }};
 	} else {
@@ -690,7 +701,7 @@ void RenderExecutor::CheckDeferredDraw(CommandBuffer& buffer, const DrawRenderSt
 	full.indirect_offsets = state.indirect_offsets;
 	full.indirect_draw    = state.indirect_draw;
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, full);
-	g_flat_defer_compared.fetch_add(1, std::memory_order_relaxed);
+	if (flat_defer) g_flat_defer_compared.fetch_add(1, std::memory_order_relaxed);
 	FlatDeferDifference difference;
 	const auto          ahead_stages = state.VertexStages();
 	const auto          full_stages  = full.VertexStages();
@@ -709,20 +720,24 @@ void RenderExecutor::CheckDeferredDraw(CommandBuffer& buffer, const DrawRenderSt
 		if (state.ps_input_info.stage.module != nullptr) shader = state.ps_input_info.stage.module->info.shader_hash;
 		same = SameResolvedStage(state.ps_input_info.stage, full.ps_input_info.stage, difference);
 	}
-	if (!same) ReportFlatDeferMismatch("draw", shader, stage, difference);
+	if (!same && flat_defer) ReportFlatDeferMismatch("draw", shader, stage, difference);
+	if (clean_lines) ReportCleanLines("draw", shader, stage, same, difference);
 }
 
 void RenderExecutor::CheckDeferredDispatch(const HW::ComputeShaderInfo& regs, const ShaderComputeInputInfo& pristine,
                                            const ShaderComputeInputInfo& input_info, const ShaderModule* module) {
-	m_flat_defer_check = nullptr;
+	m_flat_defer_check     = nullptr;
+	const bool flat_defer  = std::exchange(m_flat_defer_due, false);
+	const bool clean_lines = std::exchange(m_clean_lines_due, false);
 	ShaderComputeInputInfo full = pristine;
-	const auto* full_module     = m_context.GetPipelineCache().GetComputeProgram(regs, full);
-	g_flat_defer_compared.fetch_add(1, std::memory_order_relaxed);
+	const auto* full_module     = m_context.GetPipelineCache().GetExactComputeProgram(regs, full);
+	if (flat_defer) g_flat_defer_compared.fetch_add(1, std::memory_order_relaxed);
 	FlatDeferDifference difference;
 	if (full_module != module) difference.what = "module";
-	if (full_module != module || !SameResolvedStage(input_info.stage, full.stage, difference)) {
-		ReportFlatDeferMismatch("dispatch", module != nullptr ? module->info.shader_hash : 0, 0, difference);
-	}
+	const bool same   = full_module == module && SameResolvedStage(input_info.stage, full.stage, difference);
+	const auto shader = module != nullptr ? module->info.shader_hash : 0;
+	if (!same && flat_defer) ReportFlatDeferMismatch("dispatch", shader, 0, difference);
+	if (clean_lines) ReportCleanLines("dispatch", shader, 0, same, difference);
 }
 #endif
 
@@ -974,12 +989,21 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 #endif
 #if defined(ANYPS5_KYTY)
 	m_flat_defer_check = nullptr;
+	m_flat_defer_due   = false;
+	m_clean_lines_due  = false;
 	if (shaders_resolved) {
 		if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
 			NoteFlatDefer(words, 0);
-			if (FlatDeferVerifies()) m_flat_defer_check = resolved;
+			m_flat_defer_due = FlatDeferVerifies();
 		}
 	}
+	if (resolved != nullptr && resolved->programs.reads.CleanLineLoads() != 0 && resolved->compute_module == nullptr &&
+	    resolved->storage.state.indirect_offsets == indirect_offsets &&
+	    resolved->storage.state.indirect_draw == indirect_draw) {
+		AheadCleanLines::NoteTaken(shaders_resolved);
+		m_clean_lines_due = shaders_resolved && AheadCleanLines::Verifies();
+	}
+	if (m_flat_defer_due || m_clean_lines_due) m_flat_defer_check = resolved;
 #endif
 	m_draw_resource_key =
 	    shaders_resolved && !resolved->programs.refreshed_words ? resolved->resource_key : 0;
@@ -1736,8 +1760,13 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
 #if defined(ANYPS5_KYTY)
 	m_flat_defer_check = nullptr;
+	m_flat_defer_due   = false;
+	m_clean_lines_due  = false;
+	const bool clean_lines =
+	    resolved != nullptr && resolved->compute_module != nullptr && resolved->programs.reads.CleanLineLoads() != 0;
 	if (resolved == nullptr || resolved->compute_module == nullptr ||
 	    !resolved->programs.Revalidate(true, &resolved->compute_module->info)) {
+		if (clean_lines) AheadCleanLines::NoteTaken(false);
 #else
 	if (resolved == nullptr || resolved->compute_module == nullptr ||
 	    !resolved->programs.Revalidate(true)) {
@@ -1753,8 +1782,13 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	AheadStopStats::Add(AheadStopStats::DispatchHit);
 	if (const auto words = resolved->programs.reads.DeferredWords(); words != 0) {
 		NoteFlatDefer(words, resolved->programs.reads.DeferredGpuWords());
-		if (FlatDeferVerifies()) m_flat_defer_check = resolved;
+		m_flat_defer_due = FlatDeferVerifies();
 	}
+	if (clean_lines) {
+		AheadCleanLines::NoteTaken(true);
+		m_clean_lines_due = AheadCleanLines::Verifies();
+	}
+	if (m_flat_defer_due || m_clean_lines_due) m_flat_defer_check = resolved;
 #endif
 	input_info = resolved->compute;
 	module     = resolved->compute_module;

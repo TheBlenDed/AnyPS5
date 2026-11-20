@@ -80,6 +80,7 @@ struct SrtRuntime {
 	bool image_table_heap = false;
 #if defined(ANYPS5_KYTY)
 	bool defer_flat_loads = false;
+	bool clean_line_loads = false;
 #endif
 };
 
@@ -114,6 +115,7 @@ struct SrtWalkerGuestMemory {
 	bool (*read)(uint64_t address, uint32_t& value, bool ahead, const uint8_t* backing) = nullptr;
 #if defined(ANYPS5_KYTY)
 	uint8_t (*line)(uint64_t address, uint32_t& value) = nullptr;
+	bool (*clean_line)(uint64_t address, uint32_t& value, const uint8_t*& backing, uint8_t& images) = nullptr;
 #endif
 };
 void SetSrtWalkerGuestMemory(const SrtWalkerGuestMemory& memory);
@@ -140,6 +142,9 @@ struct SrtAheadWalkStops {
 enum class SrtFlatDefer : uint8_t { Off, On, Verify };
 [[nodiscard]] SrtFlatDefer           SrtFlatDeferMode();
 [[nodiscard]] std::vector<uint64_t>& SrtDeferredLoadsOfThread();
+enum class SrtCleanLines : uint8_t { Off, On, Verify };
+[[nodiscard]] SrtCleanLines SrtCleanLinesMode();
+[[nodiscard]] uint32_t      TakeSrtCleanLineLoadsOfThread();
 #endif
 uint32_t SrtWalkerLoadLength(uint64_t rip);
 uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);

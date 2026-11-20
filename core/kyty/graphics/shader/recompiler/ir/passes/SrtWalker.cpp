@@ -184,6 +184,10 @@ struct WalkerPageAnswer {
 	uint64_t       page    = ~uint64_t {0};
 	SrtWalkerPage  kind    = SrtWalkerPage::Direct;
 	const uint8_t* backing = nullptr;
+#if defined(ANYPS5_KYTY)
+	const uint8_t* clean_backing = nullptr;
+	uint8_t        clean_images  = 0;
+#endif
 };
 thread_local std::array<WalkerPageAnswer, 4> t_page_answers;
 
@@ -192,6 +196,25 @@ struct WalkerCachedPage {
 	const uint8_t* backing = nullptr;
 };
 constexpr uint32_t WalkerPageCacheSlots = 4;
+
+#if defined(ANYPS5_KYTY)
+thread_local bool     t_walker_clean     = false;
+thread_local bool     t_flat_probe       = false;
+thread_local uint32_t t_clean_line_loads = 0;
+
+SrtCleanLines CleanLinesMode() {
+	static const SrtCleanLines mode = [] {
+		const char*            value = std::getenv("KYTY_AHEAD_CLEAN_LINES");
+		const std::string_view text {value == nullptr ? "" : value};
+		return text == "1" ? SrtCleanLines::On : text == "verify" ? SrtCleanLines::Verify : SrtCleanLines::Off;
+	}();
+	return mode;
+}
+
+bool IsFlatOnlySlot(uint32_t slot) {
+	return slot != NoFlatSlot && slot != ZeroTestSlot && !IsDescriptorSlot(slot);
+}
+#endif
 
 uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache) {
 	constexpr uint64_t PageSize = 4096;
@@ -232,6 +255,11 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 		return uint64_t {1} << 32u | value;
 	}
 	if (t_walker_ahead) {
+		if (t_walker_clean && !t_flat_probe && g_guest_memory.clean_line != nullptr &&
+		    g_guest_memory.clean_line(address, value, answer.clean_backing, answer.clean_images)) {
+			t_clean_line_loads++;
+			return uint64_t {1} << 32u | value;
+		}
 		t_walker_faulted = true;
 		return uint64_t {1} << 32u;
 	}
@@ -296,7 +324,9 @@ void NoteExecutionLoad(uint64_t address, uint64_t result) {
 uint64_t KYTY_SYSV_ABI ProbeGuestLoadCounted(uint64_t address, WalkerCachedPage* cache, uint32_t slot) {
 	const bool before = t_walker_faulted;
 	t_walker_faulted  = false;
-	auto result = ProbeGuestLoad(address, cache);
+	t_flat_probe      = IsFlatOnlySlot(slot);
+	auto result       = ProbeGuestLoad(address, cache);
+	t_flat_probe      = false;
 	if (t_walker_faulted) {
 		NoteAheadStop(SrtAheadStop::Unreadable, slot);
 		result = NoteUnreadableLoad(address, result);
@@ -319,14 +349,21 @@ SrtFlatDefer FlatDeferMode() {
 }
 
 bool DefersFlatLoad(uint32_t slot) {
-	return slot != NoFlatSlot && slot != ZeroTestSlot && !IsDescriptorSlot(slot) &&
+	return IsFlatOnlySlot(slot) &&
 	       (FlatDeferMode() != SrtFlatDefer::Off || Common::Ab::Listed(Common::RuntimeSwitches::Switch::FlatDefer));
+}
+
+uint64_t KYTY_SYSV_ABI ProbeFlatOnlyGuestLoad(uint64_t address, WalkerCachedPage* cache) {
+	t_flat_probe      = true;
+	const auto result = ProbeGuestLoad(address, cache);
+	t_flat_probe      = false;
+	return result;
 }
 
 uint64_t KYTY_SYSV_ABI ProbeFlatGuestLoad(uint64_t address, WalkerCachedPage* cache, uint32_t slot) {
 	const bool before = t_walker_faulted;
 	t_walker_faulted  = false;
-	const auto result = ProbeGuestLoad(address, cache);
+	const auto result = ProbeFlatOnlyGuestLoad(address, cache);
 	if (t_walker_faulted && t_walker_defer) {
 		t_deferred_loads.push_back(address);
 		t_walker_faulted = before;
@@ -380,6 +417,8 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_
 	} else if (AheadStopStats()) {
 		code.mov(code.edx, slot);
 		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoadCounted));
+	} else if (IsFlatOnlySlot(slot) && CleanLinesMode() != SrtCleanLines::Off) {
+		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeFlatOnlyGuestLoad));
 	} else {
 		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProbeGuestLoad));
 	}
@@ -1829,6 +1868,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_pending_write  = runtime.pending_write;
 #if defined(ANYPS5_KYTY)
 	t_walker_defer     = t_walker_ahead && runtime.defer_flat_loads;
+	t_walker_clean     = t_walker_ahead && runtime.clean_line_loads && CleanLinesMode() != SrtCleanLines::Off;
 	const bool counted = AheadStopStats();
 	if (counted && t_walker_ahead) {
 		t_ahead_stops = {.active = true, .walked = true, .guest_writes = runtime.pending_write != nullptr};
@@ -1847,6 +1887,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	t_pending_write  = nullptr;
 #if defined(ANYPS5_KYTY)
 	t_walker_defer = false;
+	t_walker_clean = false;
 	if (counted && t_ahead_stops.active) {
 		t_ahead_stops.active = false;
 		t_ahead_stops.ended  = end != nullptr;
@@ -1941,6 +1982,16 @@ SrtFlatDefer SrtFlatDeferMode() {
 
 std::vector<uint64_t>& SrtDeferredLoadsOfThread() {
 	return t_deferred_loads;
+}
+
+SrtCleanLines SrtCleanLinesMode() {
+	return CleanLinesMode();
+}
+
+uint32_t TakeSrtCleanLineLoadsOfThread() {
+	const auto loads   = t_clean_line_loads;
+	t_clean_line_loads = 0;
+	return loads;
 }
 #endif
 

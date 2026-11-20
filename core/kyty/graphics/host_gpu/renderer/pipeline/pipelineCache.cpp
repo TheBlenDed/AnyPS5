@@ -443,6 +443,9 @@ private:
 
 thread_local bool t_ahead_unlocked = false;
 #if defined(ANYPS5_KYTY)
+thread_local bool t_exact_compute_module = false;
+#endif
+#if defined(ANYPS5_KYTY)
 thread_local bool t_execute_unlocked = false;
 thread_local bool t_ahead_missing    = false;
 #endif
@@ -839,6 +842,73 @@ void End(bool finished) {
 		return;
 	}
 	LogAheadStops(static_cast<double>(now - last) / 1e9);
+}
+}
+
+namespace AheadCleanLines {
+namespace {
+std::atomic<uint64_t> g_resolutions {0};
+std::atomic<uint64_t> g_loads {0};
+std::atomic<uint64_t> g_validated {0};
+std::atomic<uint64_t> g_failed {0};
+std::atomic<uint64_t> g_compared {0};
+std::atomic<uint64_t> g_mismatches {0};
+std::atomic<uint64_t> g_line {0};
+std::atomic<uint32_t> g_reports {0};
+
+void LogSummary() {
+	const auto now = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	        .count());
+	auto last = g_line.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_line.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000ull || !g_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-clean-lines] summary of the last {:.1f} s: {} resolutions used clean-line loads ({} loads), {} validated "
+	    "at execution, {} failed validation (redone), {} mismatches (mode {}); {} compared with a full resolution\n",
+	    static_cast<double>(now - last) / 1e9, g_resolutions.exchange(0, std::memory_order_relaxed),
+	    g_loads.exchange(0, std::memory_order_relaxed), g_validated.exchange(0, std::memory_order_relaxed),
+	    g_failed.exchange(0, std::memory_order_relaxed), g_mismatches.exchange(0, std::memory_order_relaxed),
+	    Verifies() ? "verify" : "on", g_compared.exchange(0, std::memory_order_relaxed)));
+}
+}
+
+bool Enabled() {
+	static const bool enabled = ShaderRecompiler::IR::SrtCleanLinesMode() != ShaderRecompiler::IR::SrtCleanLines::Off;
+	return enabled;
+}
+
+bool Verifies() {
+	static const bool verifies = ShaderRecompiler::IR::SrtCleanLinesMode() == ShaderRecompiler::IR::SrtCleanLines::Verify;
+	return verifies;
+}
+
+void NoteResolved(uint32_t loads) {
+	g_resolutions.fetch_add(1, std::memory_order_relaxed);
+	g_loads.fetch_add(loads, std::memory_order_relaxed);
+}
+
+void NoteTaken(bool valid) {
+	(valid ? g_validated : g_failed).fetch_add(1, std::memory_order_relaxed);
+	LogSummary();
+}
+
+void NoteCompared(const char* kind, uint64_t shader, uint32_t stage, const Difference* difference) {
+	g_compared.fetch_add(1, std::memory_order_relaxed);
+	if (difference == nullptr) return;
+	g_mismatches.fetch_add(1, std::memory_order_relaxed);
+	const auto report = g_reports.fetch_add(1, std::memory_order_relaxed);
+	if (report >= 16) return;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-clean-lines] mismatch {}: {} shader {:#018x} stage {}: {} differs, slot {} address {:#x} ahead {:#010x} "
+	    "full {:#010x}\n",
+	    report + 1, kind, shader, stage, difference->what != nullptr ? difference->what : "stage count", difference->slot,
+	    difference->address, difference->ahead, difference->full));
 }
 }
 #endif
@@ -1990,7 +2060,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (failed) return skip_failure();
 #if defined(ANYPS5_KYTY)
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			const bool generic = specialized && !m_queue_only && ShaderRecompiler::IR::GenericComputeVariants();
+			const bool generic = specialized && !m_queue_only && !t_exact_compute_module &&
+			                     ShaderRecompiler::IR::GenericComputeVariants();
 			if (generic && module != nullptr && ComputePipelineState(*module) != 2u) {
 				if (auto* served = ServeComputeVariant(cached, push_data_cursor, module, 2u)) return bind(*served);
 			} else if (generic && module == nullptr) {
@@ -2509,10 +2580,12 @@ bool PipelineCache::GetGraphicsProgramsAhead(const HW::Context&    context,
                                              const HW::Shader& shaders, DrawRenderState& state,
                                              ProgramResolution& ahead) {
 #if defined(ANYPS5_KYTY)
-	if (AheadStopStats::Enabled()) {
-		AheadStopStats::Begin();
+	if (AheadStopStats::Enabled() || AheadCleanLines::Enabled()) {
+		if (AheadStopStats::Enabled()) AheadStopStats::Begin();
 		const bool resolved = ResolveGraphicsPrograms(context, user_config, shaders, state, &ahead);
-		AheadStopStats::End(resolved && !ahead.reads.Failed() && state.vertex_info[0].stage.module != nullptr);
+		const bool finished = resolved && !ahead.reads.Failed() && state.vertex_info[0].stage.module != nullptr;
+		if (AheadStopStats::Enabled()) AheadStopStats::End(finished);
+		if (finished && ahead.reads.CleanLineLoads() != 0) AheadCleanLines::NoteResolved(ahead.reads.CleanLineLoads());
 		return resolved;
 	}
 #endif
@@ -3067,10 +3140,14 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	const bool defers = ShaderRecompiler::IR::SrtFlatDeferMode() != ShaderRecompiler::IR::SrtFlatDefer::Off;
 	runtime.defer_flat_loads = defers;
 	if (defers) ShaderRecompiler::IR::SrtDeferredLoadsOfThread().clear();
+	const bool clean_lines   = AheadCleanLines::Enabled();
+	runtime.clean_line_loads = clean_lines;
+	if (clean_lines) (void)ShaderRecompiler::IR::TakeSrtCleanLineLoadsOfThread();
 	const bool counted = AheadStopStats::Enabled();
 	if (counted) ShaderRecompiler::IR::SrtAheadWalkStopsOfThread() = {};
 	const bool materialized =
 	    ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources, specialization);
+	if (clean_lines) ahead.reads.NoteCleanLineLoads(ShaderRecompiler::IR::TakeSrtCleanLineLoadsOfThread());
 	if (counted) {
 		const auto& stops = ShaderRecompiler::IR::SrtAheadWalkStopsOfThread();
 		if (stops.walked) AheadStopStats::Add(AheadStopStats::StageWalks);
@@ -3106,7 +3183,8 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	                    ? modules.begin() + static_cast<std::ptrdiff_t>(last)
 	                    : std::ranges::find_if(modules, matches);
 #if defined(ANYPS5_KYTY)
-	if (module == modules.end() && program->ShareModule(specialization, resources, push_data_cursor, false)) {
+	if (module == modules.end() && ahead.reads.CleanLineLoads() == 0 &&
+	    program->ShareModule(specialization, resources, push_data_cursor, false)) {
 		module = modules.end() - 1;
 	}
 	if (module != modules.end() && module->info.info.uses_image_heap) {
@@ -4010,6 +4088,16 @@ PipelineCache::TableProgram PipelineCache::GetPixelProgramTable(
 	return result;
 }
 
+#if defined(ANYPS5_KYTY)
+const ShaderModule* PipelineCache::GetExactComputeProgram(const HW::ComputeShaderInfo& regs,
+                                                          ShaderComputeInputInfo&      input_info) {
+	t_exact_compute_module = true;
+	const auto* module     = GetComputeProgram(regs, input_info);
+	t_exact_compute_module = false;
+	return module;
+}
+#endif
+
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info,
                                                      bool                         guest_traversal) {
@@ -4173,6 +4261,9 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 		module = GetAhead(params, input_info, push_data_cursor, ahead);
 	}
 	AheadStopStats::End(module != nullptr && !ahead.reads.Failed());
+	if (module != nullptr && !ahead.reads.Failed() && ahead.reads.CleanLineLoads() != 0) {
+		AheadCleanLines::NoteResolved(ahead.reads.CleanLineLoads());
+	}
 	if (module != nullptr) {
 		RequestComputePipelineAhead(*module);
 	}

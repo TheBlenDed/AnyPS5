@@ -264,6 +264,25 @@ uint8_t WalkerGuestLine(uint64_t address, uint32_t& value) {
 	return TryReadBacking(address, &value, sizeof(value)) ? Common::LeverStats::LineClean : Common::LeverStats::LineUnbacked;
 }
 
+bool WalkerCleanLine(uint64_t address, uint32_t& value, const uint8_t*& backing, uint8_t& images) {
+	constexpr uint64_t PageSize = 4096;
+	constexpr uint8_t  NoImage  = 1;
+	constexpr uint8_t  Image    = 2;
+	const auto         offset   = address & (PageSize - 1);
+	if (g_gpu_resources == nullptr || offset > PageSize - sizeof(value) || Graphics::GuestGpu::IsGpuThread()) return false;
+	auto& resources = GetGpuResources();
+	if (!resources.GetBufferCache().NoGpuBytesNow(address, sizeof(value))) return false;
+	if (images == 0) {
+		const auto page = address - offset;
+		images          = resources.GetTextureCache().NoGpuImageNow(page, PageSize) ? NoImage : Image;
+		backing         = static_cast<const uint8_t*>(FindBackingPointer(page, PageSize));
+	}
+	if (images == Image && !resources.GetTextureCache().NoGpuImageNow(address, sizeof(value))) return false;
+	if (backing == nullptr) return TryReadBacking(address, &value, sizeof(value));
+	std::memcpy(&value, backing + offset, sizeof(value));
+	return true;
+}
+
 }
 #endif
 
@@ -274,7 +293,7 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	if (resources != nullptr) Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange);
 #if defined(ANYPS5_KYTY)
 	if (resources != nullptr && WalkerProbeEnabled()) {
-		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead, &WalkerGuestLine});
+		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead, &WalkerGuestLine, &WalkerCleanLine});
 	}
 #endif
 }

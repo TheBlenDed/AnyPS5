@@ -63,6 +63,7 @@ public:
 #if defined(ANYPS5_KYTY)
 		m_deferred_words     = 0;
 		m_deferred_gpu_words = 0;
+		m_clean_line_loads   = 0;
 #endif
 	}
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
@@ -86,6 +87,11 @@ public:
 	[[nodiscard]] uint32_t DeferredWords() const { return m_deferred_words; }
 	[[nodiscard]] uint32_t DeferredGpuWords() const { return m_deferred_gpu_words; }
 	static void            ReadGuestNow(uint64_t address, void* bytes, uint32_t size);
+	void                   NoteCleanLineLoads(uint32_t loads) {
+		m_clean_line_loads += loads;
+		m_gpu_written = m_gpu_written || loads != 0;
+	}
+	[[nodiscard]] uint32_t CleanLineLoads() const { return m_clean_line_loads; }
 #else
 	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
 	                      bool gpu_copies = false) const;
@@ -157,6 +163,7 @@ private:
 #if defined(ANYPS5_KYTY)
 	uint32_t         m_deferred_words     = 0;
 	mutable uint32_t m_deferred_gpu_words = 0;
+	uint32_t         m_clean_line_loads   = 0;
 #endif
 };
 
@@ -200,6 +207,21 @@ void               Add(Slot slot);
 void               Note(Slot reason, Slot extra = Slots);
 void               Begin();
 void               End(bool finished);
+}
+
+namespace AheadCleanLines {
+struct Difference {
+	const char* what    = nullptr;
+	uint32_t    slot    = 0;
+	uint64_t    address = 0;
+	uint32_t    ahead   = 0;
+	uint32_t    full    = 0;
+};
+[[nodiscard]] bool Enabled();
+[[nodiscard]] bool Verifies();
+void               NoteResolved(uint32_t loads);
+void               NoteTaken(bool valid);
+void               NoteCompared(const char* kind, uint64_t shader, uint32_t stage, const Difference* difference);
 }
 #endif
 
@@ -478,6 +500,9 @@ public:
 #if defined(ANYPS5_KYTY)
 	[[nodiscard]] static bool NarrowProgramLock();
 	static void BeginExecuteThread();
+#endif
+#if defined(ANYPS5_KYTY)
+	const ShaderModule* GetExactComputeProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
 #endif
 	const ShaderModule* GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
 	                                           ShaderComputeInputInfo&      input_info,

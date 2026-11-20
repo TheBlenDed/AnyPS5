@@ -3404,6 +3404,26 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	return modified;
 }
 
+#if defined(ANYPS5_KYTY)
+bool TextureCache::NoGpuImageNow(uint64_t address, uint64_t size) noexcept {
+	ImagePageTable::PageRange pages {};
+	if (!GuestRange {address, size}.Valid() || !ImagePageTable::TryGetPageRange(address, size, pages) ||
+	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
+		return true;
+	}
+	if (!m_lock.TryLockSpinning()) {
+		return false;
+	}
+	bool modified = false;
+	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
+		modified = !image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty();
+		return modified;
+	});
+	m_lock.unlock();
+	return !modified;
+}
+#endif
+
 bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	ImagePageTable::PageRange pages {};
 	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
