@@ -93,9 +93,9 @@ void Refusals() {
 }
 
 void Defaults() {
-	Check(!Switches::On(Switch::FlatDefer), "KYTY_FLAT_DEFER is off without the variable");
+	Check(Switches::On(Switch::FlatDefer), "KYTY_FLAT_DEFER is on without the variable");
 	Check(Switches::On(Switch::GenericComputeVariant), "KYTY_GENERIC_COMPUTE_VARIANT is on without the variable");
-	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::Off, "the walker sees KYTY_FLAT_DEFER off");
+	Check(IR::SrtFlatDeferMode() == IR::SrtFlatDefer::On, "the walker sees KYTY_FLAT_DEFER on");
 	Check(IR::GenericComputeVariants(), "the compute variants see KYTY_GENERIC_COMPUTE_VARIANT on");
 	Check(Switches::Find("KYTY_FLAT_DEFER") == Switch::FlatDefer, "KYTY_FLAT_DEFER is a runtime switch");
 	Check(!Switches::Find("KYTY_WAVE_SPLIT").has_value(), "KYTY_WAVE_SPLIT is not a runtime switch");
@@ -228,6 +228,10 @@ int main() {
 	SetVariable("KYTY_GENERIC_COMPUTE_VARIANT", nullptr);
 	Switches::Validate();
 	Defaults();
+	SetVariable("KYTY_FLAT_DEFER", "0");
+	Switches::Validate();
+	Check(!Switches::On(Switch::FlatDefer) && IR::SrtFlatDeferMode() == IR::SrtFlatDefer::Off,
+	      "KYTY_FLAT_DEFER=0 turns it off");
 	Refusals();
 	Phases();
 	EnvironmentArms();

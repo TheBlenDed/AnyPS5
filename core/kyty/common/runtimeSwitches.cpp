@@ -29,7 +29,7 @@ struct Entry {
 };
 
 constexpr Reading ReadFlatDefer(std::string_view value) {
-	return value == "1" ? Reading::On : value == "verify" ? Reading::NotAnArm : Reading::Off;
+	return value.empty() || value == "1" ? Reading::On : value == "verify" ? Reading::NotAnArm : Reading::Off;
 }
 
 constexpr Reading ReadUnlessZero(std::string_view value) {
