@@ -16,6 +16,8 @@ using Published = EagerReadbackWindows::Published;
 constexpr uint64_t Window = EagerReadbackWindows::WindowSize;
 constexpr uint64_t Pool   = 0x240000000;
 constexpr size_t   None   = EagerReadbackWindows::None;
+constexpr uint64_t LooseHitFrames = 16;
+constexpr uint32_t LooseIdleLimit = 8;
 
 void Require(bool value, const char* what) {
 	if (value) return;
@@ -32,13 +34,22 @@ std::vector<uint64_t> SameHome(size_t count) {
 	return windows;
 }
 
+std::unique_ptr<EagerReadbackWindows> Loose() {
+	EagerReadbackWindows::Settings settings;
+	settings.hot_hits   = 2;
+	settings.hit_frames = LooseHitFrames;
+	settings.idle_limit = LooseIdleLimit;
+	settings.wake_hits  = 1;
+	return std::make_unique<EagerReadbackWindows>(settings);
+}
+
 void MakeHot(EagerReadbackWindows& windows, uint64_t address, uint64_t frame, size_t& index) {
 	(void)windows.NoteFault(address, frame, index);
 	Require(windows.NoteFault(address, frame, index) == Fault::Hot, "two faults in a frame make a window hot");
 }
 
 void Learning() {
-	auto   windows = std::make_unique<EagerReadbackWindows>();
+	auto   windows = Loose();
 	size_t index   = None;
 	Require(windows->Find(Pool) == None, "a fresh table holds no window");
 	Require(windows->ActiveCount() == 0, "a fresh table has no hot window");
@@ -47,32 +58,32 @@ void Learning() {
 	Require(windows->Begin(index) == Pool, "a window starts at its 64 KiB boundary");
 	Require(windows->Find(Pool + Window) == None, "the next window is a different one");
 	Require(!windows->Active(index), "a cold window is not active");
-	Require(windows->NoteFault(Pool + 0x8000, 10 + EagerReadbackWindows::HitFrames, index) == Fault::Hot,
+	Require(windows->NoteFault(Pool + 0x8000, 10 + LooseHitFrames, index) == Fault::Hot,
 	        "a second fault within the hit frames makes the window hot");
 	Require(windows->Active(index) && windows->ActiveCount() == 1, "a hot window is active");
 	Require(windows->NoteFault(Pool, 5000, index) == Fault::Hot, "a hot window stays hot across a long gap");
 
 	size_t other = None;
 	Require(windows->NoteFault(Pool + Window, 10, other) == Fault::Cold, "the neighbour starts cold");
-	Require(windows->NoteFault(Pool + Window, 11 + EagerReadbackWindows::HitFrames, other) == Fault::Cold,
+	Require(windows->NoteFault(Pool + Window, 11 + LooseHitFrames, other) == Fault::Cold,
 	        "a second fault after the hit frames starts the count again");
-	Require(windows->NoteFault(Pool + Window, 12 + EagerReadbackWindows::HitFrames, other) == Fault::Hot,
+	Require(windows->NoteFault(Pool + Window, 12 + LooseHitFrames, other) == Fault::Hot,
 	        "the fault after that one makes it hot");
 }
 
 void Aging() {
-	auto   windows = std::make_unique<EagerReadbackWindows>();
+	auto   windows = Loose();
 	size_t index   = None;
 	MakeHot(*windows, Pool, 1, index);
 	Require(windows->NotePublished(index, 2) == Published::Touched, "the publication after a fault is not idle");
-	for (uint32_t i = 1; i < EagerReadbackWindows::IdleLimit; i++) {
+	for (uint32_t i = 1; i < LooseIdleLimit; i++) {
 		Require(windows->NotePublished(index, 2 + i) == Published::Idle, "a publication without an access is idle");
 		Require(windows->Active(index), "the window stays active below the idle limit");
 	}
 	windows->NoteGuestWrite(Pool + 0x4000);
 	Require(windows->NotePublished(index, 20) == Published::Touched, "a guest write ends the idle streak");
 	windows->NoteGuestWrite(Pool + Window);
-	for (uint32_t i = 1; i < EagerReadbackWindows::IdleLimit; i++) {
+	for (uint32_t i = 1; i < LooseIdleLimit; i++) {
 		Require(windows->NotePublished(index, 20 + i) == Published::Idle, "a write to another window does not count");
 	}
 	Require(windows->NotePublished(index, 40) == Published::Asleep, "the idle limit puts the window to sleep");
@@ -85,7 +96,7 @@ void Aging() {
 }
 
 void Blocking() {
-	auto   windows = std::make_unique<EagerReadbackWindows>();
+	auto   windows = Loose();
 	size_t index   = None;
 	MakeHot(*windows, Pool + Window, 1, index);
 	Require(windows->Block(Pool + 0x100, Pool + 2 * Window + 1, 2) == 3, "a readback over three windows blocks three");
@@ -99,7 +110,7 @@ void Blocking() {
 }
 
 void Eviction() {
-	auto       windows = std::make_unique<EagerReadbackWindows>();
+	auto       windows = Loose();
 	const auto same    = SameHome(EagerReadbackWindows::Probes + 2);
 	size_t     index   = None;
 	for (size_t i = 0; i < EagerReadbackWindows::Probes; i++) {
@@ -130,7 +141,7 @@ void Eviction() {
 	Require(windows->NoteFault(same[3], late + 5000, index) == Fault::Dropped && index == None,
 	        "a probe run of queued windows and windows with a copy in flight takes no new window");
 
-	auto blocked = std::make_unique<EagerReadbackWindows>();
+	auto blocked = Loose();
 	for (size_t i = 0; i < EagerReadbackWindows::Probes; i++) {
 		Require(blocked->Block(same[i], same[i] + 1, 100) == 1, "each window of the run is blocked");
 	}
@@ -143,7 +154,7 @@ void Eviction() {
 }
 
 void Ranges() {
-	auto                  windows = std::make_unique<EagerReadbackWindows>();
+	auto                  windows = Loose();
 	size_t                index   = None;
 	std::vector<uint64_t> seen;
 	const auto            collect = [&](uint64_t begin, uint64_t end) {
@@ -169,7 +180,7 @@ void Ranges() {
 }
 
 void GuestThreads() {
-	auto   windows = std::make_unique<EagerReadbackWindows>();
+	auto   windows = Loose();
 	size_t index   = None;
 	MakeHot(*windows, Pool, 1, index);
 	Require(windows->NotePublished(index, 2) == Published::Touched, "the first publication takes the fault");
@@ -195,6 +206,9 @@ void Thresholds() {
 	            defaults->Parameters().wake_hits == EagerReadbackWindows::WakeHits &&
 	            defaults->Parameters().probes == EagerReadbackWindows::Probes,
 	        "a table without settings uses the defaults");
+	Require(EagerReadbackWindows::HotHits == 3 && EagerReadbackWindows::HitFrames == 2 &&
+	            EagerReadbackWindows::IdleLimit == 1 && EagerReadbackWindows::WakeHits == 2,
+	        "the defaults are three faults within two frames, one idle publication and two waking faults");
 	EagerReadbackWindows::Settings zero;
 	zero.hot_hits   = 0;
 	zero.hit_frames = 0;

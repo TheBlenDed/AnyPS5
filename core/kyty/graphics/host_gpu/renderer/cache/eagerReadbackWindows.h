@@ -14,10 +14,10 @@ public:
 	static constexpr uint64_t WindowSize    = 64 * 1024;
 	static constexpr size_t   Slots         = 256;
 	static constexpr size_t   Probes        = 4;
-	static constexpr uint32_t HotHits       = 2;
-	static constexpr uint64_t HitFrames     = 16;
-	static constexpr uint32_t IdleLimit     = 8;
-	static constexpr uint32_t WakeHits      = 1;
+	static constexpr uint32_t HotHits       = 3;
+	static constexpr uint64_t HitFrames     = 2;
+	static constexpr uint32_t IdleLimit     = 1;
+	static constexpr uint32_t WakeHits      = 2;
 	static constexpr uint64_t HotFrames     = 64;
 	static constexpr uint64_t BlockedFrames = 4096;
 	static constexpr uint64_t ScanWindows   = 8;
