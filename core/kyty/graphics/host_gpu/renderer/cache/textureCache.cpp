@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/rayTracingCheck.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
@@ -30,8 +31,10 @@
 #include <cinttypes>
 #include <cstdio>
 #if defined(ANYPS5_KYTY)
+#include <charconv>
 #include <cstdlib>
 #include <string_view>
+#include <fmt/format.h>
 #endif
 #include <cstring>
 #include <limits>
@@ -53,6 +56,68 @@ constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
 constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
 constexpr uint64_t PartialUploadMaxShare = 2;
 constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
+
+#if defined(ANYPS5_KYTY)
+uint64_t ProbeColorClearAddress() {
+	static const auto target = []() -> uint64_t {
+		const auto* env = std::getenv("KYTY_COLOR_CLEAR_PROBE");
+		if (env == nullptr) {
+			return 0;
+		}
+		std::string_view value(env);
+		if (value.starts_with("0x")) {
+			value.remove_prefix(2);
+		}
+		uint64_t address = 0;
+		const auto parse = std::from_chars(value.data(), value.data() + value.size(), address, 16);
+		return parse.ec == std::errc {} && parse.ptr == value.data() + value.size() ? address : 0;
+	}();
+	return target;
+}
+
+void TraceProbeColorClear(CommandBuffer& command, uint64_t image_address, std::string_view origin,
+                          uint32_t code, uint64_t raw, bool valid, const vk::ClearColorValue* decoded) {
+	const auto target = ProbeColorClearAddress();
+	if (target == 0 || image_address != target) {
+		return;
+	}
+
+	const auto x = decoded != nullptr ? std::bit_cast<uint32_t>(decoded->float32[0]) : 0;
+	const auto y = decoded != nullptr ? std::bit_cast<uint32_t>(decoded->float32[1]) : 0;
+	struct ClearSignature {
+		std::string_view origin;
+		uint64_t raw;
+		uint32_t code;
+		uint32_t x;
+		uint32_t y;
+		bool valid;
+
+		bool operator==(const ClearSignature&) const = default;
+	};
+	static std::mutex mutex;
+	static std::vector<ClearSignature> seen;
+	static uint32_t witness_events = 0;
+	const ClearSignature signature {origin, raw, code, x, y, valid};
+	auto& context = command.GetContext();
+	std::lock_guard lock(mutex);
+	if (IsProbeColorWitnessFrame(context)) {
+		if (witness_events == 64) {
+			return;
+		}
+		++witness_events;
+	} else {
+		if (seen.size() == 32 || std::ranges::find(seen, signature) != seen.end()) {
+			return;
+		}
+		seen.push_back(signature);
+	}
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[ResourceProbe] color clear frame={} tick={} guest={:#x} origin={} code_or_mask={:#x} "
+	    "raw={:#018x} valid={} decoded={}\n",
+	    context.FlipNumber(), context.GetCommandScheduler().CurrentTick(), image_address, origin, code,
+	    raw, valid, decoded != nullptr ? fmt::format("{:08x},{:08x}", x, y) : "gpu-predicate"));
+}
+#endif
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -1864,6 +1929,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				for (uint32_t slice = 0; slice < count && expand; slice++) {
 					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
 				}
+#if defined(ANYPS5_KYTY)
+				TraceProbeColorClear(m_scheduler.Current(), image.info.data.address,
+				                     desc.info.metadata.kind == ImageMetadataKind::Dcc ? "dcc-predicate" : "cmask-predicate",
+				                     keys, desc.info.metadata.clear_word, desc.info.metadata.clear_register_valid,
+				                     nullptr);
+#endif
 				const auto command = m_scheduler.Current().Handle();
 				const auto area    = BeginColorRendering(image, view.format, view.base_level,
 				                                         image_first, count, nullptr, command);
@@ -1926,6 +1997,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			Common::ScopedLock lock {m_lock};
 			const auto& image = m_slot_images[id];
 			const bool depth = image.info.IsDepth();
+#if defined(ANYPS5_KYTY)
+			if (!depth) {
+				TraceProbeColorClear(
+				    m_scheduler.Current(), image.info.data.address,
+				    desc.info.metadata.kind == ImageMetadataKind::Dcc ? "dcc" : "cmask", code,
+				    desc.info.metadata.clear_word, desc.info.metadata.clear_register_valid, &clear.color);
+			}
+#endif
 			if (depth) {
 				const auto value = clear.color.float32[0];
 				clear.depthStencil = {value, 0u};
@@ -2849,6 +2928,11 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		}
 		clear.depthStencil.stencil = stencil_clear;
 	}
+#if defined(ANYPS5_KYTY)
+	if (aspect == vk::ImageAspectFlagBits::eColor) {
+		TraceProbeColorClear(command, image.info.data.address, "buffer-fill", 0, packed_clear, true, &clear.color);
+	}
+#endif
 	ClearImage(command, selected, image.backing.format,
 	           {aspect, subresources.base_level, subresources.level_count,
 	            subresources.base_layer, subresources.layer_count}, clear);
@@ -2911,8 +2995,22 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
+		auto color = clear.color;
+#if defined(ANYPS5_KYTY)
+		const auto probe_address = ProbeColorClearAddress();
+		const bool witness = probe_address != 0 && image.info.data.address == probe_address &&
+		                     format == vk::Format::eR16G16Sfloat && full_image && !image.info.IsVolume() &&
+		                     image.info.samples == 1 && image.info.resources.levels == 1 &&
+		                     image.info.resources.layers == 1 && image.info.LinearSize() <= (32u << 20u) &&
+		                     ApplyProbeColorWitness(command.GetContext(), color);
+#endif
 		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &clear.color, 1, &native_range);
+		                                 &color, 1, &native_range);
+#if defined(ANYPS5_KYTY)
+		if (witness) {
+			SaveProbeColorWitness(command.GetContext(), image);
+		}
+#endif
 	} else {
 		command.Handle().clearDepthStencilImage(image.backing.image,
 		                                        vk::ImageLayout::eTransferDstOptimal,

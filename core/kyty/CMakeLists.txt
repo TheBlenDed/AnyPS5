@@ -266,6 +266,24 @@ set_source_files_properties(${KYTY_SHIM_MEMORY_SOURCES} PROPERTIES INCLUDE_DIREC
 set_source_files_properties("${KYTY_SHIM_SOURCE_DIR}/MemoryBacking.cpp" PROPERTIES COMPILE_OPTIONS -fexceptions)
 list(APPEND KYTY_GPU_SOURCES ${KYTY_SHIM_MEMORY_SOURCES})
 
+set(KYTY_HULL_PROOF_DIR "${ANYPS5_SOURCE_DIR}/core/shader/recompiler")
+set(KYTY_HULL_PROOF_SOURCES
+    "${KYTY_DIR}/graphics/shader/recompiler/QuadHelperProof.cpp"
+    "${KYTY_HULL_PROOF_DIR}/Optimization/src/QuadHelperProof.cpp"
+    "${KYTY_HULL_PROOF_DIR}/IntermediateRepresentation/src/GuestRegister.cpp"
+    "${KYTY_HULL_PROOF_DIR}/IntermediateRepresentation/src/IrBlock.cpp"
+    "${KYTY_HULL_PROOF_DIR}/IntermediateRepresentation/src/IrOpcode.cpp"
+    "${KYTY_HULL_PROOF_DIR}/IntermediateRepresentation/src/IrProgram.cpp"
+    "${KYTY_HULL_PROOF_DIR}/IntermediateRepresentation/src/IrType.cpp"
+    "${KYTY_HULL_PROOF_DIR}/IntermediateRepresentation/src/IrValue.cpp"
+)
+set_source_files_properties(${KYTY_HULL_PROOF_SOURCES} PROPERTIES
+    COMPILE_OPTIONS -fexceptions
+    INCLUDE_DIRECTORIES "${KYTY_HULL_PROOF_DIR};${KYTY_HULL_PROOF_DIR}/ControlFlow/include;${KYTY_HULL_PROOF_DIR}/IntermediateRepresentation/include;${KYTY_HULL_PROOF_DIR}/Optimization/include;${KYTY_HULL_PROOF_DIR}/RdnaDecoder/include"
+)
+list(REMOVE_ITEM KYTY_GPU_SOURCES "${KYTY_DIR}/graphics/shader/recompiler/QuadHelperProof.cpp")
+list(APPEND KYTY_GPU_SOURCES ${KYTY_HULL_PROOF_SOURCES})
+
 add_library(kyty_gpu STATIC ${KYTY_GPU_SOURCES})
 add_dependencies(kyty_gpu kyty_gpu_shaders kyty_shader_store_stamp kyty_host_gpu_stamp)
 target_include_directories(kyty_gpu

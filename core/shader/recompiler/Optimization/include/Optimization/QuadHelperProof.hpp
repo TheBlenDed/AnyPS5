@@ -7,7 +7,12 @@
 
 namespace ShaderRecompiler {
 
-[[nodiscard]] std::string ProveQuadHelpersUnobserved(const IrProgram& program, const IrValue& wqm, std::span<IrValue* const> reads, const IrValue& predicate);
+struct QuadHelperGuard {
+    const IrValue* instruction;
+    std::size_t operand;
+};
+
+[[nodiscard]] std::string ProveQuadHelpersUnobserved(const IrProgram& program, const IrValue& wqm, std::span<IrValue* const> reads, const IrValue& predicate, std::span<const QuadHelperGuard> guards = {});
 
 }
 

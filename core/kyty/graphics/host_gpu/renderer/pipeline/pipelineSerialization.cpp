@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/rayTracingCheck.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 
@@ -337,6 +338,9 @@ bool PipelineCache::ReadRecord(std::span<const uint8_t> frame_bytes, StoreRecord
 			record.plan_loaded = ShaderRecompiler::IR::LoadResourcePlan(plan, record.plan);
 			module.module      = CompileSPV(spirv, m_graphics.device);
 			module.spirv_words = static_cast<uint32_t>(spirv.size());
+#if defined(ANYPS5_KYTY)
+			RetainProbeShader(module, spirv);
+#endif
 			if (!plain_spirv.empty()) {
 				module.plain = MakePlainModule(module, plain_spirv, m_graphics.device);
 				if (module.plain == nullptr) {

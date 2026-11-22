@@ -33,8 +33,11 @@
 #include <optional>
 #endif
 #include <fmt/format.h>
+#include <functional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -46,6 +49,25 @@ struct DriverCreation {
 	const char* names[4] {};
 	uint64_t    hashes[4] {};
 };
+
+#if defined(ANYPS5_KYTY)
+uint32_t ComputeCreationThreshold(const char* name) {
+	const auto* value = std::getenv(name);
+	char* end = nullptr;
+	const auto words = value != nullptr ? std::strtoul(value, &end, 10) : 0ul;
+	return end != nullptr && *end == '\0' && words <= UINT32_MAX ? static_cast<uint32_t>(words) : 0u;
+}
+
+bool FastComputeCreation(const ShaderModule& module) {
+	static const auto minimum = ComputeCreationThreshold("KYTY_FAST_COMPUTE_MIN_WORDS");
+	return minimum != 0 && module.spirv_words >= minimum;
+}
+
+bool LookupComputeCreation(const ShaderModule& module) {
+	static const auto minimum = ComputeCreationThreshold("KYTY_COMPUTE_CACHE_LOOKUP_MIN_WORDS");
+	return minimum != 0 && module.spirv_words >= minimum;
+}
+#endif
 
 thread_local DriverCreation t_driver_creation;
 
@@ -61,13 +83,30 @@ int64_t SteadyNs() {
 class ScopedDriverCreation {
 public:
 	ScopedDriverCreation(const std::array<const char*, 4>& names,
-	                     const std::array<uint64_t, 4>&    hashes) {
+	                     const std::array<uint64_t, 4>&    hashes, [[maybe_unused]] uint64_t module = 0) {
 		t_driver_creation.active = true;
 		for (size_t i = 0; i < 4; i++) {
 			t_driver_creation.names[i]  = names[i];
 			t_driver_creation.hashes[i] = hashes[i];
 		}
 		const int64_t now = SteadyNs();
+#if defined(ANYPS5_KYTY)
+		static const bool trace_enabled = [] {
+			const auto* value = std::getenv("KYTY_PIPELINE_WAIT_TRACE");
+			return value != nullptr && std::string_view(value) == "1";
+		}();
+		if (trace_enabled) {
+			m_trace_start = now;
+			std::string stages;
+			for (size_t i = 0; i < names.size(); ++i) {
+				if (names[i] != nullptr) {
+					stages += fmt::format(" {}={:016x}", names[i], hashes[i]);
+				}
+			}
+			Log::WriteToConsoleAndLog(fmt::format("[kyty-driver] enter tid={} module={:016x}{} @{}\n",
+			    std::hash<std::thread::id>{}(std::this_thread::get_id()), module, stages, now));
+		}
+#endif
 		for (size_t i = 0; i < MaxDriverCreations; i++) {
 			int64_t free = 0;
 			if (g_driver_creations[i].compare_exchange_strong(free, now, std::memory_order_acq_rel)) {
@@ -81,6 +120,12 @@ public:
 		if (m_slot >= 0) {
 			g_driver_creations[static_cast<size_t>(m_slot)].store(0, std::memory_order_release);
 		}
+#if defined(ANYPS5_KYTY)
+		if (m_trace_start != 0) {
+			Log::WriteToConsoleAndLog(fmt::format("[kyty-driver] leave tid={} begin={} @{}\n",
+			    std::hash<std::thread::id>{}(std::this_thread::get_id()), m_trace_start, SteadyNs()));
+		}
+#endif
 	}
 
 	ScopedDriverCreation(const ScopedDriverCreation&)            = delete;
@@ -88,6 +133,9 @@ public:
 
 private:
 	int m_slot = -1;
+#if defined(ANYPS5_KYTY)
+	int64_t m_trace_start = 0;
+#endif
 };
 
 }
@@ -901,6 +949,12 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 	if (lookup) {
 		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 	}
+#if defined(ANYPS5_KYTY)
+	const bool fast = !lookup && FastComputeCreation(module);
+	if (fast) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
+#endif
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
@@ -921,7 +975,7 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 	vk::Result result;
 	{
 		const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
-		                                    {module.info.shader_hash, 0, 0, 0});
+		                                    {module.info.shader_hash, 0, 0, 0}, module.id);
 		const auto started = timing ? Clock::now() : Clock::time_point {};
 		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 		if (timing) {
@@ -933,11 +987,12 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 		*driver_time = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed);
 	}
 #if defined(ANYPS5_KYTY)
-	if (log_ms && std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >= *log_ms) {
+	if (log_ms && ((lookup && LookupComputeCreation(module)) ||
+	               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >= *log_ms)) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "[kyty-gpl] compute-driver {:.6f} s 0x{:016x} module={} spirv_words={} mode={} result={} @{}\n",
 		    std::chrono::duration<double>(elapsed).count(), module.info.shader_hash, module.id,
-		    module.spirv_words, lookup ? "lookup" : "create", vk::to_string(result),
+		    module.spirv_words, lookup ? "lookup" : fast ? "fast-create" : "create", vk::to_string(result),
 		    finished.time_since_epoch().count()));
 	}
 #endif
@@ -946,6 +1001,12 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderModule& module, vk::PipelineCache driver_cache) {
+#if defined(ANYPS5_KYTY)
+	if ((LookupComputeCreation(module) || FastComputeCreation(module)) &&
+	    FindComputePipeline(graphics, pipeline, module, driver_cache)) {
+		return;
+	}
+#endif
 	const auto result = CreateComputePipeline(graphics, pipeline, module, driver_cache, false);
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkCreateComputePipelines failed: %s, cs 0x%016" PRIx64 "\n", vk::to_string(result).c_str(),

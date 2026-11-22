@@ -172,6 +172,7 @@ void DisplayWindow::UpdateTitle() {
     static std::uint64_t fpsFrames = 0;
     static double currentFps = 0.0;
     static const bool everyFrame = TitleEveryFrame();
+    static const bool externalMonitor = std::getenv("ANYPS5_EXTERNAL_MONITOR") != nullptr;
     const auto now = std::chrono::steady_clock::now();
     frameNum++;
     fpsFrames++;
@@ -183,7 +184,7 @@ void DisplayWindow::UpdateTitle() {
         fpsFrames = 0;
         fpsWindowClosed = true;
     }
-    if (everyFrame || WindowTitleUpdate::ShouldPush(frameNum, fpsWindowClosed)) {
+    if (!externalMonitor && (everyFrame || WindowTitleUpdate::ShouldPush(frameNum, fpsWindowClosed))) {
         char text[160];
         std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
         SDL_SetWindowTitle(window, text);

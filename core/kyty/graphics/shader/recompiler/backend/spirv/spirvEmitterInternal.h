@@ -158,7 +158,13 @@ struct EmitterState {
 	std::map<std::array<uint32_t, 2>, uint32_t>      bda_load_functions;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
-	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
+	std::map<std::array<uint32_t, 5>, uint32_t>        indirect_buffer_load_functions;
+	struct IndirectBufferReadGroups {
+		uint32_t lookup = 0;
+		uint32_t first_slot = 0;
+		std::vector<uint32_t> representatives;
+	};
+	std::map<uint32_t, IndirectBufferReadGroups>      indirect_buffer_read_groups;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         bvh_triangle_function   = 0;
 	int32_t                                          bvh_guest_lanes         = -1;

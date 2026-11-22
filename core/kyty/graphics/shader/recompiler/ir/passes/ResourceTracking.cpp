@@ -5517,7 +5517,7 @@ private:
 				           !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or 32-bit formatted load, "
+					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or 16/32-bit formatted load, "
 					     "or a raw DWORD store or 32-bit integer atomic from a user-data base");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;

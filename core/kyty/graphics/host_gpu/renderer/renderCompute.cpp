@@ -581,6 +581,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		if (rt_pass == 1) {
 			RtCheck().Before(bindings);
 		}
+#if defined(ANYPS5_KYTY)
+		if (rt_pass == 0) {
+			ProbeShaderResources(m_context, std::span {&descriptor_stage, 1u}, false);
+		}
+#endif
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
 #if defined(ANYPS5_KYTY)
@@ -681,6 +686,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			RtCheck().AfterGuest(bindings);
 		}
 
+#if defined(ANYPS5_KYTY)
+		if (rt_pass == 0) {
+			ProbeShaderResources(m_context, std::span {&descriptor_stage, 1u}, true);
+		}
+#endif
 		m_deferred_barrier       = true;
 		m_deferred_barrier_queue = m_guest_queue;
 		ResetBindings();
@@ -995,6 +1005,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		if (rt_pass == 1) {
 			RtCheck().Before(bindings);
 		}
+#if defined(ANYPS5_KYTY)
+		if (rt_pass == 0) {
+			ProbeShaderResources(m_context, std::span {&descriptor_stage, 1u}, false);
+		}
+#endif
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
 #if defined(ANYPS5_KYTY)
@@ -1024,6 +1039,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		} else if (rt_pass == 2) {
 			RtCheck().AfterGuest(bindings);
 		}
+#if defined(ANYPS5_KYTY)
+		if (rt_pass == 0) {
+			ProbeShaderResources(m_context, std::span {&descriptor_stage, 1u}, true);
+		}
+#endif
 		m_deferred_barrier       = true;
 		m_deferred_barrier_queue = m_guest_queue;
 		ResetBindings();

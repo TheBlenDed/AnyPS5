@@ -88,6 +88,9 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	}
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eColorAttachment)) {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
+		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
+			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+		}
 	}
 	if (graphics.GetPhysicalDeviceProperties().limits.storageImageSampleCounts &
 	    static_cast<vk::SampleCountFlagBits>(info.samples)) {

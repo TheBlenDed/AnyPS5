@@ -124,6 +124,43 @@ int64_t SteadyNs() {
 	    .count();
 }
 
+enum class ReadbackTracePath { Queue, Timeline, Publish, Count };
+
+int64_t StartReadbackTrace() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_READBACK_SLOW_TRACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled ? SteadyNs() : 0;
+}
+
+void NoteSlowReadback(ReadbackTracePath path, uint64_t needed, uint64_t recorded, uint64_t submitted,
+                      uint64_t bytes, const std::array<int64_t, 5>& times) {
+	const auto [start, gpu, priority, invalidate, done] = times;
+	if (start == 0 || done - start < 20'000'000) {
+		return;
+	}
+	static constexpr std::array names {"queue", "timeline", "publish"};
+	static std::array<std::atomic<int64_t>, static_cast<size_t>(ReadbackTracePath::Count)> previous {};
+	const auto index = static_cast<size_t>(path);
+	auto last = previous[index].load(std::memory_order_relaxed);
+	if (done - last < 250'000'000 ||
+	    !previous[index].compare_exchange_strong(last, done, std::memory_order_relaxed)) {
+		return;
+	}
+#ifdef _WIN32
+	const auto tid = ::GetCurrentThreadId();
+#else
+	const auto tid = Common::Thread::GetThreadIdUnique();
+#endif
+	const auto ms = [](int64_t duration) { return static_cast<double>(duration) / 1'000'000.0; };
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-readback-slow] path={} tid={} needed={} recorded={} submitted={} bytes={} "
+	    "gpu_ms={:.3f} priority_ms={:.3f} invalidate_ms={:.3f} backing_ms={:.3f} start={} end={}\n",
+	    names[index], tid, needed, recorded, submitted, bytes, ms(gpu - start), ms(priority - gpu),
+	    ms(invalidate - priority), ms(done - invalidate), start, done));
+}
+
 bool ReadbackStudyOn() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_READBACK_STATS");
@@ -1185,13 +1222,19 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		written_begin = std::min(written_begin, buffer_address + copy.srcOffset);
 		written_end   = std::max(written_end, buffer_address + copy.srcOffset + copy.size);
 	}
-	auto publish = [total_size, buffer_address, copies = std::move(copies),
+	auto publish = [total_size, buffer_address, tick = m_scheduler.CurrentTick(), copies = std::move(copies),
 	                download = std::move(download)] {
+		const auto start = StartReadbackTrace();
 		download.buffer->Invalidate(download.offset, total_size);
+		const auto invalidated = start != 0 ? SteadyNs() : 0;
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(
 			    buffer_address + copy.srcOffset,
 			    download.mapped + (copy.dstOffset - download.offset), copy.size);
+		}
+		if (start != 0) {
+			NoteSlowReadback(ReadbackTracePath::Publish, tick, tick, 0, total_size,
+			                 {start, start, start, invalidated, SteadyNs()});
 		}
 	};
 	if constexpr (async) {
@@ -1823,9 +1866,17 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			}
 		});
 	} else {
+		const auto trace = StartReadbackTrace();
+		const auto submitted = trace != 0 ? m_scheduler.SubmittedTick() : 0;
 		m_scheduler.GetMasterSemaphore().Wait(tick);
+		const auto gpu_ready = trace != 0 ? SteadyNs() : 0;
 		m_scheduler.WaitPriorityOperations(tick);
 		note_split(split.other_wait_ns, wait_start, phases[1]);
+		if (trace != 0) {
+			const auto ready = SteadyNs();
+			NoteSlowReadback(ReadbackTracePath::Timeline, tick, tick, submitted, read_size,
+			                 {trace, gpu_ready, ready, ready, ready});
+		}
 		release([this, vaddr, size, pages_begin, pages_end, tick, is_write] {
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write);
 		});
@@ -2143,12 +2194,17 @@ void BufferCache::WaitReadbackQueueCopies(vk::Buffer buffer) {
 
 void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	auto& queue = read.slot->queue;
+	const auto trace = StartReadbackTrace();
+	const auto submitted = trace != 0 ? m_scheduler.SubmittedTick() : 0;
 	if (m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, UINT64_MAX) !=
 	    vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue wait failed\n");
 	}
+	const auto gpu_ready = trace != 0 ? SteadyNs() : 0;
 	m_scheduler.WaitPriorityOperations(read.needed);
+	const auto priority_ready = trace != 0 ? SteadyNs() : 0;
 	queue.staging->Invalidate(0, read.total_size);
+	const auto invalidated = trace != 0 ? SteadyNs() : 0;
 	const auto* mapped = queue.staging->Mapped().data();
 	for (const auto& copy: read.copies) {
 		Libs::LibKernel::Memory::WriteBacking(read.buffer_address + copy.srcOffset,
@@ -2163,6 +2219,10 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	read.slot->busy.store(false, std::memory_order_release);
 	read.published->store(true, std::memory_order_release);
 	read.published->notify_all();
+	if (trace != 0) {
+		NoteSlowReadback(ReadbackTracePath::Queue, read.needed, read.recorded, submitted, read.total_size,
+		                 {trace, gpu_ready, priority_ready, invalidated, SteadyNs()});
+	}
 }
 
 uint64_t BufferCache::InFlightReadbackTick(uint64_t begin, uint64_t end) const {

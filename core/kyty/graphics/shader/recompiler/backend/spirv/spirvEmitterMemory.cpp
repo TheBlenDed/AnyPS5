@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <tuple>
 #include <utility>
 
@@ -437,6 +438,55 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits);
 
+const EmitterState::IndirectBufferReadGroups* GroupIndirectBufferReads(EmitterState& state, uint32_t resource) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GROUP_INDIRECT_BUFFER_LOADS");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	if (!enabled || state.program.table_mode || state.program.stage != ShaderType::Compute) return nullptr;
+	auto [it, fresh] = state.indirect_buffer_read_groups.try_emplace(resource);
+	auto& groups = it->second;
+	if (!fresh) return groups.lookup != 0u ? &groups : nullptr;
+	const auto& buffers = state.program.info.buffers;
+	const auto& root = buffers[resource];
+	if (!root.read || root.written || root.atomic || !root.formatted || root.packed_stride != 0u ||
+	    root.indirect_resources.size() < 3u || root.indirect_resources.front() != resource) {
+		return nullptr;
+	}
+	const auto& sources = state.program.descriptor_sources;
+	if (root.source >= sources.size() || !sources[root.source].indirect_descriptor) return nullptr;
+	groups.first_slot = buffers[root.indirect_resources[1]].descriptor_index;
+	if (groups.first_slot == UINT32_MAX) return nullptr;
+	std::vector<uint32_t> ordinals(root.indirect_resources.size());
+	for (uint32_t ordinal = 1; ordinal < root.indirect_resources.size(); ++ordinal) {
+		const auto index = root.indirect_resources[ordinal];
+		const auto& candidate = buffers[index];
+		if (candidate.source != root.source || candidate.written || candidate.atomic ||
+		    candidate.packed_stride == 0u || IR::HasRuntimeStride(candidate.packed_stride) ||
+		    candidate.descriptor_index != groups.first_slot + ordinal - 1u) {
+			return nullptr;
+		}
+		const auto same_shape = [&](uint32_t representative) {
+			const auto& other = buffers[representative];
+			return candidate.packed_stride == other.packed_stride &&
+			       candidate.descriptor_format == other.descriptor_format &&
+			       candidate.descriptor_swizzle == other.descriptor_swizzle;
+		};
+		const auto match = std::ranges::find_if(groups.representatives, same_shape);
+		ordinals[ordinal] = static_cast<uint32_t>(match - groups.representatives.begin());
+		if (match == groups.representatives.end()) groups.representatives.push_back(index);
+	}
+	if (groups.representatives.size() >= ordinals.size() - 1u) return nullptr;
+	const auto type = TypeU32(state);
+	const auto array_type = state.builder.Type(
+	    spv::OpTypeArray, type, ConstantU32(state, static_cast<uint32_t>(ordinals.size())));
+	for (auto& ordinal: ordinals) ordinal = ConstantU32(state, ordinal);
+	groups.lookup = state.builder.DefineGlobalVariable(
+	    TypePointer(state, spv::StorageClassPrivate, array_type), spv::StorageClassPrivate,
+	    state.builder.Constant(spv::OpConstantComposite, array_type, ordinals));
+	return &groups;
+}
+
 template <typename Fn>
 auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
                       uint32_t components, Fn&& emit) {
@@ -465,8 +515,29 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	const auto selected = ctx.Arg(handle, 0);
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
-	const auto empty_root = shared && buffer.packed_stride == 0u;
+	const EmitterState::IndirectBufferReadGroups* groups = nullptr;
+	if constexpr (has_result) {
+		if (!shared && mem.formatted && !mem.typed) groups = GroupIndirectBufferReads(state, root_resource);
+	}
+	const auto empty_root = (shared || groups != nullptr) && buffer.packed_stride == 0u;
 	const auto selected_access = [&]() {
+		if constexpr (has_result) {
+			if (groups != nullptr) {
+				const auto type = TypeU32(state);
+				const auto ptr = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, type),
+				                          ptr, groups->lookup, selected);
+				const auto group = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, type, group, ptr);
+				const auto ordinal = Binary(state, spv::OpISub, type, selected, ConstantU32(state, 1u));
+				const auto slot = EmitAddU32(state, ordinal, ConstantU32(state, groups->first_slot));
+				return EmitIndexSwitch(state, group, static_cast<uint32_t>(groups->representatives.size()),
+				                       TypeU32Composite(state, components), [&](uint32_t index) {
+					                       mem.resource = groups->representatives[index];
+					                       return emit(mem, PrepareMemoryResourceAccess(state, mem, slot));
+				                       });
+			}
+		}
 		if (shared) {
 			const auto root_slot = buffer.descriptor_index;
 			const auto child_slot = state.program.info.buffers[buffer.indirect_resources[1]].descriptor_index;
@@ -1380,22 +1451,70 @@ uint32_t IndirectFormatGeometry(EmitterState& state, const IndirectBufferAccess&
 	return geometry;
 }
 
+uint32_t PackIndirectFormattedD16(EmitterState& state, uint32_t format,
+                                  std::span<const uint32_t> values, uint32_t words) {
+	const auto type = TypeU32(state);
+	constexpr auto format_count =
+	    static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+	const auto kind = EmitIndexSwitch(state, format, format_count, type, [&](uint32_t entry) {
+		const auto info = Format::GetFormatInfo(static_cast<Prospero::BufferFormat>(entry));
+		return ConstantU32(state, static_cast<uint32_t>(info.type));
+	});
+	const auto is_type = [&](Format::ComponentType value) {
+		return Binary(state, spv::OpIEqual, TypeBool(state), kind,
+		              ConstantU32(state, static_cast<uint32_t>(value)));
+	};
+	const auto is_uint = is_type(Format::ComponentType::Uint);
+	const auto is_sint = is_type(Format::ComponentType::Sint);
+	const auto is_int = Binary(state, spv::OpLogicalOr, TypeBool(state), is_uint, is_sint);
+	const auto clamp = [&](uint32_t value) {
+		const auto u = EmitUMin32(state, value, ConstantU32(state, 0xffffu));
+		const auto s = EmitSMin32(state, EmitSMax32(state, value, ConstantU32(state, 0xffff8000u)),
+		                         ConstantU32(state, 0x7fffu));
+		return Select(state, type, is_uint, u, s);
+	};
+	std::array<uint32_t, 4> packed {};
+	for (uint32_t word = 0; word < words; word++) {
+		const auto low = values[word * 2u];
+		const auto high = word * 2u + 1u < values.size() ? values[word * 2u + 1u] : ConstantU32(state, 0u);
+		const auto integer = Binary(
+		    state, spv::OpBitwiseOr, type,
+		    Binary(state, spv::OpBitwiseAnd, type, clamp(low), ConstantU32(state, 0xffffu)),
+		    Binary(state, spv::OpShiftLeftLogical, type, clamp(high), ConstantU32(state, 16u)));
+		const auto pair = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair,
+		                          EmitBitCastF32U32(state, low), EmitBitCastF32U32(state, high));
+		packed[word] = Select(state, type, is_int, integer, EmitPackHalf2x16(state, pair));
+	}
+	return ConstructU32Composite(state, words, packed);
+}
+
 uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
-                               const std::array<uint32_t, 8>& args, uint32_t components) {
+                               const std::array<uint32_t, 8>& args, uint32_t components,
+                               uint32_t d16_components = 0) {
 	auto& state = ctx.state;
 	const auto geometry = IndirectFormatGeometry(state, buffer);
-	if (components == 1u) {
+	if (components == 1u && d16_components == 0u) {
 		return LoadIndirectFormattedComponent(ctx, buffer, geometry, buffer.selector);
 	}
+	const auto count = d16_components == 0u ? components : d16_components;
 	std::array<uint32_t, 4> values {};
-	for (uint32_t component = 0; component < components; component++) {
+	for (uint32_t component = 0; component < count; component++) {
 		const auto selector =
 		    component == 0u ? buffer.selector
 		                    : EmitBitFieldUExtract(state, args[3], ConstantU32(state, component * 3u),
 		                                           ConstantU32(state, 3));
 		values[component] = LoadIndirectFormattedComponent(ctx, buffer, geometry, selector);
 	}
+	if (d16_components != 0u) {
+		return PackIndirectFormattedD16(state, buffer.format, std::span(values).first(count), components);
+	}
 	return ConstructU32Composite(state, components, values);
+}
+
+std::array<uint32_t, 5> IndirectBufferLoadKey(const IR::MemoryInfo& mem, uint32_t components) {
+	return {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted),
+	        mem.formatted && mem.data_bits == 16u ? mem.component_count : 0u};
 }
 
 uint32_t LoadRawBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -1516,8 +1635,7 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	auto& state = ctx.state;
 	const auto mem = ctx.Memory(inst);
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
-		const auto function = state.indirect_buffer_load_functions.at(
-		    {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted)});
+		const auto function = state.indirect_buffer_load_functions.at(IndirectBufferLoadKey(mem, components));
 		const auto args   = IndirectBufferArgs(ctx, inst);
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpFunctionCall, TypeU32Composite(state, components), result,
@@ -1859,9 +1977,8 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			const auto& memory = ctx.Memory(inst);
 			if (memory.kind != IR::ResourceKind::IndirectBuffer ||
 			    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) continue;
-			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(
-			    std::array {memory.data_bits, components, uint32_t(memory.coherent),
-			                uint32_t(memory.formatted)}, 0u);
+			const auto key = IndirectBufferLoadKey(memory, components);
+			auto [entry, inserted] = state.indirect_buffer_load_functions.try_emplace(key, 0u);
 			if (!inserted) continue;
 			if (memory.formatted && state.indirect_format_function == 0u) {
 				DefineIndirectBufferFormats(ctx);
@@ -1874,7 +1991,8 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			    TypeBool(state));
 			const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
 			                  std::to_string(components) + (memory.coherent ? "_coherent" : "") +
-			                  (memory.formatted ? "_formatted" : "");
+			                  (memory.formatted ? "_formatted" : "") +
+			                  (key.back() != 0u ? ("_" + std::to_string(key.back())) : "");
 			state.builder.AddName(function, name.c_str());
 			state.builder.AddFunction(spv::OpFunction, result_type, function,
 			                          SharedHelperControl(state), signature);
@@ -1889,7 +2007,7 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 			args[3] = Select(state, type, active, args[3],
 			                 Binary(state, spv::OpBitwiseAnd, type, args[3], ConstantU32(state, ~(0x7fu << 12))));
 			const auto buffer = PrepareIndirectBuffer(state, args, memory.formatted);
-			const auto result = memory.formatted ? LoadIndirectFormatted(ctx, buffer, args, components)
+			const auto result = memory.formatted ? LoadIndirectFormatted(ctx, buffer, args, components, key.back())
 			    : LoadIndirectBuffer(ctx, buffer, memory.data_bits, components, memory.coherent);
 			std::array<uint32_t, 4> values {};
 			for (uint32_t component = 0; component < components; component++) {

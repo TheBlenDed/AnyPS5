@@ -14,9 +14,12 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string_view>
+#include <thread>
 #include <utility>
 
 namespace Libs::Graphics {
@@ -38,6 +41,16 @@ constexpr auto     StallShown  = std::chrono::seconds(3);
 constexpr auto     StallGap    = std::chrono::seconds(1);
 constexpr auto     ManifestBarDelay  = std::chrono::seconds(1);
 constexpr auto     ManifestBarLinger = std::chrono::seconds(2);
+
+#if defined(ANYPS5_KYTY)
+bool PipelineWaitTraceEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PIPELINE_WAIT_TRACE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+#endif
 
 template <typename... Args>
 void PrecompileLog(fmt::format_string<Args...> format, Args&&... args) {
@@ -77,6 +90,11 @@ PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, ui
 	m_what    = what;
 	m_hash    = hash;
 	m_why     = why;
+	if (PipelineWaitTraceEnabled()) {
+		PrecompileLog("[kyty-wait] begin tid={} kind={} shader={:016x} @{}",
+		              std::hash<std::thread::id>{}(std::this_thread::get_id()), m_what, m_hash,
+		              m_started.time_since_epoch().count());
+	}
 }
 
 static const char* ComputeWrites(const ShaderModule& module) {
@@ -114,6 +132,11 @@ PipelineCache::StallScope::~StallScope() {
 			stats.over_100ms += ns >= 100'000'000u ? 1u : 0u;
 			stats.over_500ms += ns >= 500'000'000u ? 1u : 0u;
 		}
+	}
+	if (m_what != nullptr && PipelineWaitTraceEnabled()) {
+		PrecompileLog("[kyty-wait] end tid={} kind={} shader={:016x} begin={} @{}",
+		              std::hash<std::thread::id>{}(std::this_thread::get_id()), m_what, m_hash,
+		              m_started.time_since_epoch().count(), now.time_since_epoch().count());
 	}
 	static const uint64_t log_ns = [] {
 		const char* value = std::getenv("KYTY_PIPELINE_STALL_LOG_MS");

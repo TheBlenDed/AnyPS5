@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -22,6 +23,28 @@ class CommandBuffer;
 class RenderContext;
 struct PreparedBindings;
 struct ShaderModule;
+struct DrawRenderState;
+struct DrawTargets;
+struct DynamicState;
+class Image;
+
+#if defined(ANYPS5_KYTY)
+bool IsProbeColorWitnessFrame(const RenderContext& context);
+bool ApplyProbeColorWitness(RenderContext& context, vk::ClearColorValue& value);
+void SaveProbeColorWitness(RenderContext& context, Image& image);
+bool ProbeShaderResources(RenderContext& context, std::span<PreparedBindings* const> stages, bool after,
+                          uint32_t draw_indices = 0);
+void RetainProbeShader(const ShaderModule& module, std::span<const uint32_t> spirv);
+void ProbeDrawShaders(RenderContext& context, const DrawRenderState& draw, const DynamicState& state,
+                      uint32_t indices);
+void ProbeDrawAttachments(RenderContext& context, const DrawTargets& targets, uint32_t indices, bool after);
+uint32_t BeginPixelHistory(RenderContext& context, const DrawTargets& targets, const DrawRenderState& draw,
+                           uint32_t indices, bool depth_clear);
+void EndPixelHistory(RenderContext& context, const DrawTargets& targets, uint32_t capture);
+void ProbeDrawBuffer(RenderContext& context, const char* kind, uint32_t slot, vk::Buffer buffer,
+                     uint64_t offset, uint64_t size, uint32_t stride, int32_t vertex_offset,
+                     uint32_t first_instance, uint32_t indices);
+#endif
 
 class RayTracingCheck: public std::enable_shared_from_this<RayTracingCheck> {
 public:

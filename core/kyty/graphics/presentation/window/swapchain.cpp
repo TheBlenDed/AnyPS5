@@ -34,7 +34,143 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+#include <mutex>
+#include <thread>
+#include <windows.h>
+#endif
+
 namespace Libs::Graphics {
+
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+class RenderDocCapture final {
+public:
+	using Entry = void (*)();
+
+	static std::unique_ptr<RenderDocCapture> Create() {
+		const auto* enabled = std::getenv("ANYPS5_RENDERDOC_F3");
+		if (enabled == nullptr || enabled[0] != '1' || enabled[1] != '\0') return nullptr;
+		using GetApi = int (*)(int, void**);
+		auto library = GetModuleHandleW(L"renderdoc.dll");
+		const auto get_api = library == nullptr ? nullptr :
+		    reinterpret_cast<GetApi>(GetProcAddress(library, "RENDERDOC_GetAPI"));
+		void* api = nullptr;
+		constexpr int Version160 = 10600;
+		if (get_api == nullptr || get_api(Version160, &api) != 1 || api == nullptr) {
+			Log::WriteToConsoleAndLog("[renderdoc] capture API unavailable\n");
+			return nullptr;
+		}
+		constexpr size_t SetCaptureKeys = 6;
+		constexpr size_t MaskOverlayBits = 8;
+		const auto* entries = static_cast<const Entry*>(api);
+		reinterpret_cast<void (*)(int*, int)>(entries[SetCaptureKeys])(nullptr, 0);
+		if (std::getenv("ANYPS5_EXTERNAL_MONITOR") != nullptr) {
+			reinterpret_cast<void (*)(uint32_t, uint32_t)>(entries[MaskOverlayBits])(0, 0);
+		}
+		Log::WriteToConsoleAndLog("[renderdoc] F3 capture API ready\n");
+		return std::make_unique<RenderDocCapture>(entries);
+	}
+
+	explicit RenderDocCapture(const Entry* entries)
+	    : m_get_count(reinterpret_cast<uint32_t (*)()>(entries[GetNumCaptures])),
+	      m_trigger(entries[TriggerCapture]),
+	      m_is_capturing(reinterpret_cast<uint32_t (*)()>(entries[IsFrameCapturing])),
+	      m_discard(reinterpret_cast<uint32_t (*)(void*, void*)>(entries[DiscardFrameCapture])),
+	      m_input([this](std::stop_token stop) { PollKey(stop); }) {}
+
+	void BeforePresent(VkInstance instance) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_state == State::Requested) {
+				m_state = State::Active;
+				m_trigger();
+				return;
+			}
+		}
+		TryDiscard(instance);
+	}
+
+	void AfterPresent(VkInstance instance) {
+		TryDiscard(instance);
+		std::lock_guard lock(m_mutex);
+		if ((m_state != State::Active && m_state != State::CancelRequested) || m_is_capturing()) return;
+		const auto count = m_get_count();
+		if (count > m_saved) {
+			Log::WriteToConsoleAndLog(fmt::format("[renderdoc] saved captures: {}\n", count));
+		} else {
+			Log::WriteToConsoleAndLog("[renderdoc] capture ended without a file\n");
+		}
+		m_saved = count;
+		m_state = State::Idle;
+	}
+
+private:
+	enum class State { Idle, Requested, Active, CancelRequested, Discarding };
+	static constexpr size_t GetNumCaptures = 13;
+	static constexpr size_t TriggerCapture = 15;
+	static constexpr size_t IsFrameCapturing = 20;
+	static constexpr size_t DiscardFrameCapture = 24;
+
+	void TryDiscard(VkInstance instance) {
+		HWND window;
+		{
+			std::lock_guard lock(m_mutex);
+			if (m_state != State::CancelRequested || !m_is_capturing()) return;
+			m_state = State::Discarding;
+			window = m_window;
+		}
+		const bool discarded = m_discard(*reinterpret_cast<void**>(instance), window) != 0;
+		std::lock_guard lock(m_mutex);
+		Log::WriteToConsoleAndLog(discarded ? "[renderdoc] capture cancelled\n" :
+		                                     "[renderdoc] capture cancel failed\n");
+		m_state = discarded ? State::Idle : State::Active;
+	}
+
+	void PollKey(std::stop_token stop) {
+		bool was_down = false;
+		while (!stop.stop_requested()) {
+			const bool down = (GetAsyncKeyState(VK_F3) & 0x8000) != 0;
+			if (down && !was_down) {
+				const HWND window = GetForegroundWindow();
+				DWORD pid = 0;
+				GetWindowThreadProcessId(window, &pid);
+				if (pid == GetCurrentProcessId()) {
+					std::lock_guard lock(m_mutex);
+					switch (m_state) {
+						case State::Idle:
+							m_window = window;
+							m_state = State::Requested;
+							Log::WriteToConsoleAndLog("[renderdoc] capture requested\n");
+							break;
+						case State::Requested:
+							m_state = State::Idle;
+							Log::WriteToConsoleAndLog("[renderdoc] capture cancelled\n");
+							break;
+						case State::Active:
+							m_state = State::CancelRequested;
+							Log::WriteToConsoleAndLog("[renderdoc] capture cancel requested\n");
+							break;
+						case State::CancelRequested:
+						case State::Discarding: break;
+					}
+				}
+			}
+			was_down = down;
+			std::this_thread::sleep_for(std::chrono::milliseconds(15));
+		}
+	}
+
+	uint32_t (*m_get_count)();
+	Entry m_trigger;
+	uint32_t (*m_is_capturing)();
+	uint32_t (*m_discard)(void*, void*);
+	std::mutex m_mutex;
+	State m_state = State::Idle;
+	HWND m_window = nullptr;
+	uint32_t m_saved = 0;
+	std::jthread m_input;
+};
+#endif
 
 struct Presenter::Frame {
 	VulkanImage   image;
@@ -1520,6 +1656,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 }
 
 Swapchain::Status Swapchain::Present() {
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+	static const auto capture = RenderDocCapture::Create();
+#endif
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
 	present.sType              = vk::StructureType::ePresentInfoKHR;
@@ -1532,7 +1671,13 @@ Swapchain::Status Swapchain::Present() {
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+		if (capture) capture->BeforePresent(m_window.graphic_ctx.instance);
+#endif
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+		if (capture) capture->AfterPresent(m_window.graphic_ctx.instance);
+#endif
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;

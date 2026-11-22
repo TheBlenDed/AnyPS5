@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
+#include "graphics/host_gpu/renderer/rayTracingCheck.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineChainThreads.h"
 #if defined(ANYPS5_KYTY)
@@ -43,6 +44,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -50,6 +52,7 @@
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -474,6 +477,56 @@ void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 	}
 	file.Write(words.data(), words.size_bytes());
 }
+
+#if defined(ANYPS5_KYTY)
+void CaptureComputeModule(const ShaderModule& module, const std::vector<uint32_t>& spirv) {
+	static const auto minimum = [] {
+		const auto* value = std::getenv("KYTY_CAPTURE_COMPUTE_MIN_WORDS");
+		char* end = nullptr;
+		const auto words = value != nullptr ? std::strtoul(value, &end, 10) : 0ul;
+		return end != nullptr && *end == '\0' && words <= UINT32_MAX ? words : 0ul;
+	}();
+	static const auto modules = [] {
+		std::vector<uint64_t> ids;
+		const auto* value = std::getenv("KYTY_CAPTURE_COMPUTE_MODULES");
+		if (value == nullptr) return ids;
+		for (const auto field: std::string_view(value) | std::views::split(',')) {
+			if (field.empty()) continue;
+			const auto* first = &*field.begin();
+			const auto* last = first + std::ranges::distance(field);
+			uint64_t id = 0;
+			const auto parsed = std::from_chars(first, last, id, 16);
+			if (parsed.ec == std::errc {} && parsed.ptr == last) ids.push_back(id);
+		}
+		return ids;
+	}();
+	static const auto* directory = std::getenv("APS5_VIDEOOUT_TELEMETRY_DIR");
+	const bool selected = std::ranges::find(modules, module.id) != modules.end() ||
+	                      (minimum != 0 && spirv.size() >= minimum);
+	if (!selected || spirv.empty() || spirv.size() > (16u << 20u) ||
+	    directory == nullptr || *directory == '\0') {
+		return;
+	}
+	static std::mutex mutex;
+	static uint32_t captures = 0;
+	std::lock_guard lock(mutex);
+	if (captures >= 8u) return;
+	const auto name = fmt::format("compute-{:016x}-{:016x}.kyty", module.info.shader_hash, module.id);
+	const auto path = std::filesystem::path(directory) / name;
+	std::error_code error;
+	if (std::filesystem::exists(path, error) || error) return;
+	const auto bytes = EncodeComputeModule(module, spirv);
+	std::ofstream stream(path, std::ios::binary);
+	stream.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+	stream.close();
+	if (!stream) {
+		std::filesystem::remove(path, error);
+		return;
+	}
+	++captures;
+	Log::WriteToConsoleAndLog(fmt::format("[kyty-gpl] captured {} words={}\n", name, spirv.size()));
+}
+#endif
 
 void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
                          const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
@@ -1709,6 +1762,11 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	}
 #if defined(ANYPS5_KYTY)
 	LogShaderVariantBuild(stage, key.hash, key.user_data_count, key.static_state, push_data_cursor, module);
+	if (key.stage == ShaderType::Compute) {
+		CaptureComputeModule(module, result.spirv);
+	} else {
+		RetainProbeShader(module, result.spirv);
+	}
 #endif
 	spirv       = std::move(result.spirv);
 	plain_spirv = std::move(result.spirv_plain);
@@ -1730,6 +1788,9 @@ std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&       mo
 	plain->vertex_formats  = module.vertex_formats;
 	plain->rect_parameters = module.rect_parameters;
 	plain->spirv_words     = static_cast<uint32_t>(spirv.size());
+#if defined(ANYPS5_KYTY)
+	RetainProbeShader(*plain, spirv);
+#endif
 	return plain;
 }
 

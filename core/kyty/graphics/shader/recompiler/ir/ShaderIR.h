@@ -91,18 +91,23 @@ struct MemoryInfo {
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) return false;
-		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
-		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
+		if (formatted) {
+			if (data_bits == 16u) {
+				return ((component_count == 1u || component_count == 2u) &&
+				        opcode == ValueOpcode::LoadBufferU32) ||
+				       ((component_count == 3u || component_count == 4u) &&
+				        opcode == ValueOpcode::LoadBufferU32x2);
+			}
+			return data_bits == 32u &&
+			       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+			        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
+		}
+		if (data_bits == 8u) return opcode == ValueOpcode::LoadBufferU8;
+		if (data_bits == 16u) return opcode == ValueOpcode::LoadBufferU16;
 		return data_bits == 32u &&
-		       (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4
-		                  : opcode == ValueOpcode::ReadConstBuffer ||
-		                        opcode == ValueOpcode::LoadBufferU32 ||
-		                        opcode == ValueOpcode::LoadBufferU32x2 ||
-		                        opcode == ValueOpcode::LoadBufferU32x3 ||
-		                        opcode == ValueOpcode::LoadBufferU32x4);
+		       (opcode == ValueOpcode::ReadConstBuffer || opcode == ValueOpcode::LoadBufferU32 ||
+		        opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
+		        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
 		return !formatted && !typed && data_bits == 32u &&

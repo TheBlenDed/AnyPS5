@@ -32,6 +32,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "loader/systemContent.h"
+#include "graphics/host_gpu/renderer/rayTracingCheck.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -1123,9 +1124,35 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			continue;
 		}
 #endif
-		const auto& view   = target.desc.view_info;
-		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
-		                                            : vk::ImageLayout::eColorAttachmentOptimal;
+		const auto& view = target.desc.view_info;
+		auto layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
+		                                     : vk::ImageLayout::eColorAttachmentOptimal;
+		if (image.binding.is_bound && !image.binding.shader_write &&
+		    m_context.GetGraphics().attachment_feedback_loop_enabled) {
+			const auto overlaps = [&](const TextureBinding& binding) {
+				if (binding.image_id != target.image_id ||
+				    binding.desc.type != TextureCache::BindingType::Texture) return false;
+				const auto& sampled = binding.desc.view_info;
+				return ImageRangeOverlaps(view.base_level, view.level_count, sampled.base_level, sampled.level_count) &&
+				       ImageRangeOverlaps(view.base_layer, view.layer_count, sampled.base_layer, sampled.layer_count);
+			};
+			const auto sampled = [&](const PreparedBindings* stage) {
+				if (std::ranges::any_of(stage->images, overlaps)) return true;
+				if (stage->tables_reused) {
+					const auto& table = *static_cast<const TableBindingState*>(stage->table_state);
+					return std::ranges::any_of(stage->table_visits, [&](uint32_t index) {
+						return overlaps(table.elements[index].resolution->texture);
+					});
+				}
+				return std::ranges::any_of(stage->table_images, [&](const TextureBinding* binding) {
+					return overlaps(*binding);
+				});
+			};
+			if (std::ranges::any_of(stages, sampled)) {
+				layout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+				feedback_aspects |= vk::ImageAspectFlagBits::eColor;
+			}
+		}
 		image.binding.attachment_layout = layout;
 		image.binding.attachment_access =
 		    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
@@ -2406,6 +2433,36 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
+#if defined(ANYPS5_KYTY)
+	const bool probe_draw = ProbeShaderResources(m_context, stages, false, draw.index_count) && !mesh_active &&
+	                        draw.indexed && emit.indirect.address == 0;
+	static const bool probe_depth_always = [] {
+		const auto* value = std::getenv("KYTY_RESOURCE_PROBE_DRAW_DEPTH_ALWAYS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	const bool force_probe_depth = probe_draw && probe_depth_always && dynamic_state.depth_test_enabled;
+	const auto original_depth_compare = dynamic_state.depth_compare_op;
+	if (force_probe_depth) {
+		dynamic_state.SetDepthCompareOp(vk::CompareOp::eAlways);
+		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+		dynamic_state.MoveGeneration();
+	}
+	if (probe_draw) {
+		ProbeDrawShaders(m_context, state, dynamic_state, draw.index_count);
+		const uint32_t index_stride = index_binding.type == vk::IndexType::eUint16 ? 2 : 4;
+		ProbeDrawBuffer(m_context, "index", 0, index_binding.buffer, index_binding.offset,
+		                uint64_t {draw.index_count} * index_stride, index_stride, emit.vertex_offset,
+		                emit.first_instance, draw.index_count);
+		for (uint32_t slot = 0; slot < vertex_bindings.count; ++slot) {
+			ProbeDrawBuffer(m_context, "vertex", slot, vertex_bindings.buffers[slot], vertex_bindings.offsets[slot],
+			                vertex_bindings.sizes[slot], state.vertex_info[0].buffers[slot].stride, emit.vertex_offset,
+			                emit.first_instance, draw.index_count);
+		}
+		ProbeDrawAttachments(m_context, *m_draw_targets, draw.index_count, false);
+	}
+	const auto pixel_history = BeginPixelHistory(m_context, *m_draw_targets, state, draw.index_count,
+	                                             rendering.depth_stencil_attachment.depth_clear);
+#endif
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (mesh_task) {
@@ -2448,6 +2505,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		m_shader_write_queue    = m_guest_queue;
 		m_shader_write_deferred = true;
 	}
+#if defined(ANYPS5_KYTY)
+	if (force_probe_depth) {
+		dynamic_state.SetDepthCompareOp(original_depth_compare);
+		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+		dynamic_state.MoveGeneration();
+	}
+	if (probe_draw) {
+		ProbeDrawAttachments(m_context, *m_draw_targets, draw.index_count, true);
+	}
+	EndPixelHistory(m_context, *m_draw_targets, pixel_history);
+#endif
 	if (query_bias) {
 		dynamic_state.SetDepthBiasEnabled(false);
 	}

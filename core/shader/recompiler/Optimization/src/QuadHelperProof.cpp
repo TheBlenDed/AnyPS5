@@ -128,8 +128,10 @@ bool WaveMaskBranch(BranchCondition condition) {
 
 class Prover {
 public:
-    Prover(const IrProgram& program, const IrValue& wqm, std::span<IrValue* const> reads, const IrValue& predicate)
-        : program(program), wqm(wqm), reads(reads.begin(), reads.end()), predicate(predicate) {}
+    Prover(const IrProgram& program, const IrValue& wqm, std::span<IrValue* const> reads, const IrValue& predicate, std::span<const QuadHelperGuard> guards)
+        : program(program), wqm(wqm), reads(reads.begin(), reads.end()), predicate(predicate) {
+        for (const auto& guard : guards) guardedEffects.emplace(guard.instruction, guard.operand);
+    }
 
     std::string Run() {
         try {
@@ -795,9 +797,23 @@ private:
             for (const int world : {Console, Lowered}) assign(state, inst, world, state.helper[world] ? boolean(world == Console) : compute(state, inst, operands(state, inst, world)));
             return true;
         }
-        const auto console = operands(state, inst, Console);
+        auto console = operands(state, inst, Console);
         const auto lowered = operands(state, inst, Lowered);
         if (IrOpcodeHasSideEffects(opcode) || CrossLane(program, *inst)) {
+            if (const auto guard = guardedEffects.find(inst); guard != guardedEffects.end()) {
+                const auto index = guard->second;
+                const auto original = known(state, console.at(index));
+                const auto replacement = known(state, lowered.at(index));
+                if (original == false && replacement == false) return true;
+                if (console != lowered && (!original || !replacement)) {
+                    std::vector<std::pair<int, std::vector<bool>>> splits;
+                    if (!original) splits.push_back({console[index], {true, false}});
+                    if (!replacement && (original || console[index] != lowered[index])) splits.push_back({lowered[index], {true, false}});
+                    fork(state, splits);
+                    return false;
+                }
+                if (original == true && replacement == true) console[index] = lowered[index];
+            }
             if (console != lowered) {
                 const bool effect = IrOpcodeHasSideEffects(opcode);
                 std::size_t operand = 0;
@@ -837,6 +853,8 @@ private:
             return;
         }
         if (IrOpcodeHasSideEffects(opcode) || CrossLane(program, *inst)) {
+            if (const auto guard = guardedEffects.find(inst); guard != guardedEffects.end() &&
+                known(state, token(state, inst->Argument(guard->second), world)) == false) return;
             throw Refusal{Describe(inst) + " runs on a quad-helper lane in only one of the two programs"};
         }
         assign(state, inst, world, compute(state, inst, operands(state, inst, world)));
@@ -1009,6 +1027,7 @@ private:
     const IrValue& wqm;
     std::unordered_set<const IrValue*> reads;
     const IrValue& predicate;
+    std::unordered_map<const IrValue*, std::size_t> guardedEffects;
 
     std::unordered_map<const IrBlock*, std::vector<IrValue*>> body;
     std::unordered_map<const IrBlock*, std::size_t> phiCount;
@@ -1033,8 +1052,8 @@ private:
 
 }
 
-std::string ProveQuadHelpersUnobserved(const IrProgram& program, const IrValue& wqm, std::span<IrValue* const> reads, const IrValue& predicate) {
-    return Prover(program, wqm, reads, predicate).Run();
+std::string ProveQuadHelpersUnobserved(const IrProgram& program, const IrValue& wqm, std::span<IrValue* const> reads, const IrValue& predicate, std::span<const QuadHelperGuard> guards) {
+    return Prover(program, wqm, reads, predicate, guards).Run();
 }
 
 }

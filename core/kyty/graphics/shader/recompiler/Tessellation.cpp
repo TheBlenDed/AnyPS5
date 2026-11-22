@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/QuadHelperProof.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -607,6 +608,28 @@ const IR::Inst* QuadMaskOwnBit(const IR::Inst& read, uint32_t wave_size,
 	return wqm;
 }
 
+bool QuadMaskAndMatches(IR::Value predicate, IR::Value low, IR::Value high, uint32_t wave_size,
+                        unsigned depth = 0) {
+	using namespace IR;
+	if (depth >= 8u) return false;
+	const auto* ballot = HullMaskProducer(low, ValueOpcode::CompositeExtractU32x4, 0u);
+	if (ballot != nullptr && ballot->GetOpcode() == ValueOpcode::Ballot) {
+		return ballot->Arg(0).Resolve() == predicate.Resolve() &&
+		       (wave_size == 64u ? HullMaskProducer(high, ValueOpcode::CompositeExtractU32x4, 1u) == ballot
+		                         : IsHullImmediate(high, 0u));
+	}
+	const auto* logical = HullInstruction(predicate, ValueOpcode::LogicalAnd);
+	const auto* low_and = HullInstruction(low, ValueOpcode::BitwiseAnd32);
+	const auto* high_and = HullInstruction(high, ValueOpcode::BitwiseAnd32);
+	if (logical == nullptr || low_and == nullptr ||
+	    (wave_size == 64u ? high_and == nullptr : !IsHullImmediate(high, 0u))) return false;
+	for (size_t index = 0; index < 2; ++index) {
+		if (!QuadMaskAndMatches(logical->Arg(index), low_and->Arg(index),
+		                        high_and ? high_and->Arg(index) : high, wave_size, depth + 1u)) return false;
+	}
+	return true;
+}
+
 IR::Value QuadMaskPredicate(const IR::Inst& wqm, uint32_t wave_size,
                             const std::unordered_set<const IR::Inst*>& branch_inputs) {
 	using namespace IR;
@@ -620,7 +643,16 @@ IR::Value QuadMaskPredicate(const IR::Inst& wqm, uint32_t wave_size,
 	const auto low = words->Arg(0).Resolve();
 	const auto high = words->Arg(1).Resolve();
 	const auto* ballot = HullMaskProducer(low, ValueOpcode::CompositeExtractU32x4, 0u);
-	if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot ||
+	if (ballot == nullptr) {
+		for (const auto& inst: *wqm.Parent()) {
+			if (&inst == &wqm) break;
+			if (inst.GetOpcode() != ValueOpcode::LogicalAnd) continue;
+			const auto predicate = Value(const_cast<Inst*>(&inst));
+			if (QuadMaskAndMatches(predicate, low, high, wave_size)) return predicate;
+		}
+		return {};
+	}
+	if (ballot->GetOpcode() != ValueOpcode::Ballot ||
 	    branch_inputs.contains(ballot) || !exclusive(*low.TryInstruction(), *words)) return {};
 	if (wave_size == 64u) {
 		if (ballot->UseCount() != 2u ||
@@ -784,7 +816,10 @@ void LowerMergedHullQuadMasks(IR::Program& program) {
 	for (const auto* wqm: order) {
 		const auto& found = masks.at(wqm);
 		const auto predicate = QuadMaskPredicate(*wqm, program.wave_size, branch_inputs);
-		if (predicate.IsEmpty()) continue;
+		if (predicate.IsEmpty()) {
+			LOGF("merged hull whole-quad predicate shape not recognized\n");
+			continue;
+		}
 		const auto own_uses = [&](const Inst* part) {
 			if (branch_inputs.contains(part)) return false;
 			return std::ranges::all_of(part->Uses(), [&](const Use& use) {
@@ -792,8 +827,12 @@ void LowerMergedHullQuadMasks(IR::Program& program) {
 				       std::ranges::find(found.reads, use.user) != found.reads.end();
 			});
 		};
-		if (!std::ranges::all_of(found.parts, own_uses) ||
-		    !QuadHelpersUnobserved(*wqm, predicate, found.reads, branch_inputs)) continue;
+		if (!std::ranges::all_of(found.parts, own_uses)) {
+			LOGF("merged hull whole-quad mask has another use\n");
+			continue;
+		}
+		if (!QuadHelpersUnobserved(*wqm, predicate, found.reads, branch_inputs) &&
+		    !ProveHullQuadHelpersUnobserved(program, *wqm, found.reads, predicate)) continue;
 		for (auto* read: found.reads) replacements.emplace_back(read, predicate);
 	}
 	if (replacements.empty()) return;
