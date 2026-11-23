@@ -44,6 +44,8 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <cstdlib>
+#include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
 #include <functional>
@@ -2434,6 +2436,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
 #if defined(ANYPS5_KYTY)
+	if (state.ps_active && draw.indexed && m_draw_targets->color_count == 0) {
+		TracePixelHistoryTextureBindings(m_context, bindings.pixel, draw.index_count);
+	}
 	const bool probe_draw = ProbeShaderResources(m_context, stages, false, draw.index_count) && !mesh_active &&
 	                        draw.indexed && emit.indirect.address == 0;
 	static const bool probe_depth_always = [] {
@@ -2462,6 +2467,85 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	const auto pixel_history = BeginPixelHistory(m_context, *m_draw_targets, state, draw.index_count,
 	                                             rendering.depth_stencil_attachment.depth_clear);
+	if (pixel_history != 0 && m_draw_targets->color_count == 0 && state.ps_active && draw.indexed) {
+		static const uint64_t geometry_ps = [] {
+			const auto* value = std::getenv("KYTY_PIXEL_HISTORY_GEOMETRY_PS");
+			char* end = nullptr;
+			const auto hash = value != nullptr ? std::strtoull(value, &end, 16) : 0ull;
+			return value != nullptr && end != value && *end == '\0' ? hash : 0ull;
+		}();
+		const auto* pixel = state.ps_input_info.stage.module;
+		if (geometry_ps != 0 && pixel != nullptr && pixel->info.shader_hash == geometry_ps) {
+			ProbePixelHistoryShaderInputs(m_context, stages, pixel_history, draw.index_count, state.ps_plain);
+			if (PixelHistoryDiscardProbeIndices(draw.index_count)) {
+				static uint64_t probe_flip = UINT64_MAX;
+				static uint32_t copies = 0;
+				const auto flip = m_context.FlipNumber();
+				if (probe_flip != flip) {
+					probe_flip = flip;
+					copies = 0;
+				}
+				const bool external_writes = std::ranges::any_of(stages, [](const auto* stage) {
+					const auto& info = stage->runtime->module->info.info;
+					return info.uses_gds || std::ranges::any_of(info.images, [](const auto& image) {
+						return image.written || image.atomic;
+					});
+				});
+				const auto& depth = rendering.depth_stencil_attachment;
+				if (copies < 4 && !mesh_active && emit.indirect.address == 0 && !shader_write_stages &&
+				    !external_writes && !feedback_aspects && !force_probe_depth && !depth.depth_clear &&
+				    !depth.stencil_clear && depth.has_depth && dynamic_state.depth_write_enabled &&
+				    !m_context.GetOcclusionQueries().Counting()) {
+					++copies;
+					vk::Pipeline alternate;
+					m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, *m_draw_targets, false,
+					                                                 pipeline.native_bindings, &pipeline, &alternate);
+					if (alternate) {
+						auto copy = CopyPixelHistoryDepth(m_context, *m_draw_targets);
+						if (copy) {
+							auto probe = rendering;
+							probe.depth_stencil_attachment.image_view = copy->FindView(m_draw_targets->depth.desc.view_info);
+							probe.depth_stencil_attachment.image_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+							buffer.BeginRendering(probe);
+							vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, alternate);
+							EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+							buffer.EndRendering();
+							SavePixelHistoryDiscardProbe(m_context, *m_draw_targets, pixel_history, copy);
+							::Log::WriteToConsoleAndLog(fmt::format(
+							    "[PixelHistoryAB] flip={} draw={} indices={} keep-fragments\n",
+							    flip, pixel_history, draw.index_count));
+						}
+						auto device = m_context.GetGraphics().device;
+						m_context.GetCommandScheduler().DeferHostOperation([device, alternate, copy = std::move(copy)] {
+							device.destroyPipeline(alternate, nullptr);
+						});
+					}
+				}
+			}
+			::Log::WriteToConsoleAndLog(fmt::format(
+			    "[PixelHistoryGeometry] flip={} draw={} guest_index={:#x} guest_stride={} index_count={} "
+			    "host_offset={} base_vertex={} first_instance={} instances={} topology={} restart={} "
+			    "indirect={:#x} mesh={} cull={}\n",
+			    m_context.FlipNumber(), pixel_history, index_source.address, index_source.guest_element_size,
+			    draw.index_count, index_binding.offset, emit.vertex_offset, emit.first_instance, draw.instance_count,
+			    static_cast<uint32_t>(state.topology), state.primitive_restart_enable, emit.indirect.address,
+			    mesh_active, static_cast<uint32_t>(dynamic_state.cull_mode)));
+			if (!mesh_active && emit.indirect.address == 0) {
+				const auto index_name = fmt::format("geometry-{}-index", pixel_history);
+				const uint32_t stride = index_binding.type == vk::IndexType::eUint16 ? 2 : 4;
+				ProbeDrawBuffer(m_context, index_name.c_str(), 0, index_binding.buffer, index_binding.offset,
+				                uint64_t {draw.index_count} * stride, stride, emit.vertex_offset, emit.first_instance,
+				                draw.index_count);
+				for (uint32_t slot = 0; slot < vertex_bindings.count; ++slot) {
+					const auto name = fmt::format("geometry-{}-vertex", pixel_history);
+					ProbeDrawBuffer(m_context, name.c_str(), slot, vertex_bindings.buffers[slot],
+					                vertex_bindings.offsets[slot], vertex_bindings.sizes[slot],
+					                state.vertex_info[0].buffers[slot].stride, emit.vertex_offset,
+					                emit.first_instance, draw.index_count);
+				}
+			}
+		}
+	}
 #endif
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);

@@ -13,10 +13,13 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/shaderBindings.h"
 #include "kytyHostGpuStamp.h"
 #include "kytyShaderStoreStamp.h"
 
 #include <fmt/format.h>
+#include <spirv-tools/libspirv.hpp>
+#include <spirv/unified1/spirv.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -724,6 +727,41 @@ std::atomic_uint64_t witness_frame {UINT64_MAX};
 std::atomic_uint64_t witness_sample_frame {UINT64_MAX};
 std::atomic_uint64_t pixel_history_frame {UINT64_MAX};
 
+constexpr uint32_t PixelHistoryScale = 10000;
+std::atomic_uint64_t pixel_history_region {(5000ull << 48u) | (7000ull << 32u)};
+
+bool PixelHistoryRepeat() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_REPEAT");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
+struct PixelHistoryRequest {
+	uint64_t id = 0;
+	uint32_t x = 0;
+	uint32_t y = 0;
+	uint32_t width = 0;
+	uint32_t height = 0;
+};
+
+PixelHistoryRequest ReadPixelHistoryRequest(const char* directory) {
+	std::ifstream stream(std::filesystem::path(directory) / "pixel-history-request.txt");
+	PixelHistoryRequest request;
+	if (!(stream >> request.id >> request.x >> request.y) ||
+	    request.x > PixelHistoryScale || request.y > PixelHistoryScale) {
+		return {};
+	}
+	stream >> std::ws;
+	if (!stream.eof() && (!(stream >> request.width >> request.height) ||
+	                      request.width < 300 || request.width > 2667 ||
+	                      request.height < 400 || request.height > 3556)) {
+		return {};
+	}
+	return request;
+}
+
 bool ColorWitnessEnabled() {
 	static const bool enabled = [] {
 		const auto* env = std::getenv("KYTY_COLOR_CLEAR_WITNESS");
@@ -1178,6 +1216,43 @@ void RetainProbeShader(const ShaderModule& module, std::span<const uint32_t> spi
 	capture.bytes += spirv.size_bytes();
 }
 
+std::vector<uint32_t> PixelHistoryKeepFragments(uint64_t module_id, bool maintenance8_enabled) {
+	auto& capture = DrawShaderCapture();
+	std::vector<uint32_t> words;
+	{
+		std::lock_guard lock(capture.mutex);
+		const auto found = capture.programs.find(module_id);
+		if (found == capture.programs.end()) {
+			return {};
+		}
+		words = found->second;
+	}
+	uint32_t replaced = 0;
+	for (size_t i = 5; i < words.size();) {
+		const auto size = words[i] >> 16u;
+		if (size == 0 || size > words.size() - i) {
+			return {};
+		}
+		if (size == 1 && (words[i] & 0xffffu) == spv::OpKill) {
+			words[i] = (1u << 16u) | spv::OpReturn;
+			++replaced;
+		}
+		i += size;
+	}
+	if (replaced == 0) {
+		return {};
+	}
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	spvtools::ValidatorOptions validation;
+	validation.SetUniformBufferStandardLayout(true);
+	validation.SetAllowOffsetTextureOperand(maintenance8_enabled);
+	if (!tools.Validate(words.data(), words.size(), validation)) {
+		::Log::WriteToConsoleAndLog(fmt::format("[PixelHistoryAB] invalid alternate module {:016x}\n", module_id));
+		return {};
+	}
+	return words;
+}
+
 void ProbeDrawShaders(RenderContext& context, const DrawRenderState& draw, const DynamicState& state,
                       uint32_t indices) {
 	auto& capture = DrawShaderCapture();
@@ -1313,7 +1388,9 @@ bool ProbeShaderResources(RenderContext& context, std::span<PreparedBindings* co
 		return env != nullptr && std::string_view(env) == "1";
 	}();
 	static std::atomic_bool finished = false;
-	if (probes.empty() || directory == nullptr || *directory == '\0' || finished.load(std::memory_order_relaxed)) {
+	const bool repeat_resolve = match_draw_frame && PixelHistoryRepeat();
+	if (probes.empty() || directory == nullptr || *directory == '\0' ||
+	    (!repeat_resolve && finished.load(std::memory_order_relaxed))) {
 		return false;
 	}
 	static std::mutex mutex;
@@ -1322,7 +1399,19 @@ bool ProbeShaderResources(RenderContext& context, std::span<PreparedBindings* co
 	static uint64_t armed_frame = 0;
 	static uint64_t captured_draw_frame = UINT64_MAX;
 	static std::array<ProbePairState, MaxProbePairs + 1> pairs;
+	static uint64_t resolve_frame = UINT64_MAX;
+	if (repeat_resolve && (!after || context.FlipNumber() != pixel_history_frame.load(std::memory_order_relaxed))) {
+		return false;
+	}
 	std::lock_guard lock(mutex);
+	if (repeat_resolve && resolve_frame != context.FlipNumber()) {
+		resolve_frame = context.FlipNumber();
+		for (auto& probe: probes) {
+			probe.done = probe.pair != 0 || !probe.after;
+		}
+		armed = true;
+		armed_frame = resolve_frame;
+	}
 	const auto& draw_matches = DrawProbeMatches();
 	if (!after && draw_indices != 0 && !draw_matches.empty()) {
 		const auto match = std::ranges::find(draw_matches, draw_indices, &DrawProbeMatch::indices);
@@ -1447,6 +1536,207 @@ void ProbeDrawBuffer(RenderContext& context, const char* kind, uint32_t slot, vk
 	});
 }
 
+static void ProbePixelHistoryAlphaMips(RenderContext& context, const PreparedBindings& stage,
+                                       const char* directory, uint32_t indices) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_CAPTURE_ALPHA_MIPS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	if (!enabled || !PixelHistoryDiscardProbeIndices(indices) || stage.images.empty()) {
+		return;
+	}
+	const auto& binding = stage.images.front();
+	if (!binding.image_id || !binding.image_view) {
+		return;
+	}
+	auto& image = context.GetTextureCache().GetImage(binding.image_id);
+	const auto& info = image.info;
+	if (!image.backing.image || info.IsVolume() || info.samples != 1 || info.resources.layers != 1 ||
+	    info.resources.levels < 2 || info.extent.width > 4096 || info.extent.height > 4096 ||
+	    (info.pixel_format != vk::Format::eBc3UnormBlock && info.pixel_format != vk::Format::eBc3SrgbBlock)) {
+		return;
+	}
+	const auto view = std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+	if (view == image.views.end()) {
+		return;
+	}
+	const auto frame = context.FlipNumber();
+	thread_local uint64_t previous = UINT64_MAX;
+	thread_local ImageId captured {};
+	if (previous == frame && captured == binding.image_id) {
+		return;
+	}
+	previous = frame;
+	captured = binding.image_id;
+	auto& scheduler = context.GetCommandScheduler();
+	for (uint32_t level = 0; level < 2; ++level) {
+		const auto original = image.backing.subresource_states.empty() ? image.backing.state :
+		                      image.backing.subresource_states[level];
+		if (original.layout == vk::ImageLayout::eUndefined || original.layout == vk::ImageLayout::ePreinitialized) {
+			continue;
+		}
+		const auto extent = info.MipExtent(level);
+		const auto size = uint64_t {(extent.width + 3) / 4} * ((extent.height + 3) / 4) * 16;
+		auto staging = std::make_shared<Buffer>(context.GetGraphics(), scheduler, MemoryUsage::Download, 0,
+		                                        vk::BufferUsageFlagBits::eTransferDst, size);
+		scheduler.EndRendering();
+		const auto command = scheduler.Current().Handle();
+		const ImageSubresourceRange range {level, 1, 0, 1};
+		image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range, command);
+		const vk::BufferImageCopy copy {0, 0, 0, {vk::ImageAspectFlagBits::eColor, level, 0, 1},
+		                                {0, 0, 0}, {extent.width, extent.height, 1}};
+		command.copyImageToBuffer(image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          staging->Handle(), 1, &copy);
+		image.Transit(original.layout, original.access_mask, range, command);
+		ProbeBarrier(command, vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite,
+		             vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead);
+		auto name = fmt::format("cloth-alpha-{}-{}-mip{}", frame, binding.image_id.index, level);
+		auto detail = fmt::format(" origin=0x0 extent={}x{} address={:#x} format={} view_base_mip={}",
+		                          extent.width, extent.height, info.data.address,
+		                          static_cast<uint32_t>(info.pixel_format), view->info.base_level);
+		scheduler.DeferHostOperation([staging = std::move(staging), path = std::filesystem::path(directory),
+		                              name = std::move(name), detail = std::move(detail), size] {
+			staging->Invalidate(0, size);
+			SaveProbe(path, name, detail, staging->Mapped().data(), size);
+		});
+	}
+}
+
+void ProbePixelHistoryShaderInputs(RenderContext& context, std::span<PreparedBindings* const> stages,
+                                   uint32_t capture, uint32_t indices, bool plain_pixel) {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_SHADER_INPUTS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	const auto* directory = std::getenv("APS5_VIDEOOUT_TELEMETRY_DIR");
+	if (!enabled || directory == nullptr || *directory == '\0') {
+		return;
+	}
+	const auto frame = context.FlipNumber();
+	const auto tick = context.GetCommandScheduler().CurrentTick();
+	const auto prefix = DrawProbePrefix(frame, tick, indices);
+	uint64_t budget = 2u << 20u;
+	for (size_t stage_slot = 0; stage_slot < stages.size(); ++stage_slot) {
+		const auto* stage = stages[stage_slot];
+		const auto* module = stage != nullptr && stage->runtime != nullptr ? stage->runtime->module : nullptr;
+		if (module == nullptr) {
+			continue;
+		}
+		const auto name = fmt::format("inputs-{}-stage-{}", capture, stage_slot);
+		const bool plain = plain_pixel && module->info.stage == ShaderType::Pixel && module->plain != nullptr;
+		if (module->info.stage == ShaderType::Pixel) {
+			ProbePixelHistoryAlphaMips(context, *stage, directory, indices);
+		}
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[PixelHistoryInputs] flip={} draw={} stage={} hash={:016x} module={:016x} shader_data_words={}\n",
+		    frame, capture, stage_slot, module->info.shader_hash, plain ? module->plain->id : module->id,
+		    stage->shader_data.size()));
+		if (!stage->shader_data.empty()) {
+			SaveProbe(directory, fmt::format("{}-{}-shader-data", prefix, name), "",
+			          stage->shader_data.data(), stage->shader_data.size() * sizeof(uint32_t));
+		}
+		const auto copy = [&](std::span<const vk::DescriptorBufferInfo> views, std::string_view kind) {
+			const auto buffer_name = fmt::format("{}-{}", name, kind);
+			for (uint32_t slot = 0; slot < views.size(); ++slot) {
+				const auto& view = views[slot];
+				const auto size = view.buffer && view.range != VK_WHOLE_SIZE && (view.offset & 3u) == 0
+				                      ? std::min({uint64_t {view.range}, uint64_t {256u << 10u}, budget}) & ~3ull
+				                      : 0ull;
+				::Log::WriteToConsoleAndLog(fmt::format(
+				    "[PixelHistoryInputs] flip={} draw={} stage={} kind={} slot={} range={} copied={}\n",
+				    frame, capture, stage_slot, kind, slot, view.range, size));
+				if (size != 0) {
+					ProbeDrawBuffer(context, buffer_name.c_str(), slot, view.buffer, view.offset, size, 0, 0, 0, indices);
+					budget -= size;
+				}
+			}
+		};
+		copy(stage->uniform_buffers, "uniform");
+		copy(std::span {&stage->flattened_srt, 1u}, "srt");
+		copy(stage->buffers, "storage");
+		for (size_t slot = 0; slot < stage->images.size(); ++slot) {
+			const auto& image = stage->images[slot];
+			const auto* backing = image.image_id ? &context.GetTextureCache().GetImage(image.image_id) : nullptr;
+			const auto& info = backing != nullptr ? backing->info : image.desc.info;
+			::Log::WriteToConsoleAndLog(fmt::format(
+			    "[PixelHistoryInputs] flip={} draw={} stage={} image={} id={} view={} template={} "
+			    "addr={:#x} format={} extent={}x{} levels={}\n",
+			    frame, capture, stage_slot, slot, image.image_id.index, static_cast<bool>(image.image_view),
+			    slot < 64 && ((stage->template_images >> slot) & 1u) != 0,
+			    info.data.address, static_cast<uint32_t>(info.pixel_format), info.extent.width,
+			    info.extent.height, info.resources.levels));
+		}
+	}
+}
+
+void TracePixelHistoryTextureBindings(RenderContext& context, const PreparedBindings& stage, uint32_t indices) {
+	static const uint64_t selected_shader = [] {
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_TEXTURE_TRACE");
+		uint64_t hash = 0;
+		return value != nullptr && ParseProbeNumber(std::string_view(value), hash, 16) ? hash : 0u;
+	}();
+	if (selected_shader == 0 || stage.runtime == nullptr || stage.runtime->module == nullptr ||
+	    stage.runtime->module->info.shader_hash != selected_shader || !PixelHistoryDiscardProbeIndices(indices)) {
+		return;
+	}
+	const auto& module = *stage.runtime->module;
+	const auto& snapshot = *stage.runtime->resources;
+	struct BindingState {
+		ShaderRecompiler::IR::DescriptorValue raw;
+		ImageId image;
+		vk::ImageView view;
+		bool operator==(const BindingState&) const = default;
+	};
+	thread_local std::unordered_map<uint64_t, BindingState> previous;
+	thread_local uint32_t logged = 0;
+	for (size_t slot = 0; slot < std::min({stage.images.size(), snapshot.images.size(), module.info.info.images.size()});
+	     ++slot) {
+		const auto& resource = module.info.info.images[slot];
+		const auto& raw = snapshot.images[slot];
+		const auto& binding = stage.images[slot];
+		const BindingState current {raw, binding.image_id, binding.image_view};
+		const auto key = (uint64_t {indices} << 32u) | slot;
+		if (const auto found = previous.find(key); found != previous.end() && found->second == current) {
+			continue;
+		}
+		if (logged >= 128) {
+			if (logged == 128) {
+				::Log::WriteToConsoleAndLog("[PixelHistoryTexture] trace limit reached\n");
+				++logged;
+			}
+			break;
+		}
+		previous.insert_or_assign(key, current);
+		++logged;
+		ShaderTextureResource texture;
+		std::ranges::copy(raw.dwords, texture.fields);
+		const auto* image = binding.image_id ? &context.GetTextureCache().GetImage(binding.image_id) : nullptr;
+		const auto* actual_view = static_cast<const ImageViewInfo*>(nullptr);
+		if (image != nullptr && binding.image_view) {
+			const auto found = std::ranges::find(image->views, binding.image_view, &CachedImageView::view);
+			if (found != image->views.end()) {
+				actual_view = &found->info;
+			}
+		}
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[PixelHistoryTexture] flip={} indices={} module={:016x} slot={} descriptor={} source={} pc={:#x} "
+		    "raw_words={} raw_null={} raw_addr={:#x} raw_format={} id={} view={} template={} "
+		    "live_addr={:#x} live_format={} view_format={} base_mip={} base_layer={} "
+		    "raw={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}\n",
+		    context.FlipNumber(), indices, module.id, slot, resource.descriptor_index, resource.source,
+		    resource.first_use_pc, raw.dword_count, texture.IsNull(), texture.Base40(),
+		    static_cast<uint32_t>(texture.Format()), binding.image_id.index, static_cast<bool>(binding.image_view),
+		    slot < 64 && ((stage.template_images >> slot) & 1u) != 0,
+		    image != nullptr ? image->info.data.address : 0,
+		    image != nullptr ? static_cast<uint32_t>(image->info.pixel_format) : 0,
+		    actual_view != nullptr ? static_cast<uint32_t>(actual_view->format) : 0,
+		    actual_view != nullptr ? actual_view->base_level : 0,
+		    actual_view != nullptr ? actual_view->base_layer : 0,
+		    raw.dwords[0], raw.dwords[1], raw.dwords[2], raw.dwords[3], raw.dwords[4], raw.dwords[5], raw.dwords[6],
+		    raw.dwords[7]));
+	}
+}
+
 namespace {
 
 const char* PixelHistoryDirectory() {
@@ -1454,12 +1744,31 @@ const char* PixelHistoryDirectory() {
 	return directory;
 }
 
+uint64_t PixelHistoryDepthAddress() {
+	static const uint64_t address = [] {
+		uint64_t parsed = 0;
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_DEPTH_ADDRESS");
+		return value != nullptr && ParseProbeNumber(std::string_view(value), parsed, 16) ? parsed : 0;
+	}();
+	return address;
+}
+
+bool PixelHistoryIncludesColor() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_INCLUDE_COLOR");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
 void SaveDrawAttachments(RenderContext& context, const DrawTargets& targets, const char* directory,
-                         std::string_view prefix, bool after, bool pixel_history) {
+                         std::string_view prefix, bool after, bool pixel_history, Image* depth_override = nullptr) {
 	auto& scheduler = context.GetCommandScheduler();
-	const auto save = [&](ImageId id, vk::ImageAspectFlagBits aspect, uint32_t level, uint32_t layer, const char* kind) {
-		if (!id) return;
-		auto& image = context.GetTextureCache().GetImage(id);
+	const bool depth_history = pixel_history && PixelHistoryDepthAddress() != 0;
+	const auto save = [&](ImageId id, vk::ImageAspectFlagBits aspect, uint32_t level, uint32_t layer,
+	                      const char* kind, Image* override_image = nullptr) {
+		if (!id && override_image == nullptr) return;
+		auto& image = override_image != nullptr ? *override_image : context.GetTextureCache().GetImage(id);
 		const auto& info = image.info;
 		const auto original = image.backing.state;
 		if (!image.backing.image || info.IsBlock() || info.IsVolume() || info.samples != 1 ||
@@ -1478,10 +1787,22 @@ void SaveDrawAttachments(RenderContext& context, const DrawTargets& targets, con
 		if (extent.width < 640 || extent.height < 360 || bytes == 0) {
 			return;
 		}
-		const uint32_t x = pixel_history ? extent.width / 2 - 64 : extent.width / 4;
-		const uint32_t width = pixel_history ? 128 : extent.width - 2 * x;
-		const uint32_t y = pixel_history ? extent.height * 7 / 10 - 64 : extent.height / 3;
-		const uint32_t height = pixel_history ? 128 : extent.height - y;
+		const auto region = pixel_history_region.load(std::memory_order_relaxed);
+		const auto length = [](uint32_t units, uint32_t extent, uint32_t fallback) {
+			return units == 0 ? fallback :
+			       std::clamp(static_cast<uint32_t>((uint64_t {extent} * units + PixelHistoryScale / 2) /
+			                                        PixelHistoryScale), 1u, extent);
+		};
+		const uint32_t sample_width = length((region >> 16u) & 0xffffu, extent.width, depth_history ? 256 : 128);
+		const uint32_t sample_height = length(region & 0xffffu, extent.height, depth_history ? 192 : 128);
+		const auto start = [](uint32_t units, uint32_t extent, uint32_t length) {
+			const auto middle = static_cast<uint32_t>(uint64_t {extent} * units / PixelHistoryScale);
+			return std::min(std::max(middle, length / 2) - length / 2, extent - length);
+		};
+		const uint32_t x = pixel_history ? start(region >> 48u, extent.width, sample_width) : extent.width / 4;
+		const uint32_t width = pixel_history ? sample_width : extent.width - 2 * x;
+		const uint32_t y = pixel_history ? start((region >> 32u) & 0xffffu, extent.height, sample_height) : extent.height / 3;
+		const uint32_t height = pixel_history ? sample_height : extent.height - y;
 		const auto size = uint64_t {width} * height * bytes;
 		if (size > (8u << 20u)) return;
 		auto staging = std::make_shared<Buffer>(context.GetGraphics(), scheduler, MemoryUsage::Download, 0,
@@ -1506,13 +1827,13 @@ void SaveDrawAttachments(RenderContext& context, const DrawTargets& targets, con
 	};
 	const auto colors = std::span {targets.colors, targets.color_count};
 	const auto color = std::ranges::find(colors, 0u, &RenderColorInfo::target_slot);
-	if (color != colors.end()) {
+	if (depth_override == nullptr && (!depth_history || PixelHistoryIncludesColor()) && color != colors.end()) {
 		save(color->image_id, vk::ImageAspectFlagBits::eColor, color->desc.view_info.base_level,
 		     color->desc.view_info.base_layer, "gbuffer0");
 	}
 	const auto& depth = targets.depth;
 	save(depth.image_id, vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
-	     depth.desc.view_info.base_layer, "depth");
+	     depth.desc.view_info.base_layer, "depth", depth_override);
 }
 }
 
@@ -1540,17 +1861,41 @@ uint32_t BeginPixelHistory(RenderContext& context, const DrawTargets& targets, c
 		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_MIN_TARGETS");
 		return value != nullptr && ParseProbeNumber(std::string_view(value), count) ? std::max(count, 1u) : 1u;
 	}();
-	if (color_address == 0 || targets.color_count < min_targets) {
+	const auto depth_address = PixelHistoryDepthAddress();
+	if (color_address == 0 && depth_address == 0) {
 		return 0;
 	}
+	const bool split_budget = depth_address != 0 && PixelHistoryIncludesColor();
+	const bool repeat = split_budget && PixelHistoryRepeat();
+	static const uint32_t depth_skip = [] {
+		uint32_t count = 0;
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_DEPTH_SKIP");
+		return value != nullptr && ParseProbeNumber(std::string_view(value), count) ? count : 0;
+	}();
+	const bool color_draw = targets.color_count != 0;
+	const bool color_phase = split_budget && color_draw;
 	const auto flip = context.FlipNumber();
 	const auto history_frame = pixel_history_frame.load(std::memory_order_relaxed);
-	if (history_frame != UINT64_MAX && history_frame != flip) {
+	if (!repeat && history_frame != UINT64_MAX && history_frame != flip) {
 		return 0;
 	}
+
 	const auto colors = std::span {targets.colors, targets.color_count};
 	const auto color = std::ranges::find(colors, 0u, &RenderColorInfo::target_slot);
-	if (color == colors.end() || color->desc.info.data.address != color_address || !color->image_id) {
+	const bool color_matches = color_address != 0 && color != colors.end() && color->image_id &&
+	                           color->desc.info.data.address == color_address;
+	const size_t budget = color_phase ? (repeat && color_matches ? 2 : 1) : 0;
+	const auto& depth = targets.depth;
+	const bool depth_matches = depth_address != 0 && depth.image_id && depth.desc.info.data.address == depth_address;
+	if (depth_address == 0) {
+		if (!color_matches || targets.color_count < min_targets) {
+			return 0;
+		}
+	} else if (color_phase) {
+		if (!depth_matches && !color_matches) {
+			return 0;
+		}
+	} else if (!depth_matches || (!depth.depth_write_enable && !depth_clear)) {
 		return 0;
 	}
 	const auto* directory = PixelHistoryDirectory();
@@ -1559,41 +1904,100 @@ uint32_t BeginPixelHistory(RenderContext& context, const DrawTargets& targets, c
 	}
 	static std::mutex mutex;
 	static uint32_t ordinal = 0;
+	static std::array<uint32_t, 3> phase_counts {};
+	static uint64_t depth_candidates = 0;
 	static auto next_marker_check = std::chrono::steady_clock::time_point {};
-	constexpr uint32_t max_draws = 256;
+	static uint64_t armed_depth_flip = UINT64_MAX;
+	static uint64_t last_request = 0;
+	static PixelHistoryRequest pending;
+	constexpr std::array<uint32_t, 3> repeat_limits {64, 64, 128};
+	const bool late_depth = repeat && depth_skip != 0 && budget == 0;
+	const uint32_t max_draws = late_depth ? 192 : repeat ? repeat_limits[budget] :
+	                           split_budget ? (color_phase ? 192 : 64) : 256;
+	constexpr std::array phases {"depth-or-legacy", "color", "primary-color"};
 	uint32_t capture = 0;
+	uint64_t depth_order = 0;
 	{
 		const std::lock_guard lock(mutex);
 		const auto selected = pixel_history_frame.load(std::memory_order_relaxed);
-		if (selected == UINT64_MAX) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now < next_marker_check) {
+		if (repeat && selected != flip) {
+			if (pending.id == 0) {
+				const auto now = std::chrono::steady_clock::now();
+				if (now < next_marker_check) {
+					return 0;
+				}
+				next_marker_check = now + std::chrono::milliseconds(40);
+				pending = ReadPixelHistoryRequest(directory);
+				if (pending.id <= last_request) {
+					pending = {};
+					return 0;
+				}
+				armed_depth_flip = flip;
+			}
+			if (flip <= armed_depth_flip) {
 				return 0;
 			}
-			next_marker_check = now + std::chrono::milliseconds(40);
-			if (!ResourceProbeArmed(directory)) {
+			last_request = pending.id;
+			const uint64_t region = (uint64_t {pending.x} << 48u) | (uint64_t {pending.y} << 32u) |
+			                        (uint64_t {pending.width} << 16u) | pending.height;
+			pixel_history_region.store(region, std::memory_order_relaxed);
+			::Log::WriteToConsoleAndLog(fmt::format("[PixelHistory] request={} flip={} center={}x{} size={}x{}\n",
+			                                       pending.id, flip, pending.x, pending.y, pending.width, pending.height));
+			pending = {};
+			phase_counts.fill(0);
+			depth_candidates = 0;
+			ordinal = 0;
+			pixel_history_frame.store(flip, std::memory_order_relaxed);
+		} else if (selected == UINT64_MAX) {
+			if (armed_depth_flip == UINT64_MAX) {
+				const auto now = std::chrono::steady_clock::now();
+				if (now < next_marker_check) {
+					return 0;
+				}
+				next_marker_check = now + std::chrono::milliseconds(40);
+				if (!ResourceProbeArmed(directory)) {
+					return 0;
+				}
+				if (depth_address != 0) {
+					armed_depth_flip = flip;
+				}
+			}
+			if (depth_address != 0 && flip <= armed_depth_flip) {
 				return 0;
 			}
 			pixel_history_frame.store(flip, std::memory_order_relaxed);
 		} else if (selected != flip) {
 			return 0;
 		}
-		if (ordinal >= max_draws) {
-			if (ordinal == max_draws) {
-				::Log::WriteToConsoleAndLog(fmt::format("[PixelHistory] flip={} capture_limit={}\n", flip, max_draws));
-				++ordinal;
+		if (repeat && budget == 0) {
+			++depth_candidates;
+			if (depth_candidates <= depth_skip) {
+				return 0;
+			}
+		}
+		depth_order = depth_candidates;
+		auto& recorded = phase_counts[budget];
+		if (recorded >= max_draws) {
+			if (recorded == max_draws) {
+				::Log::WriteToConsoleAndLog(fmt::format("[PixelHistory] flip={} capture_limit={} phase={}\n",
+				                                       flip, max_draws, phases[budget]));
+				++recorded;
 			}
 			return 0;
 		}
+		++recorded;
 		capture = ++ordinal;
 	}
 	const auto vertices = draw.VertexStages();
 	const auto* vertex = vertices.empty() ? nullptr : vertices.back().stage.module;
 	const auto* pixel = draw.ps_active ? draw.ps_input_info.stage.module : nullptr;
 	::Log::WriteToConsoleAndLog(fmt::format(
-	    "[PixelHistory] flip={} draw={} indices={} vs={:016x} ps={:016x} depth_clear={}\n", flip, capture,
-	    indices, vertex != nullptr ? vertex->info.shader_hash : 0, pixel != nullptr ? pixel->info.shader_hash : 0,
-	    depth_clear));
+	    "[PixelHistory] flip={} draw={} indices={} vs={:016x} ps={:016x} depth_clear={} color_targets={} color0={:#x} "
+	    "depth={:#x} depth_test={} depth_write={} depth_compare={} depth_candidates={}\n",
+	    flip, capture, indices, vertex != nullptr ? vertex->info.shader_hash : 0,
+	    pixel != nullptr ? pixel->info.shader_hash : 0, depth_clear, targets.color_count,
+	    color != colors.end() ? color->desc.info.data.address : 0, depth.desc.info.data.address,
+	    depth.depth_test_enable, depth.depth_write_enable, static_cast<uint32_t>(depth.depth_compare_op), depth_order));
 	SaveDrawAttachments(context, targets, directory, fmt::format("pixel-history-{}-{}", flip, capture), false, true);
 	return capture;
 }
@@ -1605,6 +2009,80 @@ void EndPixelHistory(RenderContext& context, const DrawTargets& targets, uint32_
 	const auto flip = pixel_history_frame.load(std::memory_order_relaxed);
 	SaveDrawAttachments(context, targets, PixelHistoryDirectory(), fmt::format("pixel-history-{}-{}", flip, capture),
 	                    true, true);
+}
+
+bool PixelHistoryDiscardProbeIndices(uint32_t indices) {
+	static const auto selected = [] {
+		const auto* value = std::getenv("KYTY_PIXEL_HISTORY_DISCARD_AB_INDICES");
+		std::vector<uint32_t> counts;
+		if (value == nullptr) {
+			return counts;
+		}
+		std::string_view fields(value);
+		while (!fields.empty() && counts.size() < 16) {
+			const auto separator = fields.find(',');
+			uint32_t count = 0;
+			if (!ParseProbeNumber(fields.substr(0, separator), count) || count == 0) {
+				return std::vector<uint32_t> {};
+			}
+			counts.push_back(count);
+			if (separator == std::string_view::npos) {
+				break;
+			}
+			fields.remove_prefix(separator + 1);
+		}
+		return counts;
+	}();
+	return std::ranges::find(selected, indices) != selected.end();
+}
+
+std::shared_ptr<Image> CopyPixelHistoryDepth(RenderContext& context, const DrawTargets& targets) {
+	if (!targets.depth.image_id) {
+		return {};
+	}
+	auto& source = context.GetTextureCache().GetImage(targets.depth.image_id);
+	const auto& view = targets.depth.desc.view_info;
+	const auto original = source.backing.state;
+	if (!source.backing.image || source.info.samples != 1 || source.backing.mip_levels != 1 ||
+	    source.backing.layers != 1 || view.base_level != 0 || view.base_layer != 0 ||
+	    original.layout == vk::ImageLayout::eUndefined || source.backing.extent.width > 4096 ||
+	    source.backing.extent.height > 4096 ||
+	    (source.backing.format != vk::Format::eD32Sfloat && source.backing.format != vk::Format::eD32SfloatS8Uint)) {
+		return {};
+	}
+	auto info = source.info;
+	info.data = {};
+	info.stencil = {};
+	info.metadata = {};
+	auto& scheduler = context.GetCommandScheduler();
+	auto copy = std::make_shared<Image>(context.GetGraphics(), scheduler, info);
+	scheduler.EndRendering();
+	const auto command = scheduler.Current().Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command);
+	copy->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	std::array<vk::ImageCopy, 2> regions {};
+	for (size_t i = 0; i < regions.size(); ++i) {
+		const auto aspect = i == 0 ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eStencil;
+		auto& region = regions[i];
+		region.srcSubresource = {aspect, 0, 0, 1};
+		region.dstSubresource = region.srcSubresource;
+		region.extent = source.backing.extent;
+	}
+	const auto count = source.backing.format == vk::Format::eD32SfloatS8Uint ? 2u : 1u;
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                  copy->backing.image, vk::ImageLayout::eTransferDstOptimal, count, regions.data());
+	source.Transit(original.layout, original.access_mask, {}, command);
+	copy->Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	              vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+	              {}, command);
+	return copy;
+}
+
+void SavePixelHistoryDiscardProbe(RenderContext& context, const DrawTargets& targets, uint32_t capture,
+                                  const std::shared_ptr<Image>& copy) {
+	const auto flip = context.FlipNumber();
+	auto prefix = fmt::format("pixel-history-{}-{}-keep-fragments", flip, capture);
+	SaveDrawAttachments(context, targets, PixelHistoryDirectory(), prefix, true, true, copy.get());
 }
 
 #endif

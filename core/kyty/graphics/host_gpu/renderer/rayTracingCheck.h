@@ -44,6 +44,14 @@ void EndPixelHistory(RenderContext& context, const DrawTargets& targets, uint32_
 void ProbeDrawBuffer(RenderContext& context, const char* kind, uint32_t slot, vk::Buffer buffer,
                      uint64_t offset, uint64_t size, uint32_t stride, int32_t vertex_offset,
                      uint32_t first_instance, uint32_t indices);
+void ProbePixelHistoryShaderInputs(RenderContext& context, std::span<PreparedBindings* const> stages,
+                                   uint32_t capture, uint32_t indices, bool plain_pixel);
+void TracePixelHistoryTextureBindings(RenderContext& context, const PreparedBindings& stage, uint32_t indices);
+std::vector<uint32_t> PixelHistoryKeepFragments(uint64_t module_id, bool maintenance8_enabled);
+bool PixelHistoryDiscardProbeIndices(uint32_t indices);
+std::shared_ptr<Image> CopyPixelHistoryDepth(RenderContext& context, const DrawTargets& targets);
+void SavePixelHistoryDiscardProbe(RenderContext& context, const DrawTargets& targets, uint32_t capture,
+                                  const std::shared_ptr<Image>& copy);
 #endif
 
 class RayTracingCheck: public std::enable_shared_from_this<RayTracingCheck> {

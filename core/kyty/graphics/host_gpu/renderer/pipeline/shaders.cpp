@@ -29,8 +29,10 @@
 #include <bit>
 #include <cinttypes>
 #if defined(ANYPS5_KYTY)
+#include <charconv>
 #include <cstdlib>
 #include <optional>
+#include <ranges>
 #endif
 #include <fmt/format.h>
 #include <functional>
@@ -60,7 +62,28 @@ uint32_t ComputeCreationThreshold(const char* name) {
 
 bool FastComputeCreation(const ShaderModule& module) {
 	static const auto minimum = ComputeCreationThreshold("KYTY_FAST_COMPUTE_MIN_WORDS");
-	return minimum != 0 && module.spirv_words >= minimum;
+	static const auto modules = [] {
+		std::vector<uint64_t> ids;
+		const auto* value = std::getenv("KYTY_FAST_COMPUTE_MODULES");
+		if (value == nullptr) {
+			return ids;
+		}
+		for (const auto field: std::string_view(value) | std::views::split(',')) {
+			if (field.empty()) {
+				continue;
+			}
+			const auto* first = &*field.begin();
+			const auto* last = first + std::ranges::distance(field);
+			uint64_t id = 0;
+			const auto parsed = std::from_chars(first, last, id, 16);
+			if (parsed.ec == std::errc {} && parsed.ptr == last) {
+				ids.push_back(id);
+			}
+		}
+		return ids;
+	}();
+	return (minimum != 0 && module.spirv_words >= minimum) ||
+	       std::ranges::find(modules, module.id) != modules.end();
 }
 
 bool LookupComputeCreation(const ShaderModule& module) {
@@ -949,12 +972,6 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 	if (lookup) {
 		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 	}
-#if defined(ANYPS5_KYTY)
-	const bool fast = !lookup && FastComputeCreation(module);
-	if (fast) {
-		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
-	}
-#endif
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
@@ -970,32 +987,48 @@ vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache::Pipeli
 	}();
 	timing = timing || log_ms.has_value();
 #endif
-	Clock::time_point finished {};
 	Clock::duration elapsed {};
-	vk::Result result;
-	{
-		const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
-		                                    {module.info.shader_hash, 0, 0, 0}, module.id);
-		const auto started = timing ? Clock::now() : Clock::time_point {};
-		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-		if (timing) {
-			finished = Clock::now();
-			elapsed  = finished - started;
+	const auto create = [&](bool fast) {
+		if (fast) {
+			info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 		}
+		const auto started = timing ? Clock::now() : Clock::time_point {};
+		vk::Result result;
+		{
+			const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
+			                                    {module.info.shader_hash, 0, 0, 0}, module.id);
+			result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+		}
+		if (timing) {
+			const auto finished = Clock::now();
+			const auto duration = finished - started;
+			elapsed += duration;
+#if defined(ANYPS5_KYTY)
+			if (log_ms && ((lookup && (fast || LookupComputeCreation(module))) ||
+			               std::chrono::duration_cast<std::chrono::milliseconds>(duration).count() >= *log_ms)) {
+				const auto* mode = lookup ? (fast ? "fast-lookup" : "lookup") : (fast ? "fast-create" : "create");
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "[kyty-gpl] compute-driver {:.6f} s 0x{:016x} module={} spirv_words={} mode={} result={} @{}\n",
+				    std::chrono::duration<double>(duration).count(), module.info.shader_hash, module.id,
+				    module.spirv_words, mode, vk::to_string(result), finished.time_since_epoch().count()));
+			}
+#endif
+		}
+		return result;
+	};
+
+#if defined(ANYPS5_KYTY)
+	const bool fast = FastComputeCreation(module);
+	auto result = create(!lookup && fast);
+	if (lookup && fast && result == vk::Result::ePipelineCompileRequired && pipeline.pipeline == nullptr) {
+		result = create(true);
 	}
+#else
+	const auto result = create(false);
+#endif
 	if (driver_time != nullptr) {
 		*driver_time = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed);
 	}
-#if defined(ANYPS5_KYTY)
-	if (log_ms && ((lookup && LookupComputeCreation(module)) ||
-	               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >= *log_ms)) {
-		Log::WriteToConsoleAndLog(fmt::format(
-		    "[kyty-gpl] compute-driver {:.6f} s 0x{:016x} module={} spirv_words={} mode={} result={} @{}\n",
-		    std::chrono::duration<double>(elapsed).count(), module.info.shader_hash, module.id,
-		    module.spirv_words, lookup ? "lookup" : fast ? "fast-create" : "create", vk::to_string(result),
-		    finished.time_since_epoch().count()));
-	}
-#endif
 	return result;
 }
 

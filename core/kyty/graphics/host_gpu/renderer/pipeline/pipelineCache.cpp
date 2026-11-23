@@ -501,16 +501,29 @@ void CaptureComputeModule(const ShaderModule& module, const std::vector<uint32_t
 		return ids;
 	}();
 	static const auto* directory = std::getenv("APS5_VIDEOOUT_TELEMETRY_DIR");
+	static const uint64_t shader = [] {
+		const auto* value = std::getenv("KYTY_CAPTURE_COMPUTE_SHADER");
+		if (value == nullptr) {
+			return uint64_t {0};
+		}
+		uint64_t hash = 0;
+		const auto* end = value + std::strlen(value);
+		const auto parsed = std::from_chars(value, end, hash, 16);
+		return parsed.ec == std::errc {} && parsed.ptr == end ? hash : uint64_t {0};
+	}();
+	const bool selected_shader = shader != 0 && shader == module.info.shader_hash;
 	const bool selected = std::ranges::find(modules, module.id) != modules.end() ||
-	                      (minimum != 0 && spirv.size() >= minimum);
+	                      (minimum != 0 && spirv.size() >= minimum) || selected_shader;
 	if (!selected || spirv.empty() || spirv.size() > (16u << 20u) ||
 	    directory == nullptr || *directory == '\0') {
 		return;
 	}
 	static std::mutex mutex;
 	static uint32_t captures = 0;
+	static uint32_t shader_captures = 0;
 	std::lock_guard lock(mutex);
-	if (captures >= 8u) return;
+	auto& count = selected_shader ? shader_captures : captures;
+	if (count >= 8u) return;
 	const auto name = fmt::format("compute-{:016x}-{:016x}.kyty", module.info.shader_hash, module.id);
 	const auto path = std::filesystem::path(directory) / name;
 	std::error_code error;
@@ -523,8 +536,23 @@ void CaptureComputeModule(const ShaderModule& module, const std::vector<uint32_t
 		std::filesystem::remove(path, error);
 		return;
 	}
-	++captures;
+	++count;
 	Log::WriteToConsoleAndLog(fmt::format("[kyty-gpl] captured {} words={}\n", name, spirv.size()));
+	if (selected_shader) {
+		PipelineCacheLog("[kyty-compute-specialization] shader={:016x} module={:016x} spirv={:016x} buffers={}",
+		                 module.info.shader_hash, module.id,
+		                 XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)),
+		                 module.specialization.buffers.size());
+		for (size_t slot = 0; slot < module.specialization.buffers.size(); ++slot) {
+			const auto& buffer = module.specialization.buffers[slot];
+			PipelineCacheLog("[kyty-compute-specialization] module={:016x} slot={} stride_flags={:#x} "
+			                 "format={} swizzle={:#x} zero_stride_oob={} scalar_empty={} "
+			                 "root={} mapping={} iterations={}",
+			                 module.id, slot, buffer.packed_stride, static_cast<uint32_t>(buffer.descriptor_format),
+			                 buffer.descriptor_swizzle, buffer.zero_stride_oob, buffer.scalar_empty,
+			                 buffer.indirect_root, buffer.indirect_mapping_offset, buffer.indirect_search_iterations);
+		}
+	}
 }
 #endif
 
@@ -4453,7 +4481,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets,
                                                             bool                   allow_async,
-                                                            bool                   native_bindings) {
+                                                            bool                   native_bindings,
+                                                            const Pipeline*        probe_layout,
+                                                            vk::Pipeline*          probe_result) {
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
@@ -4461,7 +4491,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto& vs_input_info = vertex_info.front();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 #if defined(ANYPS5_KYTY)
-	if (m_libraries != nullptr &&
+	if (probe_result == nullptr && m_libraries != nullptr &&
 	    (m_libraries->OptimizedReady() != m_optimized_seen ||
 	     (!m_optimized_deferred.empty() &&
 	      m_graphics_pipelines.size() + m_native_graphics_pipelines.size() != m_optimized_scanned))) {
@@ -4644,6 +4674,36 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 
+#if defined(ANYPS5_KYTY)
+	if (probe_result != nullptr) {
+		if (probe_layout == nullptr || stages[3] == nullptr || color_count != 0) {
+			return nullptr;
+		}
+		const auto words = PixelHistoryKeepFragments(stages[3]->id, SpirvProfile(m_graphics).maintenance8);
+		if (words.empty()) {
+			return nullptr;
+		}
+		auto pixel = *stages[3];
+		vk::ShaderModuleCreateInfo info {};
+		info.codeSize = words.size() * sizeof(uint32_t);
+		info.pCode    = words.data();
+		if (m_graphics.device.createShaderModule(&info, nullptr, &pixel.module) != vk::Result::eSuccess) {
+			return nullptr;
+		}
+		stages[3] = &pixel;
+		const auto result = CreateGraphicsPipelineWhole(m_graphics, *probe_layout, key, stages,
+		                                                nullptr, {}, *probe_result);
+		m_graphics.device.destroyShaderModule(pixel.module, nullptr);
+		if (result != vk::Result::eSuccess) {
+			m_graphics.device.destroyPipeline(*probe_result, nullptr);
+			*probe_result = nullptr;
+		}
+		return nullptr;
+	}
+#else
+	(void)probe_layout;
+	(void)probe_result;
+#endif
 	if (native_bindings) {
 		if (auto iter = m_native_graphics_pipelines.find(key); iter != m_native_graphics_pipelines.end()) {
 			return &iter->second;

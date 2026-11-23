@@ -510,7 +510,8 @@ public:
 
 	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets, bool allow_async = false,
-	                              bool native_bindings = false);
+	                              bool native_bindings = false,
+	                              const Pipeline* probe_layout = nullptr, vk::Pipeline* probe_result = nullptr);
 #if defined(ANYPS5_KYTY)
 	[[nodiscard]] bool PreparesGraphicsLibraries() const;
 	void SetRenderContext(RenderContext* context) { m_render = context; }
