@@ -57,6 +57,34 @@ constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
 constexpr uint64_t PartialUploadMaxShare = 2;
 constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
 
+void TraceTextureBacking(const char* event, ImageId id, const Image& image, uint64_t address, uint64_t size,
+                         uint64_t tick) {
+#if defined(ANYPS5_KYTY)
+	static const auto target = [] {
+		const auto* env = std::getenv("KYTY_TEXTURE_BACKING_TRACE");
+		std::string_view value = env != nullptr ? env : "";
+		if (value.starts_with("0x")) value.remove_prefix(2);
+		if (value.empty()) return uint64_t {0};
+		uint64_t parsed = 0;
+		const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 16);
+		return result.ec == std::errc {} && result.ptr == value.data() + value.size() ? parsed : uint64_t {0};
+	}();
+	if (target != 0 && image.info.data.address == target) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[TextureBacking] event={} tick={} id={} base={:#x} bytes={:#x} range={:#x}+{:#x} cpu={} buffer={} gpu={}\n",
+		    event, tick, id.index, image.info.data.address, image.info.data.size, address, size,
+		    image.IsDefinitelyCpuDirty(), image.IsBufferModified(), image.IsGpuModified()));
+	}
+#else
+	(void)event;
+	(void)id;
+	(void)image;
+	(void)address;
+	(void)size;
+	(void)tick;
+#endif
+}
+
 #if defined(ANYPS5_KYTY)
 uint64_t ProbeColorClearAddress() {
 	static const auto target = []() -> uint64_t {
@@ -291,6 +319,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	AttachImageVersion(id);
 	RegisterImage(id);
+	TraceTextureBacking("insert", id, m_slot_images[id], info.data.address, info.data.size, m_gc_tick);
 	return id;
 }
 
@@ -710,6 +739,7 @@ ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresou
 
 void TextureCache::FreeImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	TraceTextureBacking("free", id, image, image.info.data.address, image.info.data.size, m_gc_tick);
 	if (image.IsGpuModified()) {
 		NoteDiscardedTarget(id, image);
 		for (const auto association: image.stencil_ids) {
@@ -1785,6 +1815,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
+		TraceTextureBacking("upload", id, image, image.info.data.address, image.info.data.size, m_gc_tick);
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
 	}
@@ -3412,7 +3443,8 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	Common::ScopedLock lock {m_lock};
-	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
+	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
+		TraceTextureBacking("gpu-buffer-write", id, image, address, size, m_gc_tick);
 		if (image.info.data.address != address) {
 			return;
 		}
@@ -3486,6 +3518,7 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 		copy.imageSubresource.baseArrayLayer = static_cast<uint32_t>(offset / stride);
 	}
 	image.Upload(copies, texels.buffer, texels.offset, texels.size);
+	TraceTextureBacking("dma-direct", targets.front(), image, address, size, m_gc_tick);
 	return true;
 }
 
@@ -3569,6 +3602,7 @@ bool TextureCache::InvalidateLocked(uint64_t address, uint64_t size) {
 	for (const auto id: image_ids) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
+			TraceTextureBacking("cpu-write", id, owner, address, size, m_gc_tick);
 			if (TryInvalidatePartial(owner, address, size, PartialDirtyGranule)) {
 				continue;
 			}
@@ -3683,16 +3717,26 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+bool TextureCache::MayOverlapRegisteredImages(uint64_t address, uint64_t size) const noexcept {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return HasPartialCandidates();
+	}
+	return m_registered_pages.Any(pages.first, pages.last_exclusive);
+}
+
 void TextureCache::MapMemory(uint64_t address, uint64_t size) {
 	Common::ScopedLock lock {m_lock};
 	Common::SmallVector<ImageId, 8> mapped_images;
 	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
-		if (image.partial_candidate && image.Overlaps(address, size)) {
+		const bool guest_texture = image.info.IsBlock() && !image.IsGpuModified() && !IsTargetImage(image);
+		if ((image.partial_candidate || guest_texture) && image.Overlaps(address, size)) {
 			mapped_images.push_back(id);
 		}
 	});
 	for (const auto id: mapped_images) {
 		auto& owner = m_slot_images[id];
+		TraceTextureBacking("map", id, owner, address, size, m_gc_tick);
 		if (TryInvalidatePartial(owner, address, size, TRACKER_PAGE_SIZE)) {
 			continue;
 		}

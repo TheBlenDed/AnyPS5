@@ -355,7 +355,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
 		m_bda_mapped_since_sync.emplace_back(vaddr, size);
 	}
-	if (m_texture_cache.HasPartialCandidates()) {
+	if (m_texture_cache.MayOverlapRegisteredImages(vaddr, size)) {
 		const auto map = [this, vaddr, size] { m_texture_cache.MapMemory(vaddr, size); };
 		if (m_gpu == nullptr || m_gpu->IsStopping()) {
 			map();

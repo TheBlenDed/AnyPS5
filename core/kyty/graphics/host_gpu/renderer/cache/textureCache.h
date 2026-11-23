@@ -104,6 +104,7 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void MapMemory(uint64_t address, uint64_t size);
+	[[nodiscard]] bool MayOverlapRegisteredImages(uint64_t address, uint64_t size) const noexcept;
 	[[nodiscard]] bool HasPartialCandidates() const noexcept {
 		return m_partial_candidates.load(std::memory_order_relaxed) != 0;
 	}
