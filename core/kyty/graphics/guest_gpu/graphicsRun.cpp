@@ -459,6 +459,12 @@ void GuestGpu::ExecutionThread() {
 	BdaDirtyRegions::g_translating = true;
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
+#if defined(ANYPS5_KYTY)
+	const auto* wake_mode = std::getenv("KYTY_NOTIFY_EXECUTION_AT_TARGET");
+	const bool  notify_at_target = wake_mode != nullptr && wake_mode[0] == '1' && wake_mode[1] == '\0';
+#else
+	constexpr bool notify_at_target = false;
+#endif
 	auto&              operations     = m_resolving ? m_resolved : m_operations;
 	for (;;) {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
@@ -487,14 +493,18 @@ void GuestGpu::ExecutionThread() {
 		operation->processor->Execute(*operation);
 		const auto sequence = operation->sequence;
 		operation.reset();
-		m_executed.Publish(sequence);
+		if (notify_at_target) {
+			m_executed.Advance(sequence);
+		} else {
+			m_executed.Publish(sequence);
+		}
 		if ((sequence & 1023u) == 0) {
 			BufferCache::LogReadbackSummary();
 #if defined(ANYPS5_KYTY)
 			CommandProcessor::LogLabelSummary();
 #endif
 		}
-		if (++unnotified >= NotifyInterval) {
+		if (!notify_at_target && ++unnotified >= NotifyInterval) {
 			m_executed.Notify();
 			unnotified = 0;
 		}
