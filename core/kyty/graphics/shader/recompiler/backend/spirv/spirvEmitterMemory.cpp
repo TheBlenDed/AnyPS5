@@ -321,46 +321,21 @@ std::pair<uint32_t, uint32_t> LoadBdaCrossingDwords(ValueEmitContext& ctx, uint3
 	    state, spv::OpLogicalAnd, boolean, crosses,
 	    Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, low, last_dword),
 	           last_dword));
-	const auto same_page = Binary(state, spv::OpLogicalAnd, boolean, crosses,
-	                              Unary(state, spv::OpLogicalNot, boolean, next_page));
-	const auto preheader = state.current_label;
-	const auto header    = state.builder.AllocateId();
-	const auto body      = state.builder.AllocateId();
-	const auto latch     = state.builder.AllocateId();
-	const auto merge     = state.builder.AllocateId();
-	const auto pass      = state.builder.AllocateId();
-	const auto kept      = state.builder.AllocateId();
-	const auto first     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBranch, header);
-	EmitLabel(state, header);
-	state.builder.AddFunction(spv::OpPhi, boolean, pass, ConstantBool(state, false), preheader,
-	                          ConstantBool(state, true), latch);
-	state.builder.AddFunction(spv::OpPhi, u32, kept, ConstantU32(state, 0), preheader, first, latch);
-	state.builder.AddFunction(spv::OpLoopMerge, merge, latch, spv::LoopControlMaskNone);
-	state.builder.AddFunction(spv::OpBranch, body);
-	EmitLabel(state, body);
-	const auto zero    = ConstantU64(state, 0);
-	const auto step    = Select(state, u64, pass, ConstantU64(state, sizeof(uint32_t)), zero);
-	const auto bda     = GetBdaPointer(state, Binary(state, spv::OpIAdd, u64, aligned, step));
-	const auto at      = LoadBdaPointerDword(ctx, bda, coherent, MissingBdaDword(state));
-	const auto next_at = Select(
-	    state, u64,
-	    Binary(state, spv::OpLogicalAnd, boolean, same_page,
-	           Binary(state, spv::OpINotEqual, boolean, bda, zero)),
-	    Binary(state, spv::OpIAdd, u64, bda, ConstantU64(state, sizeof(uint32_t))), zero);
-	const auto missing_next =
-	    state.program.info.bvh
-	        ? Select(state, u32, same_page, MissingBdaDword(state), ConstantU32(state, 0))
-	        : ConstantU32(state, 0);
-	const auto following = LoadBdaPointerDword(ctx, next_at, coherent, missing_next);
-	state.builder.AddFunction(spv::OpCopyObject, u32, first, Select(state, u32, pass, kept, at));
-	const auto second = Select(state, u32, pass, at, following);
-	state.builder.AddFunction(spv::OpBranch, latch);
-	EmitLabel(state, latch);
-	const auto again = Binary(state, spv::OpLogicalAnd, boolean, next_page,
-	                          Unary(state, spv::OpLogicalNot, boolean, pass));
-	state.builder.AddFunction(spv::OpBranchConditional, again, header, merge);
-	EmitLabel(state, merge);
+	const auto zero = ConstantU64(state, 0);
+	const auto step = ConstantU64(state, sizeof(uint32_t));
+	const auto bda = GetBdaPointer(state, aligned);
+	const auto missing = MissingBdaDword(state);
+	const auto first = LoadBdaPointerDword(ctx, bda, coherent, missing);
+	const auto adjacent = Select(state, u64, Binary(state, spv::OpINotEqual, boolean, bda, zero),
+	                             Binary(state, spv::OpIAdd, u64, bda, step), zero);
+	const auto next_bda = EmitValueOrDefaultIfCondition(state, next_page, u64, adjacent, [&] {
+		return GetBdaPointer(state, Binary(state, spv::OpIAdd, u64, aligned, step));
+	});
+	const auto missing_next = state.program.info.bvh
+	                              ? Select(state, u32, crosses, missing, ConstantU32(state, 0))
+	                              : ConstantU32(state, 0);
+	const auto second = LoadBdaPointerDword(ctx, Select(state, u64, crosses, next_bda, zero), coherent,
+	                                        missing_next);
 	return {first, second};
 }
 
@@ -443,12 +418,13 @@ const EmitterState::IndirectBufferReadGroups* GroupIndirectBufferReads(EmitterSt
 		const auto* value = std::getenv("KYTY_GROUP_INDIRECT_BUFFER_LOADS");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
-	if (!enabled || state.program.table_mode || state.program.stage != ShaderType::Compute) return nullptr;
+	if (state.program.table_mode || state.program.stage != ShaderType::Compute) return nullptr;
+	const auto& buffers = state.program.info.buffers;
+	const auto& root = buffers[resource];
+	if (!enabled && root.indirect_group_offset == UINT32_MAX) return nullptr;
 	auto [it, fresh] = state.indirect_buffer_read_groups.try_emplace(resource);
 	auto& groups = it->second;
 	if (!fresh) return groups.lookup != 0u ? &groups : nullptr;
-	const auto& buffers = state.program.info.buffers;
-	const auto& root = buffers[resource];
 	if (!root.read || root.written || root.atomic || !root.formatted || root.packed_stride != 0u ||
 	    root.indirect_resources.size() < 3u || root.indirect_resources.front() != resource) {
 		return nullptr;
@@ -477,6 +453,11 @@ const EmitterState::IndirectBufferReadGroups* GroupIndirectBufferReads(EmitterSt
 		if (match == groups.representatives.end()) groups.representatives.push_back(index);
 	}
 	if (groups.representatives.size() >= ordinals.size() - 1u) return nullptr;
+	if (root.indirect_group_offset != UINT32_MAX) {
+		EXIT_IF(state.flattened_srt_variable == 0);
+		groups.lookup = state.flattened_srt_variable;
+		return &groups;
+	}
 	const auto type = TypeU32(state);
 	const auto array_type = state.builder.Type(
 	    spv::OpTypeArray, type, ConstantU32(state, static_cast<uint32_t>(ordinals.size())));
@@ -519,16 +500,23 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	if constexpr (has_result) {
 		if (!shared && mem.formatted && !mem.typed) groups = GroupIndirectBufferReads(state, root_resource);
 	}
+	EXIT_IF(buffer.indirect_group_offset != UINT32_MAX && groups == nullptr);
 	const auto empty_root = (shared || groups != nullptr) && buffer.packed_stride == 0u;
 	const auto selected_access = [&]() {
 		if constexpr (has_result) {
 			if (groups != nullptr) {
 				const auto type = TypeU32(state);
-				const auto ptr = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, type),
-				                          ptr, groups->lookup, selected);
-				const auto group = state.builder.AllocateId();
-				state.builder.AddFunction(spv::OpLoad, type, group, ptr);
+				uint32_t group = 0;
+				if (buffer.indirect_group_offset != UINT32_MAX) {
+					const auto offset = EmitAddU32(state, selected, ConstantU32(state, buffer.indirect_group_offset));
+					group = LoadFlattenedSrt(state, offset);
+				} else {
+					const auto ptr = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassPrivate, type),
+					                          ptr, groups->lookup, selected);
+					group = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpLoad, type, group, ptr);
+				}
 				const auto ordinal = Binary(state, spv::OpISub, type, selected, ConstantU32(state, 1u));
 				const auto slot = EmitAddU32(state, ordinal, ConstantU32(state, groups->first_slot));
 				return EmitIndexSwitch(state, group, static_cast<uint32_t>(groups->representatives.size()),
@@ -1285,14 +1273,42 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	                                  ConstantU32(state, 0));
 	const auto base         = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
 	                                 ConstantU64(state, ~uint64_t {3}));
+	const bool vector_bounds = bits == 32u && components >= 3u;
+	uint32_t enabled = 0, limit = 0;
+	if (vector_bounds) {
+		const auto u32 = TypeU32(state), boolean = TypeBool(state);
+		const auto zero = ConstantU32(state, 0), word = ConstantU32(state, 4u);
+		const auto structured = Binary(state, spv::OpIEqual, boolean, buffer.mode, zero);
+		const auto raw = Binary(state, spv::OpIEqual, boolean, buffer.mode, ConstantU32(state, 3u));
+		const auto record_mode = Binary(state, spv::OpIEqual, boolean, buffer.mode, ConstantU32(state, 2u));
+		const auto size = Select(state, u32, buffer.swizzle, buffer.stride, buffer.raw_records);
+		const auto raw_valid = AndCondition(state, buffer.scalar_in_bounds,
+		    AndCondition(state, Binary(state, spv::OpUGreaterThanEqual, boolean, size, word),
+		                 Select(state, boolean, buffer.swizzle, buffer.raw_index_in_bounds, ConstantBool(state, true))));
+		const auto structured_valid = AndCondition(state, buffer.index_in_bounds,
+		    Binary(state, spv::OpINotEqual, boolean, buffer.stride, zero));
+		const auto other_valid = Select(state, boolean, record_mode,
+		    Binary(state, spv::OpINotEqual, boolean, buffer.records, zero), buffer.index_in_bounds);
+		enabled = AndCondition(state, valid_format, Select(state, boolean, raw, raw_valid,
+		                   Select(state, boolean, structured, structured_valid, other_valid)));
+		limit = Select(state, u32, raw, Binary(state, spv::OpISub, u32, size, word),
+		    Select(state, u32, structured, Binary(state, spv::OpISub, u32, buffer.stride, ConstantU32(state, 1u)),
+		           ConstantU32(state, UINT32_MAX)));
+	}
 	std::array<uint32_t, 4> values {};
 	for (uint32_t component = 0; component < components; ++component) {
 		const auto address = component == 0u ? base
 		                                     : Binary(state, spv::OpIAdd, TypeU64(state), base,
 		                                              ConstantU64(state, component * 4u));
-		const auto condition = AndCondition(state, valid_format,
-		                                    IndirectBufferInBounds(state, buffer, component * 4u,
-		                                                           ConstantU32(state, bits / 8u), false));
+		uint32_t condition;
+		if (vector_bounds) {
+			const auto offset = component == 0u ? buffer.offset : Binary(state, spv::OpIAdd,
+			    TypeU32(state), buffer.offset, ConstantU32(state, component * 4u));
+			condition = AndCondition(state, enabled, Binary(state, spv::OpULessThanEqual, TypeBool(state), offset, limit));
+		} else {
+			condition = AndCondition(state, valid_format, IndirectBufferInBounds(
+			    state, buffer, component * 4u, ConstantU32(state, bits / 8u), false));
+		}
 		const auto finish = [&](uint32_t value) {
 			if (bits == 32u) return value;
 			const auto byte = Binary(

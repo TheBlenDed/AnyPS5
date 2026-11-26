@@ -223,6 +223,7 @@ The table draws are GPU-driven draws of a shader pair's table programs.
 | `KYTY_NOTIFY_EXECUTION_AT_TARGET` | `1` | off | Publish and notify after each retired execution operation to measure CPU waits on completed sequence numbers. The default batches notifications. | perf | all | AnyKyty |
 | `KYTY_TEXTURE_BACKING_TRACE` | guest address in hex | off | Trace page mapping, image upload and image cache events for a texture backing address. | debug | all | AnyKyty |
 | `KYTY_CAPTURE_COMPUTE_SHADER` | guest shader hash in hex | off | Save up to eight exact Compute modules and log their buffer specialization. | debug | all | AnyKyty |
+| `KYTY_RUNTIME_INDIRECT_READ_GROUPS` | `1` | off | For eligible formatted read-only Compute buffers, put the slot-to-group map in the dispatch's flattened SRT. Requires `KYTY_GROUP_INDIRECT_BUFFER_LOADS=1`. | perf | all | AnyKyty |
 | `KYTY_FAST_COMPUTE_MODULES` | comma-separated module IDs in hex | off | Select exact modules for the reduced-optimization Compute creation attempt. | perf | all | AnyKyty |
 | `KYTY_PIXEL_HISTORY_REPEAT` | `1` | off | Accept repeated pixel-history requests from the monitor, including the capture rectangle. | debug | all | AnyKyty |
 | `KYTY_PIXEL_HISTORY_CAPTURE_ALPHA_MIPS` | `1` | off | Save two compressed mip levels of the sampled BC3 texture on a marked draw. | debug | all | AnyKyty |

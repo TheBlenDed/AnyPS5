@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/host_gpu/renderer/cxCompat.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
@@ -9,6 +10,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "graphics/host_gpu/renderer/focusedGraphicsTiming.h"
 #include "common/file.h"
 #include "common/leverStats.h"
 #include "common/logging/log.h"
@@ -2547,7 +2549,40 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	}
 #endif
-	buffer.BeginRendering(rendering);
+	const auto* pixel_module = state.ps_input_info.stage.module;
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+	if (FrameCapture::Get().Enabled()) {
+		const auto stages = state.VertexStages();
+		const auto* vs = stages.empty() ? nullptr : stages.back().stage.module;
+		const auto& targets = *m_draw_targets;
+		uint64_t color = 0;
+		for (uint32_t i = 0; i < targets.color_count; ++i) {
+			if (targets.colors[i].target_slot == 0) color = targets.colors[i].desc.info.data.address;
+		}
+		FrameCapture::Get().Record({1, m_context.FlipNumber(), m_context.GetCommandScheduler().CurrentTick(),
+		    vs ? vs->info.shader_hash : 0, pixel_module ? pixel_module->info.shader_hash : 0,
+		    index_source.address, draw.index_count, draw.instance_count, static_cast<uint64_t>(state.topology),
+		    color, targets.depth.desc.info.data.address, emit.indirect.address,
+		    vertex_bindings.count ? state.vertex_info[0].buffers[0].addr : 0,
+		    vertex_bindings.count ? vertex_bindings.sizes[0] : 0, mesh_active, index_source.guest_element_size});
+	}
+#endif
+	buffer.BeginRendering(rendering, pixel_module != nullptr ? pixel_module->info.shader_hash : 0);
+#if defined(ANYPS5_KYTY)
+	if (auto* sample = current_graphics_sample) {
+		const bool plain = state.ps_plain && pixel_module && pixel_module->plain;
+		const auto* chosen = plain ? pixel_module->plain.get() : pixel_module;
+		FocusDrawState detail {chosen ? chosen->id : 0, plain, static_cast<uint32_t>(state.topology), {}};
+		for (size_t i = 0; i < vertex_stages.size(); ++i) {
+			const auto* module = vertex_stages[i].stage.module;
+			detail.vertex_hashes[i] = module ? module->info.shader_hash : 0;
+		}
+		if (sample->draws++ == 0) sample->state = detail;
+		else if (sample->state != detail) sample->mixed_state = true;
+		if (args_buffer.first != nullptr || mesh_active) ++sample->indirect_or_mesh_draws;
+		else sample->direct_input_elements += uint64_t {draw.index_count} * draw.instance_count;
+	}
+#endif
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);

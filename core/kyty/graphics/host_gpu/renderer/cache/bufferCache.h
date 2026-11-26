@@ -266,7 +266,7 @@ public:
 	void RequestFlushForReadbacks() noexcept {
 		if ((m_device_address_hot != 0 &&
 		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
-		    m_mirror_uses - m_mirror_flush_use < MirrorFlushLifetime) {
+		    (!m_mirror_lines.empty() && m_mirror_uses - m_mirror_flush_use < MirrorFlushLifetime)) {
 			m_flush_requested = true;
 		}
 	}
@@ -485,9 +485,9 @@ private:
 	};
 	ReadbackQueue m_readback;
 	struct ReadbackQueueSlot {
-		ReadbackQueue     queue;
-		vk::Buffer        source = nullptr;
-		bool              many = false;
+		ReadbackQueue           queue;
+		vk::Buffer              source = nullptr;
+		std::vector<vk::Buffer> follower_sources;
 		std::atomic<bool> busy {false};
 	};
 	std::array<ReadbackQueueSlot, 4> m_readback_slots;

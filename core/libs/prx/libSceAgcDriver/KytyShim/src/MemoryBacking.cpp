@@ -541,9 +541,24 @@ uint64_t UnreportedMappedPrefix(uint64_t start, uint64_t end) {
 bool AnyUnreportedMapped(uint64_t start, uint64_t end) {
 	const auto& state = State();
 	end = std::min(end, state.arena_end);
+#ifdef _WIN32
+	for (auto cursor = std::max(start, state.arena_start); cursor < end;) {
+		MEMORY_BASIC_INFORMATION memory {};
+		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &memory, sizeof(memory)) == sizeof(memory)) {
+			if (HostReadable(memory)) return true;
+			const auto next = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+			if (next > cursor) {
+				cursor = next;
+				continue;
+			}
+		}
+		cursor = (cursor | HostPageMask) + 1u;
+	}
+#else
 	for (auto cursor = std::max(start, state.arena_start); cursor < end; cursor = (cursor | HostPageMask) + 1u) {
 		if (ReadablePrefix(cursor, end) != 0) return true;
 	}
+#endif
 	return false;
 }
 
@@ -772,10 +787,19 @@ bool InGuestSpace(uint64_t vaddr, uint64_t size) {
 bool OverlapsPrivate(uint64_t vaddr, uint64_t size) {
 	const auto& pages = Pages();
 	const auto end = vaddr + size;
-	for (auto page = vaddr & ~PageMask; page < end; page += PageSize) {
+	const auto host_start = vaddr & ~HostPageMask;
+	const auto host_end = (end + HostPageMask) & ~HostPageMask;
+	for (auto page = vaddr & ~PageMask; page < end;) {
 		const auto entry = pages.Load(page >> PageBits);
 		if (entry == PrivateEntry) return true;
-		if (entry == 0 && AnyUnreportedMapped(std::max(page, vaddr & ~HostPageMask), std::min(page + PageSize, (end + HostPageMask) & ~HostPageMask))) return true;
+		auto next = page + PageSize;
+		if (entry == 0) {
+#ifdef _WIN32
+			while (next < end && pages.Load(next >> PageBits) == 0) next += PageSize;
+#endif
+			if (AnyUnreportedMapped(std::max(page, host_start), std::min(next, host_end))) return true;
+		}
+		page = next;
 	}
 	return false;
 }

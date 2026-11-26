@@ -247,6 +247,13 @@ struct ProgramResolution {
 			return false;
 		}
 		refreshed_words = reads.HasDescriptorRefresh();
+		if (refreshed_words) {
+			for (const auto& stage: std::span(specializations).first(stages)) {
+				for (const auto& buffer: stage.buffers) {
+					if (buffer.indirect_group_offset != UINT32_MAX) return false;
+				}
+			}
+		}
 		reads.RefreshDescriptorWords(std::span(resources).first(stages), std::span(plans).first(stages));
 		reads.RefreshFlatLoads(std::span(resources).first(stages), gpu_flat_loads, program);
 		return true;

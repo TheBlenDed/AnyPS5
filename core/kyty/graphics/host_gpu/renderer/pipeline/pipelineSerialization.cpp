@@ -424,8 +424,11 @@ void PipelineCache::StoreLayout(uint64_t key, const ShaderTessellationInputInfo&
 	m_store.Append(std::move(record.bytes));
 }
 
+static constexpr std::array<uint8_t, 8> ComputeModuleMagic {'K', 'y', 't', 'y', 'C', 'S', '0', '2'};
+
 std::vector<uint8_t> EncodeComputeModule(const ShaderModule& module, const std::vector<uint32_t>& spirv) {
 	Writer record;
+	record.Raw(ComputeModuleMagic.data(), ComputeModuleMagic.size());
 	IoStoreModuleInfo(record, module);
 	IoAll(record, spirv);
 	return std::move(record.bytes);
@@ -434,6 +437,10 @@ std::vector<uint8_t> EncodeComputeModule(const ShaderModule& module, const std::
 bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
                          std::vector<uint32_t>& spirv) {
 	Reader reader {bytes};
+	const auto versioned = bytes.size() >= ComputeModuleMagic.size() &&
+	                       std::ranges::equal(bytes.first(ComputeModuleMagic.size()), ComputeModuleMagic);
+	reader.buffer_has_indirect_group_offset = versioned;
+	if (versioned) reader.bytes = reader.bytes.subspan(ComputeModuleMagic.size());
 	IoStoreModuleInfo(reader, module);
 	IoAll(reader, spirv);
 	module.spirv_words = static_cast<uint32_t>(spirv.size());

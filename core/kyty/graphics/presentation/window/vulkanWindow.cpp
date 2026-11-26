@@ -1,6 +1,11 @@
 #include "common/assert.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/queueCheckpoints.h"
+#endif
+
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "graphics/host_gpu/renderer/focusedGraphicsTiming.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -409,6 +414,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		if (available) device_extensions.push_back(name);
 		return available;
 	};
+#if defined(ANYPS5_KYTY)
+	if (QueueCheckpoints::Requested()) {
+		const bool available = add(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		std::fprintf(stderr, "[kyty-checkpoints] extension=%s\n", available ? "enabled" : "unavailable");
+	}
+#endif
 	vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features,
 	                   vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceRobustness2FeaturesEXT,
 	                   vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
@@ -650,6 +661,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
+#if defined(ANYPS5_KYTY)
+	device_features.pipelineStatisticsQuery = FocusPixelShader() != 0 && supported2.features.pipelineStatisticsQuery;
+#endif
 	device_features.drawIndirectFirstInstance            = VK_TRUE;
 	device_features.multiDrawIndirect                    = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;

@@ -79,6 +79,7 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 
 bool SaveResourcePlan(const ResourcePlan& plan, std::vector<uint8_t>& bytes, EncodeFailure& failure) {
 	Writer writer;
+	writer.buffer_has_indirect_group_offset = false;
 	IoPlan(writer, plan);
 	failure = writer.failure;
 	if (failure.Failed()) {
@@ -91,6 +92,7 @@ bool SaveResourcePlan(const ResourcePlan& plan, std::vector<uint8_t>& bytes, Enc
 
 bool DecodeResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {
 	Reader reader {bytes};
+	reader.buffer_has_indirect_group_offset = false;
 	IoPlan(reader, plan);
 	return reader.ok && reader.bytes.empty();
 }

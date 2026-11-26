@@ -57,8 +57,11 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
-void CommandBuffer::BeginRendering(const RenderState& state) const {
+void CommandBuffer::BeginRendering(const RenderState& state, [[maybe_unused]] uint64_t pixel_shader) const {
 	if (m_rendering && m_render_state == state) {
+#if defined(ANYPS5_KYTY)
+		m_scheduler.NoteGraphicsTimingShader(m_render_timing, pixel_shader);
+#endif
 		return;
 	}
 	EndRendering();
@@ -97,6 +100,9 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	const auto recorder = Handle();
+#if defined(ANYPS5_KYTY)
+	m_render_timing = m_scheduler.BeginGraphicsTiming(state, pixel_shader);
+#endif
 	recorder.beginRendering(rendering);
 	m_render_state = state;
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
@@ -110,6 +116,9 @@ void CommandBuffer::EndRendering() const {
 		const auto recorder = Handle();
 		m_context.GetOcclusionQueries().OnEndRendering(recorder);
 		recorder.endRendering();
+#if defined(ANYPS5_KYTY)
+		m_scheduler.EndPassTiming(m_render_timing);
+#endif
 		m_rendering = false;
 	}
 	if (m_pending_shader_writes) {

@@ -34,7 +34,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -43,6 +45,28 @@
 #include <vector>
 
 namespace Libs::Graphics {
+#if defined(ANYPS5_KYTY)
+static bool TraceComputeInputs(uint64_t shader) {
+	static const auto selected = [] {
+		std::vector<uint64_t> hashes;
+		const char* value = std::getenv("KYTY_TRACE_COMPUTE_INPUTS");
+		std::string_view list(value ? value : "");
+		while (!list.empty()) {
+			const auto end = list.find(',');
+			const auto field = list.substr(0, end);
+			uint64_t hash = 0;
+			const auto parsed = std::from_chars(field.data(), field.data() + field.size(), hash, 16);
+			if (parsed.ec != std::errc{} || parsed.ptr != field.data() + field.size()) return std::vector<uint64_t>{};
+			hashes.push_back(hash);
+			if (end == list.npos) break;
+			list.remove_prefix(end + 1);
+		}
+		return hashes;
+	}();
+	return std::find(selected.begin(), selected.end(), shader) != selected.end();
+}
+#endif
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -664,8 +688,14 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 		                                   std::max(input_info.threads_num[1], 1u) *
 		                                   std::max(input_info.threads_num[2], 1u);
-		if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
-		    group_threads <= input_info.wave_size && !input_info.lds_storage) {
+		const bool ordered = (mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
+		                     group_threads <= input_info.wave_size && !input_info.lds_storage;
+#if defined(ANYPS5_KYTY)
+		const auto timing = rt_pass == 0 ? m_context.GetCommandScheduler().BeginComputeTiming(
+		    program.shader_hash, input_info.stage.module->id, ordered ? "ordered" : "direct",
+		    thread_group_x, thread_group_y, thread_group_z) : 0;
+#endif
+		if (ordered) {
 			for (uint32_t z = 0; z < thread_group_z; ++z) {
 				for (uint32_t y = 0; y < thread_group_y; ++y) {
 					for (uint32_t x = 0; x < thread_group_x; ++x) {
@@ -679,6 +709,33 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		} else {
 			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		}
+#if defined(ANYPS5_KYTY)
+		m_context.GetCommandScheduler().EndPassTiming(timing);
+		if (timing && TraceComputeInputs(program.shader_hash)) {
+			std::string metadata;
+			for (auto value: cs_regs.cs_user_sgpr.value) {
+				metadata += fmt::format(" {:08x}", value);
+			}
+			metadata += " buffers=";
+			for (size_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); ++i) {
+				const auto desc = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				metadata += fmt::format("{}:{:x}:{}:{},", i, desc.Base48(), desc.GetSize(),
+				                        program.info.buffers[i].written ? "rw" : "r");
+			}
+			metadata += " images=";
+			for (size_t i = 0; i < program.info.images.size() && i < resources.images.size(); ++i) {
+				const auto desc = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+				metadata += fmt::format("{}:{:x}:{},", i, desc.Base40(), program.info.images[i].written ? "rw" : "r");
+			}
+			std::fprintf(stderr, "[kyty-compute-inputs] frame=%" PRIu64 " tick=%" PRIu64
+			             " token=%u queue=%u async=%u mode=%x shader=%016" PRIx64 " module=%016" PRIx64
+			             " code=%" PRIx64 " groups=%ux%ux%u dma=%u sgpr=%s\n",
+			             uint64_t(m_context.FlipNumber()), uint64_t(m_context.GetCommandScheduler().CurrentTick()),
+			             timing, m_guest_queue, unsigned(async_compute), mode, uint64_t(program.shader_hash),
+			             uint64_t(input_info.stage.module->id), uint64_t(cs_regs.cs_regs.data_addr), thread_group_x,
+			             thread_group_y, thread_group_z, unsigned(program.info.uses_dma), metadata.c_str());
+		}
+#endif
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 		if (rt_pass == 1) {
 			RtCheck().AfterOracle(bindings, counted);
@@ -927,7 +984,14 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+	const auto timing = m_context.GetCommandScheduler().BeginComputeTiming(
+	    program.shader_hash, input_info.stage.module->id, "indirect-scratch");
+#endif
 	vk_buffer.dispatchIndirect(stream.Handle(), scratch_offset);
+#if defined(ANYPS5_KYTY)
+	m_context.GetCommandScheduler().EndPassTiming(timing);
+#endif
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }
@@ -1032,7 +1096,16 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			                          1, &barrier, 0, nullptr, 0, nullptr);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+		const auto timing = rt_pass == 0
+		                        ? m_context.GetCommandScheduler().BeginComputeTiming(
+		                              program.shader_hash, input_info.stage.module->id, "indirect")
+		                        : 0;
+#endif
 		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+#if defined(ANYPS5_KYTY)
+		m_context.GetCommandScheduler().EndPassTiming(timing);
+#endif
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 		if (rt_pass == 1) {
 			RtCheck().AfterOracle(bindings, counted);

@@ -2416,6 +2416,94 @@ bool EmptyBuffersServe(const ResourcePlan& program, const ResourceSnapshot& snap
 }
 #endif
 
+#if defined(ANYPS5_KYTY)
+static void MaterializeIndirectReadGroups(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                          ResourceSpecialization& specialization) {
+	static const bool enabled = [] {
+		const auto* runtime = std::getenv("KYTY_RUNTIME_INDIRECT_READ_GROUPS");
+		const auto* grouped = std::getenv("KYTY_GROUP_INDIRECT_BUFFER_LOADS");
+		return runtime != nullptr && std::string_view(runtime) == "1" &&
+		       grouped != nullptr && std::string_view(grouped) == "1";
+	}();
+	if (!enabled || program.stage != ShaderType::Compute) {
+		return;
+	}
+	auto& buffers = specialization.buffers;
+	const auto original_count = program.info.buffers.size();
+	const auto shape = [](const ResourceSpecialization::Buffer& buffer) {
+		return std::tuple {buffer.packed_stride, buffer.descriptor_format, buffer.descriptor_swizzle};
+	};
+	for (uint32_t index = 0; index < original_count; ++index) {
+		const auto& info = program.info.buffers[index];
+		auto& root = buffers[index];
+		if (root.indirect_root != index || root.packed_stride != 0u || !info.read || !info.formatted ||
+		    info.written || info.atomic || info.scalar) {
+			continue;
+		}
+		const auto* source = Source(program, info.source);
+		if (source == nullptr || !source->indirect_descriptor) {
+			continue;
+		}
+		bool formatted_read = false;
+		bool unsupported_use = false;
+		for (const auto& memory: program.memory_info) {
+			if (memory.planning_only || memory.resource != index) {
+				continue;
+			}
+			if (memory.kind == ResourceKind::Buffer) {
+				formatted_read |= memory.formatted && !memory.typed;
+				unsupported_use |= !memory.formatted || memory.typed;
+			} else if (memory.kind == ResourceKind::ScalarBuffer || memory.kind == ResourceKind::IndirectBuffer) {
+				unsupported_use = true;
+			}
+		}
+		if (!formatted_read || unsupported_use) {
+			continue;
+		}
+		std::vector<uint32_t> children;
+		for (uint32_t child = 0; child < buffers.size(); ++child) {
+			if (child != index && buffers[child].indirect_root == index) {
+				children.push_back(child);
+			}
+		}
+		if (children.size() < 3 || snapshot.flattened_srt.size() >= UINT32_MAX - children.size() - 1u ||
+		    children.front() < original_count ||
+		    children.back() - children.front() + 1u != children.size()) {
+			continue;
+		}
+		if (std::ranges::any_of(children, [&](uint32_t child) {
+			const auto& candidate = buffers[child];
+			return candidate.packed_stride == 0u || HasRuntimeStride(candidate.packed_stride) ||
+			       candidate.scalar_empty || candidate.zero_stride_oob;
+		})) {
+			continue;
+		}
+		std::vector<decltype(shape(root))> canonical;
+		canonical.reserve(children.size());
+		for (const auto child: children) {
+			canonical.push_back(shape(buffers[child]));
+		}
+		std::ranges::sort(canonical);
+		const auto duplicates = std::ranges::unique(canonical);
+		canonical.erase(duplicates.begin(), duplicates.end());
+		if (canonical.size() <= 1 || canonical.size() == children.size()) {
+			continue;
+		}
+		root.indirect_group_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		snapshot.flattened_srt.push_back(0u);
+		for (const auto child: children) {
+			const auto group = std::ranges::lower_bound(canonical, shape(buffers[child]));
+			snapshot.flattened_srt.push_back(static_cast<uint32_t>(group - canonical.begin()));
+		}
+		for (size_t ordinal = 0; ordinal < children.size(); ++ordinal) {
+			auto& buffer = buffers[children[ordinal]];
+			std::tie(buffer.packed_stride, buffer.descriptor_format, buffer.descriptor_swizzle) =
+			    ordinal < canonical.size() ? canonical[ordinal] : canonical.front();
+		}
+	}
+}
+#endif
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 #if defined(ANYPS5_KYTY)
@@ -2691,7 +2779,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 #endif
 	FlushRecordBlocks(snapshot.flattened_srt);
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	if (!BuildResourceSpecialization(program, snapshot, specialization)) {
+		return false;
+	}
+#if defined(ANYPS5_KYTY)
+	MaterializeIndirectReadGroups(program, snapshot, specialization);
+#endif
+	return true;
 }
 
 bool SpecializeDirectResources(const ResourcePlan& program, ResourceSnapshot& snapshot,
@@ -2890,6 +2984,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
+		buffer.indirect_group_offset      = source.indirect_group_offset;
 		buffer.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < buffers.size(); ++index) {

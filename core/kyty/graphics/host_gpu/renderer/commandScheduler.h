@@ -82,6 +82,14 @@ public:
 		m_submit_hook      = hook;
 		m_submit_hook_data = userdata;
 	}
+#if defined(ANYPS5_KYTY)
+	[[nodiscard]] uint32_t BeginGraphicsTiming(const RenderState& state, uint64_t pixel_shader);
+	void NoteGraphicsTimingShader(uint32_t token, uint64_t pixel_shader);
+	[[nodiscard]] uint32_t BeginComputeTiming(uint64_t shader, uint64_t module, const char* dispatch,
+	                                          uint32_t groups_x = 0, uint32_t groups_y = 0, uint32_t groups_z = 0);
+	[[nodiscard]] uint32_t BeginPassTiming(uint64_t shader, const char* kind);
+	void EndPassTiming(uint32_t token);
+#endif
 
 private:
 	void QueueOperation(Common::UniqueFunction<void>&& operation);
@@ -176,6 +184,8 @@ private:
 	SubmitHook                     m_submit_hook      = nullptr;
 	void*                          m_submit_hook_data = nullptr;
 #if defined(ANYPS5_KYTY)
+	class PassTiming;
+	std::unique_ptr<PassTiming> m_pass_timing;
 	Common::AnnotatedMutex      m_flip_mutex;
 	std::condition_variable_any m_flip_changed;
 	std::deque<FlipCompletion>  m_flip_completions KYTY_GUARDED_BY(m_flip_mutex);

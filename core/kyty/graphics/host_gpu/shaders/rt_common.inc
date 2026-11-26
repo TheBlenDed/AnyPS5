@@ -90,8 +90,7 @@ uvec4 LoadNodeU32x4(uint64_t host, uint offset) {
 	return host == 0 ? uvec4(0) : U32x4Ref(host + offset).v;
 }
 
-BoxNode LoadBoxNode(uint64_t base, uint node) {
-	const uint64_t host = HostAddress(NodeAddress(base, node));
+BoxNode LoadBoxNodeFromHost(uint64_t host, uint node) {
 	BoxNode        box;
 	const uvec4    first = LoadNodeU32x4(host, 0);
 	box.children[0] = first.x;
@@ -125,6 +124,10 @@ BoxNode LoadBoxNode(uint64_t base, uint node) {
 		}
 	}
 	return box;
+}
+
+BoxNode LoadBoxNode(uint64_t base, uint node) {
+	return LoadBoxNodeFromHost(HostAddress(NodeAddress(base, node)), node);
 }
 
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer RtState {

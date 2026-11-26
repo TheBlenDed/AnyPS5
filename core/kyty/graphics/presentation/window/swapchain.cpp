@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/UpscaleMode.hpp"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/frameCapture.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
@@ -173,6 +174,7 @@ private:
 #endif
 
 struct Presenter::Frame {
+	uint32_t capture_token = 0;
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
@@ -1469,8 +1471,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const bool filter_source   = upscaled || native_rcas || native_cmaa2;
 	const bool blit_source     = source != nullptr && !convert_source && !filter_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
-	const bool draw_attachment =
-	    convert_source || draw_overlay || draw_system_overlay || filter_source;
+	const bool tagged = source != nullptr && source->capture_token != 0 && m_extent.width >= 98 && m_extent.height >= 8;
+	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay || filter_source || tagged;
 	if (blit_source) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
@@ -1600,6 +1602,34 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		if (draw_system_overlay) {
 			m_system_overlay->Record(vk_command.Direct(), m_image_views[m_image_index]);
 		}
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+		if (tagged) {
+			if (convert_source || draw_overlay || draw_system_overlay || filter_source) attachment_barrier();
+			vk::RenderingAttachmentInfo attachment {};
+			attachment.imageView = m_image_views[m_image_index];
+			attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+			attachment.loadOp = vk::AttachmentLoadOp::eClear;
+			attachment.storeOp = vk::AttachmentStoreOp::eStore;
+			attachment.clearValue.color.float32[3] = 1.0f;
+			vk::RenderingInfo tag {};
+			tag.renderArea = vk::Rect2D{{2,2},{96,6}};
+			tag.layerCount = tag.colorAttachmentCount = 1;
+			tag.pColorAttachments = &attachment;
+			auto direct = vk_command.Direct();
+			direct.beginRendering(&tag);
+			vk::ClearAttachment white {};
+			white.aspectMask = vk::ImageAspectFlagBits::eColor;
+			for (auto& channel : white.clearValue.color.float32) channel = 1.0f;
+			std::array<vk::ClearRect,48> cells {};
+			const auto bits = FrameCapture::Tag(source->capture_token, GetCurrentProcessId());
+			for (int i = 0; i < 48; ++i) {
+				cells[i].rect = vk::Rect2D{{2+2*i, (bits >> (47-i)) & 1 ? 2 : 5},{2,3}};
+				cells[i].layerCount = 1;
+			}
+			direct.clearAttachments(1, &white, cells.size(), cells.data());
+			direct.endRendering();
+		}
+#endif
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -1731,6 +1761,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+	frame->capture_token = FrameCapture::Get().Seal(info.data.address, image.backing.extent.width,
+	    image.backing.extent.height, static_cast<uint32_t>(frame_format), m_impl->renderer.FlipNumber(),
+	    m_impl->renderer.GetCommandScheduler().CurrentTick());
+#endif
 	if (headset) {
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
 		               vk::AccessFlagBits2::eTransferRead);
@@ -1746,6 +1781,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->source_flags = 0;
 	frame->blank        = true;
+	frame->capture_token = 0;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;

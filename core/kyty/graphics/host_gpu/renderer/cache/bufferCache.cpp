@@ -1,4 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/queueCheckpoints.h"
+#endif
+
 
 #include "graphics/host_gpu/renderer/cache/eagerReadbackWindows.h"
 #include "common/alignment.h"
@@ -2094,7 +2098,11 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 			needed                  = std::max(needed, latest);
 		}
 	}
-	slot->many   = !read.followers.empty();
+	slot->follower_sources.clear();
+	slot->follower_sources.reserve(read.followers.size());
+	for (const auto& follower: read.followers) {
+		slot->follower_sources.push_back(follower.source);
+	}
 	slot->source = buffer.Handle();
 	slot->busy.store(true, std::memory_order_release);
 	auto& queue  = slot->queue;
@@ -2128,6 +2136,9 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	(void)command.begin(&begin_info);
+#if defined(ANYPS5_KYTY)
+	QueueCheckpoints::Mark(m_graphics.device, command, 0, m_scheduler.CurrentTick(), "readback-begin", 0, needed);
+#endif
 	command.copyBuffer(buffer.Handle(), queue.staging->Handle(),
 	                   static_cast<uint32_t>(read.copies.size()), read.copies.data());
 	for (const auto& follower: read.followers) {
@@ -2144,6 +2155,9 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 	after.size                = read.total_size;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
 	                        {}, 0, nullptr, 1, &after, 0, nullptr);
+	#if defined(ANYPS5_KYTY)
+	QueueCheckpoints::Mark(m_graphics.device, command, 0, m_scheduler.CurrentTick(), "readback-end", 0, needed);
+#endif
 	(void)command.end();
 	const auto                      semaphore  = m_scheduler.GetMasterSemaphore().Handle();
 	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
@@ -2186,7 +2200,9 @@ bool BufferCache::StartReadbackQueueRead(const Buffer& buffer, uint64_t vaddr, u
 
 void BufferCache::WaitReadbackQueueCopies(vk::Buffer buffer) {
 	for (auto& slot: m_readback_slots) {
-		if (slot.busy.load(std::memory_order_acquire) && (slot.source == buffer || slot.many)) {
+		if (slot.busy.load(std::memory_order_acquire) &&
+		    (slot.source == buffer ||
+		     std::ranges::find(slot.follower_sources, buffer) != slot.follower_sources.end())) {
 			(void)m_graphics.device.waitForFences(1, &slot.queue.fence, VK_TRUE, UINT64_MAX);
 		}
 	}
@@ -2196,8 +2212,32 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	auto& queue = read.slot->queue;
 	const auto trace = StartReadbackTrace();
 	const auto submitted = trace != 0 ? m_scheduler.SubmittedTick() : 0;
-	if (m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, UINT64_MAX) !=
-	    vk::Result::eSuccess) {
+	static const bool split = [] {
+		const auto* setting = std::getenv("KYTY_READBACK_DEPENDENCY_TRACE");
+		return setting != nullptr && std::strcmp(setting, "1") == 0;
+	}();
+	const bool diagnose = trace != 0 && split;
+	auto status = m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, diagnose ? 50'000'000 : UINT64_MAX);
+	int64_t observed = 0;
+	int64_t producer_ready = 0;
+	uint64_t reached = 0;
+	if (diagnose && status == vk::Result::eTimeout) {
+		const auto semaphore = m_scheduler.GetMasterSemaphore().Handle();
+		if (m_graphics.device.getSemaphoreCounterValue(semaphore, &reached) == vk::Result::eSuccess) {
+			observed = SteadyNs();
+			if (reached < read.needed) {
+				vk::SemaphoreWaitInfo wait {};
+				wait.semaphoreCount = 1;
+				wait.pSemaphores = &semaphore;
+				wait.pValues = &read.needed;
+				if (m_graphics.device.waitSemaphores(&wait, UINT64_MAX) == vk::Result::eSuccess) {
+					producer_ready = SteadyNs();
+				}
+			}
+		}
+		status = m_graphics.device.waitForFences(1, &queue.fence, VK_TRUE, UINT64_MAX);
+	}
+	if (status != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue wait failed\n");
 	}
 	const auto gpu_ready = trace != 0 ? SteadyNs() : 0;
@@ -2219,6 +2259,11 @@ void BufferCache::FinishReadbackQueueRead(ReadbackQueueRead& read) {
 	read.slot->busy.store(false, std::memory_order_release);
 	read.published->store(true, std::memory_order_release);
 	read.published->notify_all();
+	if (observed != 0) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-readback-dependency] needed={} reached={} recorded={} bytes={} start={} probe={} producer_observed={} fence_observed={}\n",
+		    read.needed, reached, read.recorded, read.total_size, trace, observed, producer_ready, gpu_ready));
+	}
 	if (trace != 0) {
 		NoteSlowReadback(ReadbackTracePath::Queue, read.needed, read.recorded, submitted, read.total_size,
 		                 {trace, gpu_ready, priority_ready, invalidated, SteadyNs()});
@@ -2927,18 +2972,33 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		const auto& buffer        = m_slot_buffers[last->second];
 		const auto  buffer_begin  = buffer.CpuAddress();
 		const auto  buffer_end    = buffer_begin + buffer.Size();
-		const bool  expands_left  = buffer_begin < begin;
-		const bool  expands_right = buffer_end > end;
+		bool reserve_right = buffer_begin < begin || (buffer_begin == begin && buffer_end < end);
+		bool reserve_left  = buffer_end > end || (buffer_end == end && buffer_begin > begin);
 		begin                     = std::min(begin, buffer_begin);
 		end                       = std::max(end, buffer_end);
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
-			if (expands_left) {
+			const auto request_end = vaddr + size;
+			const auto tail = std::prev(m_buffers.lower_bound(request_end));
+			if (first != tail && size <= StreamLeapSize) {
+				const auto& left = m_slot_buffers[first->second];
+				const auto& right = m_slot_buffers[tail->second];
+				if (left.Size() >= StreamLeapSize && right.Size() < StreamLeapSize &&
+				    left.CpuAddress() < vaddr && left.CpuAddress() + left.Size() > vaddr) {
+					reserve_right = true;
+					reserve_left = false;
+				} else if (right.Size() >= StreamLeapSize && left.Size() < StreamLeapSize &&
+				           right.CpuAddress() < request_end && right.CpuAddress() + right.Size() > request_end) {
+					reserve_right = false;
+					reserve_left = true;
+				}
+			}
+			if (reserve_right) {
 				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
 				                                       : LibKernel::Memory::kExtendedMemoryBase +
 				                                             LibKernel::Memory::kExtendedMemorySize) - end);
 			}
-			if (expands_right) {
+			if (reserve_left) {
 				const auto minimum = vaddr < LOWER_ADDRESS_SIZE
 				                         ? CACHING_PAGESIZE * 2
 				                         : LibKernel::Memory::kExtendedMemoryBase;
@@ -2947,6 +3007,34 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 				}
 				first = find_first(begin);
 				begin = std::min(begin, first->first);
+			}
+		}
+	}
+	if (!has_stream_leap && stream_score >= 2 && size <= StreamLeapSize && first != last &&
+	    std::next(first) == last) {
+		const auto& old = m_slot_buffers[first->second];
+		if (old.Size() >= StreamLeapSize * StreamLeapThreshold) {
+			if (end > old.CpuAddress() + old.Size() && begin == old.CpuAddress()) {
+				uint64_t limit = vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
+				    : LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
+				if (last != m_buffers.end()) {
+					limit = std::min(limit, last->first);
+				}
+				if (end < limit) {
+					end += std::min(StreamLeapSize, limit - end);
+					has_stream_leap = true;
+				}
+			} else if (begin < old.CpuAddress() && end == old.CpuAddress() + old.Size()) {
+				uint64_t limit = vaddr < LOWER_ADDRESS_SIZE ? CACHING_PAGESIZE * 2
+				                                           : LibKernel::Memory::kExtendedMemoryBase;
+				if (first != m_buffers.begin()) {
+					const auto& previous = m_slot_buffers[std::prev(first)->second];
+					limit = std::max(limit, previous.CpuAddress() + previous.Size());
+				}
+				if (begin > limit) {
+					begin -= std::min(StreamLeapSize, begin - limit);
+					has_stream_leap = true;
+				}
 			}
 		}
 	}
@@ -2984,11 +3072,44 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			imported = m_in_place->Import(m_graphics, overlap.begin, bytes, flags);
 		}
 	}
+	static const bool trace_ranges = [] {
+		const char* value = std::getenv("KYTY_BUFFER_RANGE_TRACE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	const auto alloc_begin = trace_ranges ? SteadyNs() : 0;
 	const auto id = imported.has_value()
 	                    ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, bytes, imported->buffer,
 	                                            imported->address)
 	                    : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin, flags,
 	                                            bytes);
+	const auto alloc_end = trace_ranges ? SteadyNs() : 0;
+	static thread_local uint64_t leap_count = 0;
+	if (trace_ranges && overlap.has_stream_leap) {
+		++leap_count;
+	}
+	if (trace_ranges && (alloc_end - alloc_begin >= 20'000'000 ||
+	                     (overlap.has_stream_leap && (leap_count <= 32 || std::has_single_bit(leap_count))))) {
+		uint64_t largest_begin = 0, largest_bytes = 0, old_bytes = 0;
+		size_t count = 0, same_begin = 0, same_end = 0;
+		int max_score = 0;
+		for (auto it = overlap.first; it != overlap.last; ++it) {
+			const auto& old = m_slot_buffers[it->second];
+			++count;
+			same_begin += old.CpuAddress() == vaddr && old.Size() < size;
+			same_end += old.CpuAddress() + old.Size() == end && old.Size() < size;
+			max_score = std::max(max_score, old.StreamScore());
+			old_bytes += old.Size();
+			if (old.Size() > largest_bytes) {
+				largest_bytes = old.Size();
+				largest_begin = old.CpuAddress();
+			}
+		}
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-buffer-range] begin_ns={} end_ns={} request={:x} size={} merged={:x} bytes={} "
+		    "old={} old_bytes={} largest={:x} largest_bytes={} same_begin={} same_end={} score={} leap={} leaps={} imported={}\n",
+		    alloc_begin, alloc_end, vaddr, size, overlap.begin, bytes, count, old_bytes, largest_begin,
+		    largest_bytes, same_begin, same_end, max_score, overlap.has_stream_leap, leap_count, imported.has_value()));
+	}
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
@@ -3945,6 +4066,9 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
 	(void)command.begin(&begin_info);
+#if defined(ANYPS5_KYTY)
+	QueueCheckpoints::Mark(m_graphics.device, command, 0, m_scheduler.CurrentTick(), "readback-begin", 0, needed);
+#endif
 	command.copyBuffer(buffer.Handle(), staging.Handle(), static_cast<uint32_t>(copies.size()),
 	                   copies.data());
 	vk::BufferMemoryBarrier after {};
@@ -3957,6 +4081,9 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	after.size                = total_size;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
 	                        {}, 0, nullptr, 1, &after, 0, nullptr);
+	#if defined(ANYPS5_KYTY)
+	QueueCheckpoints::Mark(m_graphics.device, command, 0, m_scheduler.CurrentTick(), "readback-end", 0, needed);
+#endif
 	(void)command.end();
 	const auto                      semaphore = m_scheduler.GetMasterSemaphore().Handle();
 	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
@@ -3973,15 +4100,9 @@ bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::Bu
 	if (m_graphics.readback_queue.submit(1, &submit, m_readback.fence) != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
-	for (;;) {
-		const auto status = device.getFenceStatus(m_readback.fence);
-		if (status == vk::Result::eSuccess) {
-			break;
-		}
-		if (status != vk::Result::eNotReady) {
-			EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(status).c_str());
-		}
-		Common::SpinPause();
+	const auto status = device.waitForFences(1, &m_readback.fence, VK_TRUE, UINT64_MAX);
+	if (status != vk::Result::eSuccess) {
+		EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(status).c_str());
 	}
 	(void)device.resetFences(1, &m_readback.fence);
 	m_scheduler.WaitPriorityOperations(needed);

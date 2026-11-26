@@ -25,6 +25,7 @@ struct Writer {
 	std::unordered_map<const Inst*, uint32_t> index;
 	EncodeFailure                             failure;
 	const Inst*                               owner = nullptr;
+	bool                                      buffer_has_indirect_group_offset = true;
 
 	void Raw(const void* data, size_t size) {
 		const auto* begin = static_cast<const uint8_t*>(data);
@@ -46,6 +47,7 @@ struct Reader {
 	bool                     ok = true;
 	size_t                   allocation_budget = std::numeric_limits<size_t>::max();
 	bool                     shader_info_has_relative_vgprs = true;
+	bool                     buffer_has_indirect_group_offset = true;
 
 	void Raw(void* data, size_t size) {
 		ok = ok && size <= bytes.size();
@@ -169,7 +171,18 @@ template <class S, class T> void Io(S& io, T& value) {
 	}
 KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x,
                y, z)
-KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u)
+template <class Stream, Is<BufferResource> Object>
+void Io(Stream& io, Object& object) {
+	auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, group] = object;
+	IoAll(io, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u);
+	if constexpr (requires { io.buffer_has_indirect_group_offset; }) {
+		if (!io.buffer_has_indirect_group_offset) {
+			if constexpr (Reading<Stream>) group = UINT32_MAX;
+			return;
+		}
+	}
+	IoAll(io, group);
+}
 KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w,
                x, y, z, A, B, C, D, E)
 KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
@@ -206,7 +219,18 @@ KYTY_IO_FIELDS(SrtRead, a, b)
 KYTY_IO_FIELDS(ResourceBlock, a, b, c, d, e)
 KYTY_IO_FIELDS(UniformFill, a, b, c, d, e, f, g, h)
 KYTY_IO_FIELDS(UniformFillPlan, a, b, c, d)
-KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
+template <class Stream, Is<ResourceSpecialization::Buffer> Object>
+void Io(Stream& io, Object& object) {
+	auto& [a, b, c, d, e, f, g, h, group] = object;
+	IoAll(io, a, b, c, d, e, f, g, h);
+	if constexpr (requires { io.buffer_has_indirect_group_offset; }) {
+		if (!io.buffer_has_indirect_group_offset) {
+			if constexpr (Reading<Stream>) group = UINT32_MAX;
+			return;
+		}
+	}
+	IoAll(io, group);
+}
 KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)

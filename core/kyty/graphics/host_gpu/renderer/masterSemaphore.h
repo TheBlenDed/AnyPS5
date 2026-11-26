@@ -56,6 +56,7 @@ private:
 	std::array<Work, 512> m_work {};
 	std::atomic<uint32_t> m_work_next {0};
 	void ReportStall(uint64_t tick);
+	void ReportFailure(const char* operation, vk::Result result, uint64_t wait_tick) const;
 #endif
 };
 

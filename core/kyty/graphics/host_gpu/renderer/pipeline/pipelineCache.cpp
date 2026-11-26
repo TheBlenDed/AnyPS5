@@ -54,6 +54,7 @@
 #include <fmt/format.h>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
@@ -183,6 +184,10 @@ void LogShaderVariantBuild(const char* stage, uint64_t shader_hash, uint32_t use
 	};
 	const auto& specialization = module.specialization;
 	const auto& functions      = module.function_code;
+	const auto indirect_groups = std::ranges::count_if(specialization.buffers, [](const auto& buffer) {
+		return buffer.indirect_group_offset != UINT32_MAX;
+	});
+	writer.buffer_has_indirect_group_offset = indirect_groups != 0;
 	const auto plain_fields = module.plain != nullptr
 	                              ? fmt::format(" plain_module={:016x} plain_spirv_words={}",
 	                                            module.plain->id, module.plain->spirv_words)
@@ -190,12 +195,12 @@ void LogShaderVariantBuild(const char* stage, uint64_t shader_hash, uint32_t use
 	PipelineCacheLog(
 	    "[kyty-variant] build stage={} shader={:016x} module={:016x} user_data_count={} "
 	    "static={:016x} push_start={} push_cursor={} buffers={:016x} images={:016x} "
-	    "samplers={:016x} linked_code={:016x} table={} spirv_words={}{} @{}",
+	    "samplers={:016x} linked_code={:016x} table={} spirv_words={} indirect_groups={}{} @{}",
 	    stage, shader_hash, module.id, user_data_count, fingerprint(static_state),
 	    module.info.bindings.push_data_start_dword, push_data_cursor,
 	    fingerprint(specialization.buffers), fingerprint(specialization.images),
 	    fingerprint(specialization.samplers), XXH3_64bits(functions.data(), functions.size() * sizeof(uint32_t)),
-	    module.info.table_mode, module.spirv_words, plain_fields,
+	    module.info.table_mode, module.spirv_words, indirect_groups, plain_fields,
 	    std::chrono::steady_clock::now().time_since_epoch().count());
 }
 #endif
@@ -1757,6 +1762,9 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	ShaderRecompiler::IR::Writer inputs;
+	inputs.buffer_has_indirect_group_offset = std::ranges::any_of(specialization.buffers, [](const auto& buffer) {
+		return buffer.indirect_group_offset != UINT32_MAX;
+	});
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
 	                            info.bindings.push_data_start_dword, specialization);
 	inputs.Raw(function_code.data(), function_code.size_bytes());
@@ -2599,9 +2607,10 @@ void PipelineCache::WriteDriverCache() {
 			source = merged;
 		}
 	}
-	size_t               size = 0;
-	vk::Result           result;
-	std::vector<uint8_t> payload;
+	size_t                     size     = 0;
+	size_t                     capacity = 0;
+	vk::Result                 result;
+	std::unique_ptr<uint8_t[]> payload;
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(source, &size, nullptr);
@@ -2609,22 +2618,25 @@ void PipelineCache::WriteDriverCache() {
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
 		}
-		payload.resize(size);
-		result = m_graphics.device.getPipelineCacheData(source, &size, payload.data());
+		if (size > capacity) {
+			payload  = std::make_unique_for_overwrite<uint8_t[]>(size);
+			capacity = size;
+		}
+		result = m_graphics.device.getPipelineCacheData(source, &size, payload.get());
 		if (result != vk::Result::eIncomplete) {
 			break;
 		}
 	}
 	m_graphics.device.destroyPipelineCache(merged, nullptr);
-	if (result != vk::Result::eSuccess || size == 0 ||
+	if (result != vk::Result::eSuccess || size == 0 || size > capacity ||
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
 		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
-	payload.resize(size);
+	const std::span<const uint8_t> bytes(payload.get(), size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	const auto payload_hash = XXH3_64bits(bytes.data(), bytes.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
@@ -2637,11 +2649,11 @@ void PipelineCache::WriteDriverCache() {
 	uint32_t     payload_written = 0;
 	if (file.Create(temp_path)) {
 		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+		file.Write(bytes.data(), static_cast<uint32_t>(bytes.size()), &payload_written);
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
-	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	const bool written = prefix_written == prefix.size() && payload_written == bytes.size() && flushed;
 	std::error_code error;
 	if (written) {
 		std::filesystem::rename(temp_path, m_driver_cache_path, error);
@@ -2652,7 +2664,7 @@ void PipelineCache::WriteDriverCache() {
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
-	                 static_cast<double>(payload.size()) / 1'000'000.0,
+	                 static_cast<double>(bytes.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
 }
 
@@ -2729,6 +2741,23 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 #endif
 	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
 	                                    ahead != nullptr ? &ahead->reads : nullptr);
+#if defined(ANYPS5_KYTY)
+	const auto prepare_vertex_stage = [ahead](uint64_t address, auto&& prepare) {
+#if defined(__cpp_exceptions)
+		if (ahead != nullptr) {
+			try {
+				const Common::SoftExitScope soft_exit;
+				prepare();
+				return true;
+			} catch (const Common::SoftExitError&) {
+				return false;
+			}
+		}
+#endif
+		return Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared",
+		                             "PipelineCache::ResolveGraphicsPrograms", 0, address, prepare);
+	};
+#endif
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 #if defined(ANYPS5_KYTY)
@@ -2745,9 +2774,9 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			return false;
 		}
 #if defined(ANYPS5_KYTY)
-		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
-		                           0, vertex_regs.ls_regs.data_addr,
-		                           [&] { vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info); })) {
+		if (!prepare_vertex_stage(vertex_regs.ls_regs.data_addr, [&] {
+			    vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		    })) {
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail();
 			return ahead == nullptr;
@@ -2835,9 +2864,9 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 		}
 	} else {
 #if defined(ANYPS5_KYTY)
-		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
-		                           0, vertex_regs.es_regs.data_addr,
-		                           [&] { vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]); })) {
+		if (!prepare_vertex_stage(vertex_regs.es_regs.data_addr, [&] {
+			    vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		    })) {
 			vertex_info[0].stage = {};
 			if (ahead != nullptr) ahead->reads.Fail();
 			return ahead == nullptr;
@@ -3397,6 +3426,7 @@ template <typename InputInfo>
 void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	std::optional<ShaderModule>                       module;
 	std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+	bool                                              retry_live_resources = false;
 	std::vector<uint32_t>                             spirv;
 	std::vector<uint32_t>                             plain_spirv;
 	ShaderRecompiler::CompileOptions                  options {.wave_size = input_info.wave_size};
@@ -3461,6 +3491,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			}
 			if (!ShaderRecompiler::IR::MaterializeResources(*plan, runtime, resources,
 			                                                *specialization)) {
+				retry_live_resources = true;
 				specialization.reset();
 			}
 		}
@@ -3502,8 +3533,11 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 				ahead = &added;
 			}
 		}
-	} else if (job.guest_traversal && plan) {
-		m_program_cache.try_emplace(job.key, Program {.resource_plan = std::move(*plan)});
+	} else if ((job.guest_traversal || retry_live_resources) && plan) {
+		const bool inserted = m_program_cache.try_emplace(job.key, Program {.resource_plan = std::move(*plan)}).second;
+		if (inserted && retry_live_resources && std::getenv("KYTY_PIPELINE_STALL_LOG_MS") != nullptr) {
+			PipelineCacheLog("[kyty-gpl] retained live resource plan shader={:016x}", job.params.hash);
+		}
 	}
 	if (const auto job_count = m_in_flight.find(job.key); --job_count->second == 0) {
 		m_in_flight.erase(job_count);

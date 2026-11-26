@@ -181,6 +181,13 @@ public:
 	explicit CommandRecorder(vk::CommandBuffer direct) noexcept: m_direct(direct) {}
 	explicit CommandRecorder(CommandStream* stream) noexcept: m_stream(stream) {}
 
+	void setCheckpointNV(const void* token) const {
+		if (m_stream == nullptr) {
+			m_direct.setCheckpointNV(token);
+			return;
+		}
+		m_stream->Record([token](vk::CommandBuffer c) { c.setCheckpointNV(token); });
+	}
 	[[nodiscard]] bool IsDirect() const noexcept { return m_stream == nullptr; }
 	[[nodiscard]] bool operator==(std::nullptr_t) const noexcept {
 		return m_stream == nullptr && m_direct == nullptr;
@@ -248,6 +255,26 @@ public:
 		}
 		m_stream->Record([=](vk::CommandBuffer c) { c.endQuery(pool, query); });
 	}
+
+#if defined(ANYPS5_KYTY)
+	void resetQueryPool(vk::QueryPool pool, uint32_t count) const {
+		if (m_stream == nullptr) {
+			m_direct.resetQueryPool(pool, 0, count);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.resetQueryPool(pool, 0, count); });
+	}
+
+	void writePassTimestamp(vk::QueryPool pool, uint32_t query) const {
+		if (m_stream == nullptr) {
+			m_direct.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, query);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) {
+			c.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, query);
+		});
+	}
+#endif
 
 	void copyQueryPoolResults(vk::QueryPool pool, uint32_t first, uint32_t count, vk::Buffer buffer,
 	                          vk::DeviceSize offset, vk::DeviceSize stride,

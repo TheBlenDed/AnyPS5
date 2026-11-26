@@ -21,7 +21,7 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer Job {
 	uint     layout_count;
 	uint     mismatches;
 	uint     leaves;
-	uint     pad2;
+	uint     finite_inactive;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer LayoutRef {
@@ -114,6 +114,23 @@ shared vec3 s_root_hi;
 const uint kSplitSetSize = 2048;
 shared uint s_split_set[kSplitSetSize];
 
+const uint kMissingLeaf = 1u;
+const uint kMissingBox = 2u;
+const uint kZeroLeafLimit = 4u;
+const uint kOtherLeafLimit = 8u;
+
+BoxNode LoadWalkBox(uint64_t base, uint node, bool raw_walk) {
+	const uint64_t host = HostAddress(NodeAddress(base, node));
+	BoxNode box = LoadBoxNodeFromHost(host, node);
+	if (raw_walk && host == 0) {
+		atomicOr(s_mismatches, kMissingBox);
+		for (uint i = 0; i < 4; i++) {
+			box.children[i] = kInvalidNode;
+		}
+	}
+	return box;
+}
+
 bool FirstSplitEntry(uint tri) {
 	uint at = (tri * 0x9e3779b1u) >> 21;
 	for (uint probe = 0; probe < 32; probe++) {
@@ -145,8 +162,15 @@ uint LayoutPosition(Job job, uint tri, uint word, bool opaque) {
 void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3 hi) {
 	atomicAdd(s_leaves, 1u);
 	const uint first = leaf >> 3;
+	const bool raw_walk = pc.mode == MODE_COUNT || job.layout_va == 0;
+	uint seen = 0;
 	for (uint k = 0; k < kMaxLeafEntries; k++) {
-		const uvec2    pair   = LoadGuestU32x2(blas_va + (uint64_t(first + k) << 3));
+		const uint64_t host = HostAddress(blas_va + (uint64_t(first + k) << 3));
+		if (raw_walk && host == 0) {
+			atomicOr(s_mismatches, kMissingLeaf);
+			return;
+		}
+		const uvec2    pair   = host == 0 ? uvec2(0) : U32x2Ref(host).v;
 		const uint     tri    = pair.x;
 		const uint     word   = pair.y;
 		const bool     opaque = ((word >> 30) & 1u) != 0;
@@ -203,8 +227,12 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 			}
 		}
 		if ((word & 0x80000000u) != 0) {
-			break;
+			return;
 		}
+		seen |= tri | word;
+	}
+	if (raw_walk) {
+		atomicOr(s_mismatches, seen == 0 ? kZeroLeafLimit : kOtherLeafLimit);
 	}
 }
 
@@ -224,8 +252,10 @@ void GatherTriangle(Job job, uint64_t base, uint index, uint geometry) {
 	for (uint v = 0; v < 3; v++) {
 		usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
 	}
+	const vec3 inactive = job.finite_inactive == 0u ? vec3(uintBitsToFloat(0x7fc00000u))
+	                         : all(lessThan(abs(p[0]), vec3(1e18))) ? p[0] : vec3(0.0);
 	for (uint v = 0; v < 3; v++) {
-		const vec3 q = usable ? p[v] : vec3(uintBitsToFloat(0x7fc00000u));
+		const vec3 q = usable ? p[v] : inactive;
 		out_triangle.v[v * 3]     = q.x;
 		out_triangle.v[v * 3 + 1] = q.y;
 		out_triangle.v[v * 3 + 2] = q.z;
@@ -284,6 +314,7 @@ void main() {
 		queue_size    = QueueNodes(info.leaf_count);
 	}
 	const uint64_t base = (blas_va >> 8) << 8;
+	const bool raw_walk = pc.mode == MODE_COUNT || (pc.mode == MODE_BUILD && job.layout_va == 0);
 	if (lid == 0) {
 		s_head      = 0;
 		s_tail      = 0;
@@ -317,7 +348,7 @@ void main() {
 			                       : 0u;
 		}
 		if (IsBoxNode(root)) {
-			const BoxNode root_box = LoadBoxNode(base, root);
+			const BoxNode root_box = LoadWalkBox(base, root, raw_walk);
 			for (uint c = 0; c < 4; c++) {
 				if (root_box.children[c] != kInvalidNode &&
 				    all(lessThanEqual(root_box.lo[c], root_box.hi[c]))) {
@@ -370,7 +401,7 @@ void main() {
 		barrier();
 		for (uint i = head + lid; i < tail; i += gl_WorkGroupSize.x) {
 			const uint    node = U32Ref(queue + uint64_t(i) * 4).v;
-			const BoxNode box  = LoadBoxNode(base, node);
+			const BoxNode box  = LoadWalkBox(base, node, raw_walk);
 			uint          hash = Mix(0x1234567u, node);
 			for (uint c = 0; c < 4; c++) {
 				const uint child = box.children[c];
@@ -420,6 +451,7 @@ void main() {
 	const uint leaf_count = s_leaves;
 	const uint opaque     = s_opaque;
 	const uint alpha      = s_alpha;
+	const bool missing_input = (s_mismatches & (kMissingLeaf | kMissingBox)) != 0;
 	if (pc.mode == MODE_COUNT) {
 		if (lid == 0) {
 			MissingEntry missing = MissingEntry(pc.jobs + uint64_t(job_index) * kMissingStride);
@@ -428,7 +460,7 @@ void main() {
 			missing.opaque_count = opaque;
 			missing.alpha_count  = alpha;
 			missing.node_limit   = BlasNodeLimit(blas_va);
-			missing.flags        = s_overflow;
+			missing.flags        = s_overflow | (missing_input ? 8u : 0u);
 		}
 		return;
 	}
@@ -462,7 +494,8 @@ void main() {
 			info.rebase     = 0;
 			job.leaves      = leaf_count;
 			const bool grow = opaque > s_capacity0 || alpha > s_capacity1;
-			job.result      = (grow ? 1u : 0u) | (s_overflow << 1);
+			job.result      = missing_input ? 2u : (grow ? 1u : 0u) | (s_overflow << 1);
+			job.mismatches  = s_mismatches;
 			job.capacity0 = opaque;
 			job.capacity1 = alpha;
 		}

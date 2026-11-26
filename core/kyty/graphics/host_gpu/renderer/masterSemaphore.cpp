@@ -1,4 +1,8 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/queueCheckpoints.h"
+#endif
+
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -13,6 +17,34 @@
 namespace Libs::Graphics {
 
 #if defined(ANYPS5_KYTY)
+void MasterSemaphore::ReportFailure(const char* operation, vk::Result result, uint64_t wait_tick) const {
+	QueueCheckpoints::Report(m_graphics.device, m_graphics.queue, "main", result);
+	if (m_graphics.readback_queue != m_graphics.queue) {
+		QueueCheckpoints::Report(m_graphics.device, m_graphics.readback_queue, "readback", result);
+	}
+	const auto known = KnownGpuTick();
+	const auto next = m_work_next.load(std::memory_order_relaxed);
+	std::fprintf(stderr, "[kyty-timeline-error] operation=%s result=%d wait_tick=%" PRIu64
+	             " known_tick=%" PRIu64 " next_tick=%" PRIu64 "\n",
+	             operation, static_cast<int>(result), wait_tick, known, CurrentTick());
+	std::array<std::pair<uint64_t, uint64_t>, 24> recent {};
+	size_t count = 0;
+	for (size_t i = 1; i <= m_work.size() && count < recent.size(); ++i) {
+		const auto& slot = m_work[(next - i) % m_work.size()];
+		const auto tick = slot.tick.load(std::memory_order_relaxed);
+		const auto shader = slot.shader.load(std::memory_order_relaxed);
+		if (tick <= known || shader == 0) {
+			continue;
+		}
+		const std::pair entry {tick, shader};
+		if (std::find(recent.begin(), recent.begin() + count, entry) == recent.begin() + count) {
+			recent[count++] = entry;
+			std::fprintf(stderr, "[kyty-timeline-work] recent_tick=%" PRIu64 " compute=%016" PRIx64 "\n", tick, shader);
+		}
+	}
+	std::fflush(stderr);
+}
+
 void MasterSemaphore::ReportStall(uint64_t tick) {
 	static std::atomic_flag reported_gpu     = ATOMIC_FLAG_INIT;
 	static std::atomic_flag reported_pending = ATOMIC_FLAG_INIT;
@@ -73,6 +105,11 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+#if defined(ANYPS5_KYTY)
+	if (result != vk::Result::eSuccess) {
+		ReportFailure("getSemaphoreCounterValue", result, 0);
+	}
+#endif
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -104,6 +141,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	while (result == vk::Result::eTimeout) {
 		ReportStall(tick);
 		result = m_graphics.device.waitSemaphores(&wait_info, StallNs);
+	}
+	if (result != vk::Result::eSuccess) {
+		ReportFailure("waitSemaphores", result, tick);
 	}
 #else
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);

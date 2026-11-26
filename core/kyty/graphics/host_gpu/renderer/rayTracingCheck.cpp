@@ -1400,14 +1400,14 @@ bool ProbeShaderResources(RenderContext& context, std::span<PreparedBindings* co
 	static uint64_t captured_draw_frame = UINT64_MAX;
 	static std::array<ProbePairState, MaxProbePairs + 1> pairs;
 	static uint64_t resolve_frame = UINT64_MAX;
-	if (repeat_resolve && (!after || context.FlipNumber() != pixel_history_frame.load(std::memory_order_relaxed))) {
+	if (repeat_resolve && context.FlipNumber() != pixel_history_frame.load(std::memory_order_relaxed)) {
 		return false;
 	}
 	std::lock_guard lock(mutex);
 	if (repeat_resolve && resolve_frame != context.FlipNumber()) {
 		resolve_frame = context.FlipNumber();
 		for (auto& probe: probes) {
-			probe.done = probe.pair != 0 || !probe.after;
+			probe.done = probe.pair != 0;
 		}
 		armed = true;
 		armed_frame = resolve_frame;

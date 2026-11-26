@@ -38,7 +38,7 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 	return ret;
 }
 
-static uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index) {
+uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
 	                          state.flattened_srt_variable, ConstantU32(state, 0), index);

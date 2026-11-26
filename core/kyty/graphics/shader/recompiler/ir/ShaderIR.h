@@ -183,6 +183,7 @@ struct BufferResource {
 	std::vector<uint32_t>  indirect_resources;
 	bool                   indirect_write_table  = false;
 	uint32_t               indirect_table_offset = 0;
+	uint32_t               indirect_group_offset = UINT32_MAX;
 
 	bool operator==(const BufferResource& other) const = default;
 };

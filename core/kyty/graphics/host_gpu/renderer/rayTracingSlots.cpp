@@ -16,14 +16,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <utility>
 
 namespace Libs::Graphics {
@@ -204,7 +208,7 @@ struct Job {
 	uint32_t layout_count;
 	uint32_t mismatches;
 	uint32_t leaves;
-	uint32_t pad2;
+	uint32_t finite_inactive;
 };
 
 constexpr uint32_t JobLayoutMismatch = 16;
@@ -282,6 +286,22 @@ constexpr vk::BuildAccelerationStructureFlagsKHR BlasFlags =
     vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
 constexpr vk::BuildAccelerationStructureFlagsKHR FastBlasFlags =
     vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
+constexpr vk::BuildAccelerationStructureFlagsKHR UpdatableBlasFlags =
+    FastBlasFlags | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
+
+bool UpdatePackedBlas() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RT_UPDATE_PACKED_BLAS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
+uint32_t BlasGatherWidth(uint32_t primitives, uint32_t batch_width) {
+	constexpr uint32_t local_width = 256;
+	const auto needed = std::max(1u, (primitives + local_width - 1u) / local_width);
+	return std::min(batch_width, std::bit_ceil(needed));
+}
 
 vk::AccelerationStructureGeometryKHR TriangleGeometry(uint64_t address, uint32_t capacity,
                                                       bool opaque) {
@@ -658,6 +678,36 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 	return tlas;
 }
 
+namespace {
+
+bool TraceArenaChunks() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_RT_ARENA_TRACE");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
+uint64_t ArenaTimeNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+size_t ArenaThreadId() {
+	static thread_local const auto id = std::hash<std::thread::id>{}(std::this_thread::get_id());
+	return id;
+}
+
+void TraceArenaChunk(const char* event, uint64_t begin, uint64_t end, const Buffer* buffer,
+                     uint64_t request, uint64_t used, uint64_t reserved, bool dedicated) {
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-rt-arena] event={} tid={} begin_ns={} end_ns={} chunk={:x} chunk_bytes={} request={} "
+	    "used={} reserved={} dedicated={}\n", event, ArenaThreadId(), begin, end, reinterpret_cast<uintptr_t>(buffer),
+	    buffer->Size(), request, used, reserved, unsigned(dedicated)));
+}
+
+}
+
 RayTracing::Allocation RayTracing::Arena::Allocate(uint64_t size, uint64_t alignment) {
 	EXIT_IF(alignment == 0 || alignment > 256 || (256 % alignment) != 0);
 	size = (size + 255u) & ~uint64_t {255};
@@ -694,13 +744,22 @@ RayTracing::Allocation RayTracing::Arena::Allocate(uint64_t size, uint64_t align
 			}
 		}
 		if (best != nullptr) {
+			if (TraceArenaChunks() && best->free_bytes == best->buffer->Size()) {
+				const auto now = ArenaTimeNs();
+				TraceArenaChunk("reuse-empty", now, now, best->buffer.get(), size, m_used + size, m_reserved, false);
+			}
 			return carve(*best, best_offset, best_length);
 		}
 	}
 	auto chunk       = std::make_unique<Chunk>();
 	chunk->dedicated = size > ChunkSize / 2;
+	const auto begin = TraceArenaChunks() ? ArenaTimeNs() : 0;
 	chunk->buffer    = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
 	                                            AsFlags, chunk->dedicated ? size : ChunkSize);
+	if (TraceArenaChunks()) {
+		TraceArenaChunk("grow", begin, ArenaTimeNs(), chunk->buffer.get(), size, m_used + size,
+		                m_reserved + chunk->buffer->Size(), chunk->dedicated);
+	}
 	chunk->free_ranges.emplace(0, chunk->buffer->Size());
 	chunk->free_bytes = chunk->buffer->Size();
 	m_reserved += chunk->buffer->Size();
@@ -739,7 +798,15 @@ void RayTracing::Arena::Free(const Allocation& allocation) {
 		const auto empty = std::count_if(m_chunks.begin(), m_chunks.end(), [](const auto& c) {
 			return !c->dedicated && c->free_bytes == c->buffer->Size();
 		});
-		if (chunk.dedicated || chunk.buffer.get() == m_draining || empty > 1) {
+		const bool draining = chunk.buffer.get() == m_draining;
+		const bool release = chunk.dedicated || draining || empty > 1;
+		if (TraceArenaChunks()) {
+			const auto now = ArenaTimeNs();
+			const char* event = !release ? "keep-empty" : draining ? "release-drain" : "release-empty";
+			TraceArenaChunk(event, now, now, chunk.buffer.get(), allocation.size, m_used,
+			                release ? m_reserved - chunk.buffer->Size() : m_reserved, chunk.dedicated);
+		}
+		if (release) {
 			if (chunk.buffer.get() == m_draining) {
 				m_draining = nullptr;
 			}
@@ -946,10 +1013,20 @@ void RayTracing::CreateTlas(uint32_t capacity) {
 	EXIT_IF(m_tlas_scratch_size > BuildScratchSize);
 }
 
-bool RayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSizes& sizes, bool exact) {
+namespace {
+
+constexpr uint64_t WalkCapacity(uint32_t count, uint32_t previous) {
+	const auto reserve = std::min(count / 8 + 16u, std::max(previous, 16u));
+	return uint64_t {count} + reserve;
+}
+
+}
+
+bool RayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSizes& sizes, bool exact,
+                                  const Slot* previous) {
 	auto device = m_graphics.device;
-	const uint64_t capacity0 = exact ? opaque : uint64_t {opaque} + opaque / 8 + 16;
-	const uint64_t capacity1 = exact ? alpha : uint64_t {alpha} + alpha / 8 + 16;
+	const uint64_t capacity0 = exact ? opaque : WalkCapacity(opaque, previous ? previous->capacity0 : UINT32_MAX);
+	const uint64_t capacity1 = exact ? alpha : WalkCapacity(alpha, previous ? previous->capacity1 : UINT32_MAX);
 	if (capacity0 + capacity1 > MaxSlotTriangles) {
 		return false;
 	}
@@ -992,14 +1069,25 @@ uint64_t RayTracing::SlotBytes(const Slot& slot) noexcept {
 	return slot.storage.size + slot.vertices0.size + slot.vertices1.size + slot.entries.size;
 }
 
-void RayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
+void RayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes, const char* reason) {
+	const auto reserved = m_arena.Reserved();
+	const auto begin = TraceArenaChunks() ? ArenaTimeNs() : 0;
 	auto device        = m_graphics.device;
 	slot.capacity0     = sizes.capacity0;
 	slot.capacity1     = sizes.capacity1;
+	slot.walk_ticket = 0;
+	slot.packed_primitives.reset();
+	slot.packed_update.reset();
 	slot.storage       = m_arena.Allocate(sizes.storage, 256);
 	slot.vertices0     = m_arena.Allocate(sizes.vertices0, 256);
 	slot.vertices1     = m_arena.Allocate(sizes.vertices1, 256);
 	slot.entries       = m_arena.Allocate(sizes.entries, 256);
+	if (TraceArenaChunks() && m_arena.Reserved() != reserved) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-rt-slot-grow] reason={} tid={} begin_ns={} end_ns={} blas={:x} request={} used={} "
+		    "retired={} reserved_before={} reserved_after={}\n", reason, ArenaThreadId(), begin, ArenaTimeNs(), slot.blas_va,
+		    sizes.Total(), m_arena.Used(), m_retired_bytes, reserved, m_arena.Reserved()));
+	}
 	slot.build_scratch = sizes.scratch;
 	slot.built         = false;
 	vk::AccelerationStructureCreateInfoKHR create {};
@@ -1043,7 +1131,7 @@ bool RayTracing::CreateSlot(const PendingSlot& pending) {
 	slot->table_index    = pending.table_index;
 	slot->leaf_count     = pending.leaf_count;
 	slot->last_use_frame = m_walk_frame;
-	AllocateSlot(*slot, sizes);
+	AllocateSlot(*slot, sizes, "new-walk");
 	slot->needs_build = true;
 	m_slots_by_blas[slot->blas_va].push_back(index);
 	m_build_queue.push_back(index);
@@ -1061,6 +1149,7 @@ void RayTracing::RetireResources(Slot& slot, uint32_t slot_index) {
 	retired.slot        = slot_index;
 	slot.handle         = nullptr;
 	slot.as_address     = 0;
+	slot.packed_update.reset();
 	slot.storage = slot.vertices0 = slot.vertices1 = slot.entries = {};
 	for (const auto& allocation: retired.allocations) {
 		m_retired_bytes += allocation.size;
@@ -1174,7 +1263,7 @@ void RayTracing::Defragment(std::vector<uint32_t>& moved) {
 			continue;
 		}
 		RetireResources(*slot, UINT32_MAX);
-		AllocateSlot(*slot, sizes);
+		AllocateSlot(*slot, sizes, "defrag");
 		slot->needs_build = true;
 		m_build_queue.push_back(index);
 		moved.push_back(index);
@@ -1263,13 +1352,60 @@ bool RayTracing::Slot::CanGather(uint64_t sequence) const {
 	       (built_refit_seq + 1 == sequence || (built_refit_seq == sequence && dynamic_until != 0));
 }
 
+RayTracing::BlasUpdateMode RayTracing::SelectPackedBlasUpdate(
+    Slot& slot, const std::array<uint32_t, 2>& primitives) {
+	if (!slot.packed_update || slot.packed_update->primitives != primitives) {
+		const std::array geometries {TriangleGeometry(0, slot.capacity0, true),
+		                             TriangleGeometry(0, slot.capacity1, false)};
+		vk::AccelerationStructureBuildGeometryInfoKHR info {};
+		info.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+		info.flags = UpdatableBlasFlags;
+		info.mode = vk::BuildAccelerationStructureModeKHR::eBuild;
+		info.geometryCount = static_cast<uint32_t>(geometries.size());
+		info.pGeometries = geometries.data();
+		vk::AccelerationStructureBuildSizesInfoKHR sizes {};
+		m_graphics.device.getAccelerationStructureBuildSizesKHR(
+		    vk::AccelerationStructureBuildTypeKHR::eDevice, &info, primitives.data(), &sizes);
+		slot.packed_update = PackedBlasUpdate {
+		    primitives, sizes.accelerationStructureSize <= slot.storage.size &&
+		                    std::max(sizes.buildScratchSize, sizes.updateScratchSize) <= slot.build_scratch};
+	}
+	if (!slot.packed_update->fits) {
+		return BlasUpdateMode::Rebuild;
+	}
+	return std::exchange(slot.packed_update->built, true) ? BlasUpdateMode::Update
+	                                                      : BlasUpdateMode::BuildUpdatable;
+}
+
 bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_only, bool& gathered_out) {
+	static const bool packed_ranges = [] {
+		const auto* value = std::getenv("KYTY_RT_PACKED_BLAS_RANGES");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	static const bool trim_gather = [] {
+		const auto* value = std::getenv("KYTY_RT_TRIM_BLAS_GATHER");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	static const bool prefer_fast_build = [] {
+		const auto* value = std::getenv("KYTY_RT_FAST_BLAS_BUILD");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	const bool update_blas = packed_ranges && UpdatePackedBlas();
 	auto&                 readback  = m_readbacks[m_readback_index];
 	const uint32_t        first_job = readback.build_count;
-	std::vector<Job>      jobs, gather_jobs;
-	std::vector<uint32_t> slots, gather_slots;
+	struct GatherJob {
+		Job job;
+		std::array<uint32_t, 2> primitives;
+		uint32_t width;
+		BlasUpdateMode mode;
+	};
+	std::vector<Job>      jobs;
+	std::vector<GatherJob> gather_jobs;
+	std::vector<uint32_t> slots;
+	std::vector<uint64_t> walk_tickets;
 	uint64_t              scratch   = 0;
 	uint64_t              pool_use  = 0;
+	uint32_t              update_no_fit = 0;
 	std::vector<std::array<uint32_t, 4>> layouts;
 	constexpr uint64_t    Alignment = 256;
 	const auto gathers = [&](const Slot* slot) {
@@ -1321,6 +1457,11 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 				continue;
 			}
 			pool_use += queue;
+			if (packed_ranges && !gathered) {
+				slot.walk_ticket = ++m_walk_ticket;
+				slot.packed_primitives.reset();
+				walk_tickets.push_back(slot.layout.empty() ? slot.walk_ticket : 0);
+			}
 			slot.needs_build     = false;
 			slot.replaced        = false;
 			slot.gathers         = gathered ? slot.gathers + 1 : 0;
@@ -1335,17 +1476,54 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 				job.layout_count  = static_cast<uint32_t>(slot.layout.size());
 				layouts.insert(layouts.end(), slot.layout.begin(), slot.layout.end());
 			}
-			(gathered ? gather_jobs : jobs).push_back(job);
-			(gathered ? gather_slots : slots).push_back(index);
+			if (gathered) {
+				const std::array full {slot.capacity0, slot.capacity1};
+				const bool packed = packed_ranges && slot.layout.empty() && slot.packed_primitives.has_value();
+				const auto primitives = packed ? *slot.packed_primitives : full;
+				auto mode = BlasUpdateMode::Rebuild;
+				if (update_blas && packed && (prefer_fast_build || slot.dynamic_until != 0) &&
+				    (primitives[0] != 0 || primitives[1] != 0)) {
+					mode = SelectPackedBlasUpdate(slot, primitives);
+					update_no_fit += mode == BlasUpdateMode::Rebuild;
+				}
+				job.finite_inactive = mode != BlasUpdateMode::Rebuild;
+				if (!job.finite_inactive && slot.packed_update) {
+					slot.packed_update->built = false;
+				}
+				gather_jobs.push_back({job, primitives, 0, mode});
+			} else {
+				if (slot.packed_update) {
+					slot.packed_update->built = false;
+				}
+				jobs.push_back(job);
+				slots.push_back(index);
+			}
 		}
 		m_build_queue.insert(m_build_queue.end(), deferred.rbegin(), deferred.rend());
 	}
 	const auto walk_count = static_cast<uint32_t>(jobs.size());
-	jobs.insert(jobs.end(), gather_jobs.begin(), gather_jobs.end());
-	slots.insert(slots.end(), gather_slots.begin(), gather_slots.end());
+	uint32_t largest_gather = 0;
+	for (const auto& gather: gather_jobs) {
+		largest_gather = std::max(largest_gather, gather.job.capacity0 + gather.job.capacity1);
+	}
+	const auto gather_width = std::clamp((largest_gather + 1023u) / 1024u, 1u, 64u);
+	for (auto& gather: gather_jobs) {
+		gather.width = trim_gather ? BlasGatherWidth(gather.job.capacity0 + gather.job.capacity1, gather_width)
+		                           : gather_width;
+	}
+	if (trim_gather) {
+		std::ranges::stable_sort(gather_jobs, {}, &GatherJob::width);
+	}
+	for (const auto& gather: gather_jobs) {
+		jobs.push_back(gather.job);
+		slots.push_back(gather.job.slot);
+	}
 	if (jobs.empty()) {
 		return false;
 	}
+#if defined(ANYPS5_KYTY)
+	const auto setup_timing = m_scheduler.BeginPassTiming(readback.shader_hash, "rt-blas-setup");
+#endif
 	if (first_job != 0) {
 		MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader | AsBuildStage,
 		              vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead |
@@ -1397,6 +1575,10 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+#if defined(ANYPS5_KYTY)
+	m_scheduler.EndPassTiming(setup_timing);
+	const auto geometry_timing = m_scheduler.BeginPassTiming(readback.shader_hash, "rt-blas-geometry");
+#endif
 	const BlasPush push {jobs_base,                        m_pool->BufferDeviceAddress(),
 	                     m_slots->BufferDeviceAddress(),   m_walk_state->BufferDeviceAddress(),
 	                     m_changed->BufferDeviceAddress(), ModeBuild,
@@ -1405,18 +1587,25 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	                     m_blas_flags};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_blas_pipeline);
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
-	if (walk_count != jobs.size()) {
-		auto gather      = push;
-		gather.jobs      = jobs_base + uint64_t {walk_count} * JobStride;
-		gather.mode      = ModeGather;
-		gather.job_count = static_cast<uint32_t>(jobs.size()) - walk_count;
-		uint32_t largest = 0;
-		for (size_t i = walk_count; i < jobs.size(); i++) {
-			largest = std::max(largest, jobs[i].capacity0 + jobs[i].capacity1);
+	uint32_t gather_groups = 0;
+	uint32_t gather_dispatches = 0;
+	if (!gather_jobs.empty()) {
+		for (size_t begin = 0; begin < gather_jobs.size();) {
+			const auto width = gather_jobs[begin].width;
+			auto end = begin + 1;
+			while (end < gather_jobs.size() && gather_jobs[end].width == width) {
+				++end;
+			}
+			auto gather = push;
+			gather.jobs = jobs_base + (uint64_t {walk_count} + begin) * JobStride;
+			gather.mode = ModeGather;
+			gather.job_count = static_cast<uint32_t>(end - begin);
+			command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(gather), &gather);
+			command.dispatch(gather.job_count, width, 1);
+			gather_groups += gather.job_count * width;
+			++gather_dispatches;
+			begin = end;
 		}
-		const uint32_t groups = std::clamp<uint32_t>((largest + 1023u) / 1024u, 1u, 64u);
-		command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(gather), &gather);
-		command.dispatch(gather.job_count, groups, 1);
 		command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	}
 	if (walk_count != 0) {
@@ -1425,6 +1614,9 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderWrite, AsBuildStage | vk::PipelineStageFlagBits2::eTransfer,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead);
+#if defined(ANYPS5_KYTY)
+	m_scheduler.EndPassTiming(geometry_timing);
+#endif
 
 	struct BuildRecord {
 		vk::AccelerationStructureKHR handle;
@@ -1433,21 +1625,53 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 		uint64_t                     scratch;
 		uint32_t                     capacity0;
 		uint32_t                     capacity1;
+		std::array<uint32_t, 2>      primitives;
 		uint32_t                     fast;
+		BlasUpdateMode               mode;
 	};
 	std::vector<BuildRecord> records;
 	uint64_t                 scratch_offset = 0;
 	const auto               scratch_base   = m_build_scratch->BufferDeviceAddress();
+	uint32_t                 fast_count = 0;
+	uint32_t                 clipped = 0;
+	uint32_t                 update_builds = 0;
+	uint32_t                 updates = 0;
+	uint64_t                 submitted_primitives = 0;
+	uint64_t                 reserved_primitives = 0;
 	for (size_t i = 0; i < slots.size(); i++) {
 		auto&      slot = *m_slot_list[slots[i]];
-		const bool fast = slot.dynamic_until != 0;
-		slot.fast_built = fast;
+		slot.fast_built = slot.dynamic_until != 0;
+		const bool fast = prefer_fast_build || slot.fast_built;
+		fast_count += fast;
+		const std::array capacities {slot.capacity0, slot.capacity1};
+		const auto primitives = i >= walk_count ? gather_jobs[i - walk_count].primitives : capacities;
+		const auto mode = i >= walk_count ? gather_jobs[i - walk_count].mode : BlasUpdateMode::Rebuild;
+		update_builds += mode == BlasUpdateMode::BuildUpdatable;
+		updates += mode == BlasUpdateMode::Update;
+		clipped += primitives != capacities;
+		submitted_primitives += uint64_t {primitives[0]} + primitives[1];
+		reserved_primitives += uint64_t {capacities[0]} + capacities[1];
 		records.push_back({slot.handle, slot.vertices0.address, slot.vertices1.address,
-		                   scratch_base + scratch_offset, slot.capacity0, slot.capacity1, fast ? 1u : 0u});
+		                   scratch_base + scratch_offset, slot.capacity0, slot.capacity1, primitives,
+		                   fast ? 1u : 0u, mode});
 		scratch_offset += (slot.build_scratch + Alignment - 1) & ~(Alignment - 1);
 	}
 	const auto* copy  = command.CopyArray(records.data(), records.size());
 	const auto  count = static_cast<uint32_t>(records.size());
+#if defined(ANYPS5_KYTY)
+	const auto build_timing = m_scheduler.BeginPassTiming(readback.shader_hash, "rt-blas-build");
+	if (build_timing != 0) {
+		::Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-rt-blas] tick={} jobs={} walked={} fast_build={} clipped={} primitives={}/{} gather_groups={}/{} gather_dispatches={}\n",
+		    m_scheduler.CurrentTick(), count, walk_count, fast_count, clipped, submitted_primitives,
+		    reserved_primitives, gather_groups, gather_jobs.size() * gather_width, gather_dispatches));
+		if (update_blas) {
+			::Log::WriteToConsoleAndLog(fmt::format(
+			    "[kyty-rt-blas-update] tick={} update={} build_updatable={} no_fit={}\n",
+			    m_scheduler.CurrentTick(), updates, update_builds, update_no_fit));
+		}
+	}
+#endif
 	command.Custom([copy, count](vk::CommandBuffer c) {
 		std::vector<vk::AccelerationStructureGeometryKHR>              geometries(count * 2);
 		std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>     infos(count);
@@ -1458,14 +1682,20 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 			geometries[i * 2 + 1] = TriangleGeometry(copy[i].vertices1, copy[i].capacity1, false);
 			auto& info                     = infos[i];
 			info.type                      = vk::AccelerationStructureTypeKHR::eBottomLevel;
-			info.flags                     = copy[i].fast != 0 ? FastBlasFlags : BlasFlags;
-			info.mode                      = vk::BuildAccelerationStructureModeKHR::eBuild;
+			info.flags                     = copy[i].mode != BlasUpdateMode::Rebuild ? UpdatableBlasFlags
+			                                   : copy[i].fast != 0 ? FastBlasFlags : BlasFlags;
+			info.mode                      = copy[i].mode == BlasUpdateMode::Update
+			                                     ? vk::BuildAccelerationStructureModeKHR::eUpdate
+			                                     : vk::BuildAccelerationStructureModeKHR::eBuild;
 			info.dstAccelerationStructure  = copy[i].handle;
+			if (copy[i].mode == BlasUpdateMode::Update) {
+				info.srcAccelerationStructure = copy[i].handle;
+			}
 			info.geometryCount             = 2;
 			info.pGeometries               = &geometries[i * 2];
 			info.scratchData.deviceAddress = copy[i].scratch;
-			ranges[i * 2].primitiveCount     = copy[i].capacity0;
-			ranges[i * 2 + 1].primitiveCount = copy[i].capacity1;
+			ranges[i * 2].primitiveCount     = copy[i].primitives[0];
+			ranges[i * 2 + 1].primitiveCount = copy[i].primitives[1];
 			range_pointers[i]                = &ranges[i * 2];
 		}
 		c.buildAccelerationStructuresKHR(count, infos.data(), range_pointers.data());
@@ -1476,6 +1706,9 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	              vk::AccessFlagBits2::eAccelerationStructureReadKHR | vk::AccessFlagBits2::eShaderRead |
 	                  vk::AccessFlagBits2::eAccelerationStructureWriteKHR |
 	                  vk::AccessFlagBits2::eTransferWrite);
+#if defined(ANYPS5_KYTY)
+	m_scheduler.EndPassTiming(build_timing);
+#endif
 	constexpr uint32_t built = 1;
 	for (const auto index: slots) {
 		UpdateBuffer(command, *m_upload, m_slots->Handle(), uint64_t {index} * SlotStride + offsetof(SlotInfo, state),
@@ -1485,7 +1718,9 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	}
 	gathered_out = walk_count != slots.size();
 	readback.build_count += static_cast<uint32_t>(slots.size());
-	readback.build_slots.insert(readback.build_slots.end(), slots.begin(), slots.end());
+	for (uint32_t i = 0; i < count; i++) {
+		readback.build_slots.push_back({slots[i], packed_ranges && i < walk_count ? walk_tickets[i] : 0});
+	}
 	return true;
 }
 
@@ -1543,11 +1778,17 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 			}
 			auto& slot = *m_slot_list[index];
 			SlotSizes sizes;
-			if (!ComputeSlotSizes(opaque, alpha, sizes)) {
+			if (!ComputeSlotSizes(opaque, alpha, sizes, false, &slot)) {
 				continue;
 			}
+			if (TraceArenaChunks()) {
+				::Log::WriteToConsoleAndLog(fmt::format(
+				    "[kyty-rt-walk-resize] blas={:x} root={} old={}/{} measured={}/{} capacity={}/{}\n",
+				    slot.blas_va, slot.root, slot.capacity0, slot.capacity1, opaque, alpha,
+				    sizes.capacity0, sizes.capacity1));
+			}
 			RetireResources(slot, UINT32_MAX);
-			AllocateSlot(slot, sizes);
+			AllocateSlot(slot, sizes, "resize-walk");
 			slot.leaf_count  = 0;
 			slot.needs_build = true;
 			m_build_queue.push_back(index);
@@ -1615,13 +1856,15 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	}
 	m_prepare_id++;
 
+	const auto update_access = UpdatePackedBlas() ? vk::AccessFlagBits2::eAccelerationStructureReadKHR
+	                                             : vk::AccessFlags2 {};
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eAllCommands,
 	              vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead,
 	              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer |
 	                  AsBuildStage,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
 	                  vk::AccessFlagBits2::eTransferWrite |
-	                  vk::AccessFlagBits2::eAccelerationStructureWriteKHR);
+	                  vk::AccessFlagBits2::eAccelerationStructureWriteKHR | update_access);
 	if (!m_cleared) {
 		m_cleared = true;
 		for (const auto* buffer: {m_table.get(), m_slots.get(), m_context_table.get()}) {
@@ -1709,6 +1952,9 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	m_blas_flags = (((source.layout[3] >> BlasNodeCountBit) & 1u) != 0 ? BlasNodeCountAt80 : 0u) |
 	               (psr ? BlasPsrHeader : 0u);
 	const bool gathered = RecordBuilds(command);
+#if defined(ANYPS5_KYTY)
+	const auto walk_timing = m_scheduler.BeginPassTiming(shader_hash, "rt-walk");
+#endif
 	m_walks_announced = false;
 
 	command.fillBuffer(m_instances->Handle(), 0, uint64_t {tlas_count} * InstanceStride, 0);
@@ -1779,6 +2025,10 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	                      &blas_push);
 	command.dispatchIndirect(m_walk_state->Handle(), StateVerify);
 
+#if defined(ANYPS5_KYTY)
+	m_scheduler.EndPassTiming(walk_timing);
+	const auto tlas_timing = m_scheduler.BeginPassTiming(shader_hash, "rt-tlas");
+#endif
 	{
 		const auto handle    = m_tlas;
 		const auto instances = m_instances->BufferDeviceAddress();
@@ -1810,21 +2060,30 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	              vk::AccessFlagBits2::eAccelerationStructureReadKHR | vk::AccessFlagBits2::eShaderRead |
 	                  vk::AccessFlagBits2::eTransferRead);
 
+#if defined(ANYPS5_KYTY)
+	m_scheduler.EndPassTiming(tlas_timing);
+	const auto readback_timing = m_scheduler.BeginPassTiming(shader_hash, "rt-readback");
+#endif
 	const std::array<vk::BufferCopy, 5> regions {{
 	    {0, 0, StateSize},
 	    {0, ReadbackMissing, uint64_t {MissingCapacity} * MissingStride},
-	    {0, ReadbackJobs, uint64_t {JobCapacity} * JobStride},
+	    {0, ReadbackJobs, uint64_t {readback.build_count} * JobStride},
 	    {0, ReadbackChanged, uint64_t {ChangedCapacity} * 4},
 	    {0, ReadbackUsed, uint64_t {SlotCapacity} * 4},
 	}};
 	command.copyBuffer(m_walk_state->Handle(), readback.buffer->Handle(), 1, &regions[0]);
 	command.copyBuffer(m_missing->Handle(), readback.buffer->Handle(), 1, &regions[1]);
-	command.copyBuffer(m_jobs->Handle(), readback.buffer->Handle(), 1, &regions[2]);
+	if (regions[2].size != 0) {
+		command.copyBuffer(m_jobs->Handle(), readback.buffer->Handle(), 1, &regions[2]);
+	}
 	command.copyBuffer(m_changed->Handle(), readback.buffer->Handle(), 1, &regions[3]);
 	command.copyBuffer(m_verify_list->Handle(), readback.buffer->Handle(), 1, &regions[4]);
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eAllCommands,
 	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+#if defined(ANYPS5_KYTY)
+	m_scheduler.EndPassTiming(readback_timing);
+#endif
 	readback.tick        = m_scheduler.CurrentTick();
 	readback.capacity    = tlas_count;
 	readback.preparation = m_preparations.load(std::memory_order_relaxed) + 1;
@@ -1897,8 +2156,36 @@ void RayTracing::ProcessReadback(Readback& readback) {
 	for (uint32_t i = 0; i < readback.build_count && i < readback.build_slots.size(); i++) {
 		Job job {};
 		std::memcpy(&job, bytes + ReadbackJobs + uint64_t {i} * JobStride, sizeof(job));
+		const auto& completed = readback.build_slots[i];
+		const auto index = completed.slot;
+		if (job.layout == 0 && job.result == 2u && (job.mismatches & 3u) != 0) {
+			auto* slot = m_slot_list[index].get();
+			if (slot == nullptr || slot->evicted || slot->blas_va != job.blas_va || slot->root != job.root ||
+			    slot->entries.address != job.entries || !slot->layout.empty() ||
+			    (completed.packed_walk_ticket != 0 && completed.packed_walk_ticket != slot->walk_ticket)) {
+				continue;
+			}
+			slot->gathers = MaxGathers;
+		}
+		if (TraceArenaChunks() && job.layout == 0 && job.mismatches != 0 && job.mismatches < 16) {
+			static thread_local std::array<uint64_t, 16> samples {};
+			const auto count = ++samples[job.mismatches];
+			if (count <= 4 || std::has_single_bit(count)) {
+				::Log::WriteToConsoleAndLog(fmt::format(
+				    "[kyty-rt-walk-input] flags={} sample={} blas={:x} root={} measured={}/{} result={}\n",
+				    job.mismatches, count, job.blas_va, job.root, job.capacity0, job.capacity1, job.result));
+			}
+		}
+		if (completed.packed_walk_ticket != 0 && job.result == 0 && job.layout == 0 && job.leaves != 0 &&
+		    (job.capacity0 != 0 || job.capacity1 != 0)) {
+			auto* slot = m_slot_list[index].get();
+			if (slot != nullptr && !slot->evicted && slot->walk_ticket == completed.packed_walk_ticket &&
+			    !slot->replaced && slot->layout.empty() &&
+			    job.capacity0 <= slot->capacity0 && job.capacity1 <= slot->capacity1) {
+				slot->packed_primitives = std::array {job.capacity0, job.capacity1};
+			}
+		}
 		if ((job.result & 1u) == 0 && ((job.result >> 1u) & 5u) != 0) {
-			const auto index = readback.build_slots[i];
 			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
 				auto& slot = *m_slot_list[index];
 				if (((job.result >> 1u) & 1u) != 0) {
@@ -1911,7 +2198,6 @@ void RayTracing::ProcessReadback(Readback& readback) {
 			}
 		}
 		if ((job.result & (JobLayoutMismatch | JobLayoutStale)) != 0) {
-			const auto index = readback.build_slots[i];
 			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted &&
 			    !m_slot_list[index]->layout.empty()) {
 				m_give_up.push_back(index);
@@ -1919,13 +2205,11 @@ void RayTracing::ProcessReadback(Readback& readback) {
 			continue;
 		}
 		if (job.leaves != 0 && (job.result & 0xfu) == 0) {
-			const auto index = readback.build_slots[i];
 			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
 				m_slot_list[index]->leaf_count = job.leaves;
 			}
 		}
 		if ((job.result & 0xfu) == 0 && job.layout == 0) {
-			const auto index = readback.build_slots[i];
 			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
 				const auto& slot = *m_slot_list[index];
 				if (slot.capacity0 > job.capacity0 * 2 + 1024 || slot.capacity1 > job.capacity1 * 2 + 1024) {
@@ -1934,7 +2218,6 @@ void RayTracing::ProcessReadback(Readback& readback) {
 			}
 		}
 		if ((job.result & 1u) != 0) {
-			const auto index = readback.build_slots[i];
 			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
 				m_grow.push_back({index, job.capacity0, job.capacity1});
 			}
@@ -2075,13 +2358,14 @@ void RayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds) {
 					continue;
 				}
 				RetireResources(slot, UINT32_MAX);
-				AllocateSlot(slot, sizes);
+				AllocateSlot(slot, sizes, "resize-guest");
 				m_moved_slots.push_back(index);
 			}
 			slot.layout        = std::move(layout);
 			slot.header_layout = build.header_layout;
 			slot.leaf_count = static_cast<uint32_t>(totals[0] + totals[1]);
 			slot.replaced   = true;
+			slot.packed_update.reset();
 			if (!slot.needs_build) {
 				slot.needs_build = true;
 				m_build_queue.push_back(index);
@@ -2142,7 +2426,7 @@ uint32_t RayTracing::CreateHostSlot(uint64_t blas_va, const SlotSizes& sizes) {
 	slot->table_index      = UINT32_MAX;
 	slot->host_table_index = host;
 	slot->last_use_frame   = m_walk_frame;
-	AllocateSlot(*slot, sizes);
+	AllocateSlot(*slot, sizes, "new-guest");
 	slot->needs_build = true;
 	m_slots_by_blas[blas_va].push_back(index);
 	m_build_queue.push_back(index);
@@ -2163,6 +2447,7 @@ void RayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_siz
 		slot.layout.clear();
 		slot.refit_seq = 0;
 		slot.replaced  = true;
+		slot.packed_update.reset();
 		if (!slot.needs_build) {
 			slot.needs_build = true;
 			m_build_queue.push_back(index);

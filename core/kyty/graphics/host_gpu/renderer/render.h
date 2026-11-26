@@ -135,7 +135,7 @@ public:
 		return m_stream != nullptr ? !m_open : m_buffer == nullptr;
 	}
 
-	void BeginRendering(const RenderState& state) const;
+	void BeginRendering(const RenderState& state, uint64_t pixel_shader = 0) const;
 	void EndRendering() const;
 	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 	void DeferShaderWriteBarrier(vk::PipelineStageFlags source_stages) const noexcept {
@@ -174,6 +174,9 @@ private:
 	bool                m_open   = false;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+#if defined(ANYPS5_KYTY)
+	mutable uint32_t    m_render_timing = 0;
+#endif
 	mutable vk::PipelineStageFlags m_pending_shader_writes;
 	const HW::Context*    m_registers   = nullptr;
 	const HW::UserConfig* m_user_config = nullptr;

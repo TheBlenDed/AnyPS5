@@ -229,6 +229,14 @@ private:
 		[[nodiscard]] uint64_t Total() const noexcept { return storage + vertices0 + vertices1 + entries; }
 	};
 
+	enum class BlasUpdateMode : uint8_t { Rebuild, BuildUpdatable, Update };
+
+	struct PackedBlasUpdate {
+		std::array<uint32_t, 2> primitives;
+		bool                  fits;
+		bool                  built = false;
+	};
+
 	struct Slot {
 		uint64_t                     blas_va     = 0;
 		uint32_t                     root        = 0;
@@ -236,6 +244,9 @@ private:
 		uint32_t                     capacity0   = 0;
 		uint32_t                     capacity1   = 0;
 		uint32_t                     leaf_count  = 0;
+		uint64_t                     walk_ticket = 0;
+		std::optional<std::array<uint32_t, 2>> packed_primitives;
+		std::optional<PackedBlasUpdate> packed_update;
 		Allocation                   vertices0;
 		Allocation                   vertices1;
 		Allocation                   entries;
@@ -279,10 +290,14 @@ private:
 	};
 
 	struct Readback {
+		struct Build {
+			uint32_t slot;
+			uint64_t packed_walk_ticket;
+		};
 		std::unique_ptr<Buffer> buffer;
 		uint64_t                tick  = 0;
 		uint32_t                build_count = 0;
-		std::vector<uint32_t>   build_slots;
+		std::vector<Build>      build_slots;
 		uint32_t                source_key  = 0;
 		uint64_t                frame       = 0;
 		uint64_t                shader_hash = 0;
@@ -300,8 +315,9 @@ private:
 	bool CreateSlot(const PendingSlot& pending);
 	uint32_t CreateHostSlot(uint64_t blas_va, const SlotSizes& sizes);
 	[[nodiscard]] uint32_t FindHostSlotIndex(uint64_t blas_va) const;
-	bool ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSizes& sizes, bool exact = false);
-	void AllocateSlot(Slot& slot, const SlotSizes& sizes);
+	bool ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSizes& sizes, bool exact = false,
+	                      const Slot* previous = nullptr);
+	void AllocateSlot(Slot& slot, const SlotSizes& sizes, const char* reason);
 	[[nodiscard]] static uint64_t SlotBytes(const Slot& slot) noexcept;
 	void ReportAgain(uint64_t blas_va, uint32_t root, uint32_t table_index);
 	void RetireResources(Slot& slot, uint32_t slot_index);
@@ -312,6 +328,7 @@ private:
 	void Defragment(std::vector<uint32_t>& moved);
 	bool RecordBuilds(const CommandRecorder& command);
 	bool RecordBuildBatch(const CommandRecorder& command, bool urgent_only, bool& gathered);
+	BlasUpdateMode SelectPackedBlasUpdate(Slot& slot, const std::array<uint32_t, 2>& primitives);
 	void ProcessReadback(Readback& readback);
 
 	bool              m_enabled = false;
@@ -393,6 +410,7 @@ private:
 	uint32_t                                      m_guest_tlas_next = 0;
 	uint32_t                                      m_next_instances  = 0;
 	uint32_t                  m_prepare_id          = 0;
+	uint64_t                  m_walk_ticket         = 0;
 	std::array<std::pair<uint64_t, uint64_t>, 8> m_checked_headers {};
 	uint32_t                                     m_checked_next = 0;
 	uint32_t                  m_blas_flags          = 0;

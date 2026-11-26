@@ -59,6 +59,13 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 
 }
 
+#if defined(ANYPS5_KYTY)
+VkResult CreateVmaTracedBuffer(VmaAllocator allocator, const VkBufferCreateInfo* buffer_info,
+                               const VmaAllocationCreateInfo* alloc_info, VkBuffer* buffer,
+                               VmaAllocation* allocation, VmaAllocationInfo* result);
+bool TryRetireDedicatedBuffer(GraphicContext& graphics, VkBuffer buffer, VmaAllocation allocation);
+#endif
+
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
@@ -87,18 +94,24 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	auto              result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	const auto create = [&] {
+#if defined(ANYPS5_KYTY)
+		const auto allocate = CreateVmaTracedBuffer;
+#else
+		const auto allocate = vmaCreateBuffer;
+#endif
+		return static_cast<vk::Result>(allocate(
+		    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
+		    &native_buffer, &m_allocation, &allocation_result));
+	};
+	auto result = create();
 	if (result == vk::Result::eErrorOutOfDeviceMemory) {
 		LOGF("Buffer allocation ran out of device memory with budget enforcement: size=%" PRIu64
 		     ", memory_usage=%u; retrying without the budget limit\n",
 		     size, static_cast<unsigned>(usage));
 		graphics.LogMemoryBudget();
 		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-		result = static_cast<vk::Result>(
-		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
-		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+		result = create();
 	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
@@ -141,6 +154,12 @@ Buffer::~Buffer() {
 	if (m_in_place) {
 		m_graphics->device.destroyBuffer(m_buffer);
 	} else {
+#if defined(ANYPS5_KYTY)
+		if (is_deleted && m_scheduler->Active() &&
+		    TryRetireDedicatedBuffer(*m_graphics, m_buffer, m_allocation)) {
+			return;
+		}
+#endif
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

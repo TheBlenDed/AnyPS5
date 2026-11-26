@@ -664,7 +664,7 @@ template <class V>
 void VisitElement(V& v, ResourceSpecialization::Buffer& buffer) {
 	const ResourceSpecialization::Buffer base;
 	auto& [packed_stride, descriptor_format, descriptor_swizzle, zero_stride_oob, scalar_empty,
-	       indirect_root, indirect_mapping_offset, indirect_search_iterations] = buffer;
+	       indirect_root, indirect_mapping_offset, indirect_search_iterations, indirect_group_offset] = buffer;
 	v.Dec("st", packed_stride, base.packed_stride);
 	v.Format("f", descriptor_format, base.descriptor_format);
 	v.Hex("sw", descriptor_swizzle, base.descriptor_swizzle);
@@ -673,6 +673,7 @@ void VisitElement(V& v, ResourceSpecialization::Buffer& buffer) {
 	v.Dec("ir", indirect_root, base.indirect_root);
 	v.Dec("im", indirect_mapping_offset, base.indirect_mapping_offset);
 	v.Dec("is", indirect_search_iterations, base.indirect_search_iterations);
+	v.Dec("igo", indirect_group_offset, base.indirect_group_offset);
 }
 
 template <class V>
