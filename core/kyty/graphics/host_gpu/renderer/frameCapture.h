@@ -4,6 +4,7 @@
 #if defined(ANYPS5_KYTY) && defined(_WIN32)
 #include <windows.h>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,17 @@ public:
 		const auto* enabled = std::getenv("KYTY_FRAME_CAPTURE");
 		if (enabled == nullptr || std::strcmp(enabled, "1") != 0) return;
 		wchar_t name[64];
+		const auto* windowed = std::getenv("KYTY_FRAME_CAPTURE_WINDOWED");
+		if (windowed != nullptr && std::strcmp(windowed, "1") == 0) {
+			std::swprintf(name, 64, L"Local\\AnyKytyCaptureArmV1_%lu", GetCurrentProcessId());
+			m_arm = CreateEventW(nullptr, TRUE, FALSE, name);
+			std::swprintf(name, 64, L"Local\\AnyKytyCaptureEndV1_%lu", GetCurrentProcessId());
+			m_deadline = CreateWaitableTimerW(nullptr, TRUE, name);
+			std::swprintf(name, 64, L"Local\\AnyKytyCaptureResetV1_%lu", GetCurrentProcessId());
+			m_restart = CreateEventW(nullptr, FALSE, FALSE, name);
+			if (m_arm == nullptr || m_deadline == nullptr || m_restart == nullptr) return;
+			m_active.store(false);
+		}
 		std::swprintf(name, 64, L"Local\\AnyKytyFrameV1_%lu", GetCurrentProcessId());
 		m_file = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, Slots * sizeof(Slot), name);
 		if (m_file != nullptr && GetLastError() != ERROR_ALREADY_EXISTS) {
@@ -37,17 +49,35 @@ public:
 		}
 	}
 	~History() {
+		if (m_arm != nullptr) CloseHandle(m_arm);
+		if (m_deadline != nullptr) CloseHandle(m_deadline);
+		if (m_restart != nullptr) CloseHandle(m_restart);
 		if (m_slots != nullptr) UnmapViewOfFile(m_slots);
 		if (m_file != nullptr) CloseHandle(m_file);
 	}
-	bool Enabled() const { return m_slots != nullptr; }
+	bool Enabled() const { return m_slots != nullptr && m_active.load(std::memory_order_relaxed); }
 	void Record(const Event& event) {
 		std::lock_guard lock(m_mutex);
+		if (!m_active.load(std::memory_order_relaxed)) return;
 		if (m_count == MaxEvents) ++m_dropped;
 		else m_events[m_count++] = event;
 	}
 	uint32_t Seal(uint64_t source, uint32_t width, uint32_t height, uint32_t format, uint64_t flip, uint64_t tick) {
-		if (!Enabled()) return 0;
+		if (m_slots == nullptr) return 0;
+		if (m_arm != nullptr) {
+			const bool active = WaitForSingleObject(m_arm, 0) == WAIT_OBJECT_0 &&
+			                    WaitForSingleObject(m_deadline, 0) == WAIT_TIMEOUT;
+			if (!active && !m_active.load(std::memory_order_relaxed)) return 0;
+			if (active != m_active.load(std::memory_order_relaxed) ||
+			    (active && WaitForSingleObject(m_restart, 0) == WAIT_OBJECT_0)) {
+				if (active) ResetEvent(m_restart);
+				std::lock_guard lock(m_mutex);
+				m_active.store(active, std::memory_order_relaxed);
+				m_count = m_dropped = 0;
+				if (active && m_serial != UINT32_MAX) ++m_serial;
+				return 0;
+			}
+		}
 		std::lock_guard lock(m_mutex);
 		if (m_serial == UINT32_MAX) return 0;
 		const auto token = ++m_serial;
@@ -67,6 +97,8 @@ public:
 		return token;
 	}
 private:
+	HANDLE m_arm = nullptr, m_deadline = nullptr, m_restart = nullptr;
+	std::atomic<bool> m_active {true};
 	HANDLE m_file = nullptr;
 	Slot* m_slots = nullptr;
 	std::mutex m_mutex;

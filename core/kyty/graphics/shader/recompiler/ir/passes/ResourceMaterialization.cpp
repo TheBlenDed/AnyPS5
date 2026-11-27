@@ -15,6 +15,7 @@
 #include <atomic>
 #include <utility>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1063,6 +1064,15 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+			static const bool trace_scans = [] {
+				const auto* setting = std::getenv("KYTY_DESCRIPTOR_SCAN_TIMING");
+				return setting != nullptr && std::string_view(setting) == "1";
+			}();
+			const auto scan_clock = [] {
+				return std::chrono::duration_cast<std::chrono::nanoseconds>(
+				    std::chrono::steady_clock::now().time_since_epoch()).count();
+			};
+			const auto scan_begin = trace_scans && count >= 4096u ? scan_clock() : 0;
 			for (uint32_t word = 0; word < count; ++word) {
 				const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
 				uint64_t pointer_base = 0u;
@@ -1089,9 +1099,21 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						            std::min<size_t>(read_dwords, heap_words.size() - table_word),
 						            candidate.dwords.begin());
 					}
-					if (!normalize(candidate))
+					if (!normalize(candidate)) {
+						if (scan_begin != 0) {
+							const auto end = scan_clock();
+							std::fprintf(stderr, "[kyty-descriptor-scan] shader=%016llx begin_ns=%lld end_ns=%lld "
+							             "resource=%u word=%u child=%u count=%llu stride=%u step=%llu offset=%llu "
+							             "bounded=%u maximum=%u raw=%08x,%08x,%08x,%08x\n",
+							             static_cast<unsigned long long>(program.shader_hash), static_cast<long long>(scan_begin),
+							             static_cast<long long>(end), resource_index, word, child, static_cast<unsigned long long>(count),
+							             indirect.table_stride, static_cast<unsigned long long>(step), static_cast<unsigned long long>(table_offset),
+							             unsigned(indirect.table_maximum.has_value()), indirect.table_maximum.value_or(0u),
+							             candidate.dwords[0], candidate.dwords[1], candidate.dwords[2], candidate.dwords[3]);
+						}
 						return normalization_failed(table_offset, word, step,
 						                            indirect.table_maximum ? "key" : "probe");
+					}
 					const auto ordinal = intern_candidate(candidate);
 					if (ordinal == 0u) continue;
 					const auto mapping_word = image_heap ? table_offset / 4u : word * child_count + child;
@@ -1622,11 +1644,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
 		        Prospero::TileMode::kDepth;
 		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
-		const auto* base_source = Source(program, base.source);
-		const bool  table_heap  = image.heap && base_source != nullptr &&
-		                         base_source->indirect_descriptor.has_value() &&
-		                         base_source->indirect_descriptor->table_array;
-		image.skip_degamma = !table_heap && Prospero::IsSrgbFormat(format) &&
+		image.skip_degamma = !image.heap && Prospero::IsSrgbFormat(format) &&
 		                     SamplerSkipsDegamma(program, snapshot, base_index);
 		if (!storage && !base.depth_compare && !image.skip_degamma &&
 		    image.indirect_root == ImageResource::NoIndirectImage &&
